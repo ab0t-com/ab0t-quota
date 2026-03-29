@@ -35,6 +35,7 @@ class QuotaStore:
     # Hosts allowed for endpoint_url (local dev / DynamoDB Local only)
     _ALLOWED_ENDPOINT_HOSTS = frozenset({
         "localhost", "127.0.0.1", "dynamodb-local", "dynamodb", "localstack",
+        "host.docker.internal",
     })
 
     def __init__(self, table_name: str = "ab0t_quota_state", region: str = "us-east-1", endpoint_url: Optional[str] = None):
