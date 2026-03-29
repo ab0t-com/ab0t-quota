@@ -10,7 +10,7 @@ Usage:
 from .engine import QuotaEngine
 from .middleware import QuotaGuard
 from .models.responses import QuotaResult, QuotaUsageResponse, QuotaLimitsResponse
-from .models.requests import QuotaCheckRequest, QuotaIncrementRequest, QuotaBatchCheckRequest
+from .models.requests import QuotaCheckRequest, QuotaIncrementRequest, QuotaDecrementRequest, QuotaBatchCheckRequest
 from .models.core import (
     ResourceDef,
     CounterType,
@@ -37,6 +37,7 @@ __all__ = [
     # Requests
     "QuotaCheckRequest",
     "QuotaIncrementRequest",
+    "QuotaDecrementRequest",
     "QuotaBatchCheckRequest",
     # Core models
     "ResourceDef",
