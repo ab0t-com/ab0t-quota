@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ab0t-quota"
+version = "0.1.0"
+description = "Shared quota, rate-limit, and tier enforcement for ab0t platform services"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+
+[project.urls]
+Homepage = "https://ab0t.com"
+Repository = "https://github.com/ab0t-com/ab0t-quota"
+dependencies = [
+    "redis>=5.0",
+    "pydantic>=2.0",
+    "fastapi>=0.100",
+]
+
+[project.optional-dependencies]
+webhooks = ["httpx>=0.24"]
+dynamo = ["aioboto3>=12.0"]
+all = ["httpx>=0.24", "aioboto3>=12.0"]
+dev = ["pytest", "pytest-asyncio", "fakeredis", "httpx"]
+
+[tool.setuptools.packages.find]
+include = ["ab0t_quota*"]

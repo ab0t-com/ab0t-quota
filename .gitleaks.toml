@@ -1,0 +1,86 @@
+# Gitleaks configuration for ab0t-quota
+# https://github.com/gitleaks/gitleaks
+
+title = "ab0t-quota gitleaks config"
+
+[extend]
+# Use the default gitleaks rules as a baseline
+# useDefault = true is implied
+
+# Additional custom rules for this project
+[[rules]]
+id = "generic-api-key-value"
+description = "Detects generic API key assignments"
+regex = '''(?i)(api[_-]?key|apikey)\s*[:=]\s*['\"][0-9a-zA-Z]{16,}['\"]'''
+tags = ["key", "api"]
+
+[[rules]]
+id = "aws-access-key"
+description = "AWS Access Key ID"
+regex = '''(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}'''
+tags = ["key", "aws"]
+
+[[rules]]
+id = "aws-secret-key"
+description = "AWS Secret Access Key"
+regex = '''(?i)aws_?secret_?access_?key\s*[:=]\s*['\"][0-9a-zA-Z/+=]{40}['\"]'''
+tags = ["key", "aws"]
+
+[[rules]]
+id = "generic-password"
+description = "Detects hardcoded passwords"
+regex = '''(?i)(password|passwd|pwd)\s*[:=]\s*['\"][^\s'"]{8,}['\"]'''
+tags = ["password"]
+
+[[rules]]
+id = "private-key"
+description = "Detects private keys"
+regex = '''-----BEGIN\s*(RSA|EC|DSA|OPENSSH|PGP)?\s*PRIVATE KEY-----'''
+tags = ["key", "private"]
+
+[[rules]]
+id = "jwt-token"
+description = "Detects JWT tokens"
+regex = '''eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'''
+tags = ["token", "jwt"]
+
+[[rules]]
+id = "redis-url-with-password"
+description = "Redis connection string with password"
+regex = '''redis://:[^@\s]{8,}@'''
+tags = ["password", "redis"]
+
+[[rules]]
+id = "dynamodb-endpoint-with-creds"
+description = "DynamoDB endpoint with embedded credentials"
+regex = '''(?i)dynamodb.*endpoint.*(?:password|secret|key)\s*[:=]'''
+tags = ["password", "aws"]
+
+[[rules]]
+id = "stripe-key"
+description = "Stripe API Key"
+regex = '''(?:sk|pk)_(test|live)_[0-9a-zA-Z]{24,}'''
+tags = ["key", "stripe"]
+
+[[rules]]
+id = "slack-webhook"
+description = "Slack Webhook URL"
+regex = '''https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[a-zA-Z0-9]+'''
+tags = ["webhook", "slack"]
+
+# Allowlist - paths and patterns that are safe to ignore
+[allowlist]
+description = "Global allowlist"
+paths = [
+    '''\.gitleaks\.toml$''',
+    '''tests/.*\.py$''',
+    '''.*\.egg-info/.*''',
+    '''__pycache__/.*''',
+    '''\.pytest_cache/.*''',
+    '''\.venv/.*''',
+    '''\.mypy_cache/.*''',
+    '''node_modules/.*''',
+    '''dist/.*''',
+    '''build/.*''',
+    '''quota-config\.example\.json$''',
+]

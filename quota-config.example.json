@@ -1,0 +1,130 @@
+{
+  "$schema": "quota-config-schema.json",
+  "$comment": "Copy to quota-config.json and customize. Changes take effect on service restart.",
+
+  "storage": {
+    "redis_url": "redis://localhost:6379/0",
+    "redis_key_prefix": "quota",
+    "dynamodb_table": "ab0t_quota_state",
+    "dynamodb_region": "us-east-1",
+    "persistence_enabled": true,
+    "persistence_sync_interval_seconds": 300
+  },
+
+  "tier_provider": {
+    "type": "jwt",
+    "jwt_claim_key": "org_tier",
+    "default_tier": "free",
+    "cache_ttl_seconds": 300
+  },
+
+  "alerts": {
+    "enabled": true,
+    "cooldown_seconds": 3600,
+    "webhook_url": null,
+    "dispatchers": ["log"]
+  },
+
+  "enforcement": {
+    "enabled": true,
+    "shadow_mode": false,
+    "global_kill_switch": false
+  },
+
+  "reconciliation": {
+    "enabled": true,
+    "interval_seconds": 900,
+    "auto_correct": true
+  },
+
+  "tiers": [
+    {
+      "tier_id": "free",
+      "display_name": "Free",
+      "description": "For experimentation and evaluation",
+      "sort_order": 0,
+      "features": ["basic_sandboxes", "browser_sessions"],
+      "upgrade_url": "/billing/upgrade",
+      "limits": {
+        "sandbox.concurrent": 1,
+        "sandbox.monthly_cost": 10.00,
+        "sandbox.gpu_instances": 0,
+        "sandbox.browser_sessions": 2,
+        "sandbox.desktop_sessions": 0,
+        "resource.cpu_cores": 4,
+        "resource.allocations": 3,
+        "auth.users_per_org": 5,
+        "api.requests_per_hour": 1000
+      }
+    },
+    {
+      "tier_id": "starter",
+      "display_name": "Starter",
+      "description": "For small teams getting started",
+      "sort_order": 1,
+      "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access"],
+      "upgrade_url": "/billing/upgrade",
+      "limits": {
+        "sandbox.concurrent": 5,
+        "sandbox.monthly_cost": 100.00,
+        "sandbox.gpu_instances": 1,
+        "sandbox.browser_sessions": 10,
+        "sandbox.desktop_sessions": 5,
+        "resource.cpu_cores": 32,
+        "resource.allocations": 20,
+        "auth.users_per_org": 25,
+        "api.requests_per_hour": 10000
+      }
+    },
+    {
+      "tier_id": "pro",
+      "display_name": "Pro",
+      "description": "For growing teams with production workloads",
+      "sort_order": 2,
+      "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access", "gpu_access", "audit_logs", "priority_support"],
+      "upgrade_url": "/billing/upgrade",
+      "limits": {
+        "sandbox.concurrent": 25,
+        "sandbox.monthly_cost": 1000.00,
+        "sandbox.gpu_instances": 5,
+        "sandbox.browser_sessions": 50,
+        "sandbox.desktop_sessions": 25,
+        "resource.cpu_cores": 256,
+        "resource.allocations": 100,
+        "auth.users_per_org": 100,
+        "api.requests_per_hour": 50000
+      }
+    },
+    {
+      "tier_id": "enterprise",
+      "display_name": "Enterprise",
+      "description": "Custom limits, SLA, dedicated support",
+      "sort_order": 3,
+      "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access", "gpu_access", "audit_logs", "priority_support", "sso", "custom_roles", "sla", "dedicated_support"],
+      "limits": {
+        "sandbox.concurrent": null,
+        "sandbox.monthly_cost": null,
+        "sandbox.gpu_instances": 50,
+        "sandbox.browser_sessions": null,
+        "sandbox.desktop_sessions": null,
+        "resource.cpu_cores": 1000,
+        "resource.allocations": 500,
+        "auth.users_per_org": 10000,
+        "api.requests_per_hour": 100000
+      }
+    }
+  ],
+
+  "billing_integration": {
+    "$comment": "Maps Stripe price IDs to quota tiers. When payment-service webhook fires, it calls auth-service to set the org tier.",
+    "stripe_price_to_tier": {
+      "price_starter_monthly": "starter",
+      "price_starter_annual": "starter",
+      "price_pro_monthly": "pro",
+      "price_pro_annual": "pro",
+      "price_enterprise": "enterprise"
+    },
+    "downgrade_grace_period_days": 7,
+    "payment_failure_grace_period_days": 3
+  }
+}
