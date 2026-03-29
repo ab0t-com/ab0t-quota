@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 
@@ -57,7 +57,7 @@ class QuotaIncreaseRecord(BaseModel):
     current_usage: Optional[float] = None
     tier_id: Optional[str] = None
     status: IncreaseRequestStatus = IncreaseRequestStatus.PENDING
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     reviewed_at: Optional[datetime] = None
     reviewed_by: Optional[str] = Field(default=None, description="Admin user_id who reviewed")
     admin_note: Optional[str] = Field(default=None, description="Admin's response note")

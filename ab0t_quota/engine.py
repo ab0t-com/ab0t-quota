@@ -105,6 +105,8 @@ class QuotaEngine:
 
         if result.denied:
             result.denied_level = "org"
+            if isinstance(counter, RateCounter):
+                result.retry_after = await counter.seconds_until_slot()
 
         # Per-user sub-quota check (only for gauges, only when user_id provided)
         if (
@@ -346,8 +348,6 @@ class QuotaEngine:
 
             # Hard deny
             retry_after = None
-            if isinstance(counter, RateCounter):
-                pass  # middleware can populate retry_after asynchronously
             return QuotaResult(
                 decision=QuotaDecision.DENY,
                 severity=AlertSeverity.EXCEEDED,
@@ -386,5 +386,9 @@ class QuotaEngine:
             return None
         try:
             return await self._override_loader(org_id, resource_key)
-        except Exception:
+        except Exception as e:
+            logger.error(
+                "override_load_error org_id=%s resource_key=%s error=%s",
+                org_id, resource_key, str(e),
+            )
             return None

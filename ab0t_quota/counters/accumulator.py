@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from ..models.core import ResetPeriod
@@ -24,7 +24,7 @@ class AccumulatorCounter(Counter):
         self._reset_period = reset_period
 
     def _period_key(self, now: Optional[datetime] = None) -> str:
-        now = now or datetime.utcnow()
+        now = now or datetime.now(timezone.utc)
         if self._reset_period == ResetPeriod.HOURLY:
             return now.strftime("%Y-%m-%dT%H")
         if self._reset_period == ResetPeriod.DAILY:
@@ -58,14 +58,12 @@ class AccumulatorCounter(Counter):
         return float(val) if val else 0.0
 
     async def increment(self, delta: float, idempotency_key: Optional[str] = None) -> float:
-        if idempotency_key and await self._check_idempotency(idempotency_key):
+        if idempotency_key and not await self._claim_idempotency(idempotency_key):
             return await self.get()
         new_val = await self._redis.incrbyfloat(self._redis_key, delta)
         ttl = self._period_ttl_seconds()
         if ttl > 0:
             await self._redis.expire(self._redis_key, ttl)
-        if idempotency_key:
-            await self._set_idempotency(idempotency_key)
         return float(new_val)
 
     async def decrement(self, delta: float, idempotency_key: Optional[str] = None) -> float:
@@ -77,8 +75,9 @@ class AccumulatorCounter(Counter):
         if ttl > 0:
             await self._redis.expire(self._redis_key, ttl)
 
-    async def _check_idempotency(self, key: str) -> bool:
-        return bool(await self._redis.exists(f"{self._key_prefix}:idem:{key}"))
-
-    async def _set_idempotency(self, key: str) -> None:
-        await self._redis.set(f"{self._key_prefix}:idem:{key}", "1", ex=86400)
+    async def _claim_idempotency(self, key: str) -> bool:
+        """Atomically claim an idempotency key. Returns True if this is the first attempt."""
+        result = await self._redis.set(
+            f"{self._key_prefix}:idem:{key}", "1", ex=86400, nx=True,
+        )
+        return result is not None

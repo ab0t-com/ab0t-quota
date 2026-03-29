@@ -105,13 +105,24 @@
 │  │               │                     │ justification=...    │ │
 │  └───────────────┴─────────────────────┴──────────────────────┘ │
 │                                                                  │
+│  GSI1 (overloaded — type-based access across orgs):              │
+│  ┌───────────────┬──────────────────────────────────────────┐    │
+│  │ GSI1PK        │ GSI1SK                                   │    │
+│  ├───────────────┼──────────────────────────────────────────┤    │
+│  │ TIER          │ ORG#org-1                                │    │
+│  │ COUNTER       │ ORG#org-1#sandbox.concurrent             │    │
+│  │ OVERRIDE      │ ORG#org-1#sandbox.concurrent             │    │
+│  └───────────────┴──────────────────────────────────────────┘    │
+│                                                                  │
 │  Access Patterns:                                                │
-│  1. Get org tier:      PK=ORG#org-1, SK=TIER                    │
-│  2. Get override:      PK=ORG#org-1, SK=OVERRIDE#resource_key   │
-│  3. Get counter:       PK=ORG#org-1, SK=COUNTER#resource_key    │
-│  4. List all org data: PK=ORG#org-1 (query all SK)              │
-│  5. List increase reqs: PK=ORG#org-1, SK begins_with INCREASE#  │
-│  6. Seed all counters: Scan SK begins_with COUNTER# (startup)   │
+│  1. Get org tier:      PK=ORG#org-1, SK=TIER             (table)│
+│  2. Get override:      PK=ORG#org-1, SK=OVERRIDE#res     (table)│
+│  3. Get counter:       PK=ORG#org-1, SK=COUNTER#res      (table)│
+│  4. List all org data: PK=ORG#org-1 (query all SK)       (table)│
+│  5. List increase reqs: PK=ORG#org-1, SK bw INCREASE#    (table)│
+│  6. Seed all counters: GSI1PK=COUNTER (query, not scan)  (GSI1) │
+│  7. List all overrides: GSI1PK=OVERRIDE                  (GSI1) │
+│  8. List all tiers:    GSI1PK=TIER                       (GSI1) │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
@@ -263,16 +274,25 @@ ACCUMULATOR (monotonic within period — resets on calendar boundary)
 
 ## DynamoDB Access Patterns
 
-| # | Access Pattern | PK | SK | Use Case |
-|---|---|---|---|---|
-| 1 | Get org tier | `ORG#{org_id}` | `TIER` | Auth reads on token creation |
-| 2 | Set org tier | `ORG#{org_id}` | `TIER` | Payment webhook updates |
-| 3 | Get override | `ORG#{org_id}` | `OVERRIDE#{resource_key}` | Engine reads (cached) |
-| 4 | List overrides | `ORG#{org_id}` | `begins_with(OVERRIDE#)` | Admin dashboard |
-| 5 | Get counter snapshot | `ORG#{org_id}` | `COUNTER#{resource_key}` | Startup recovery |
-| 6 | Snapshot counter | `ORG#{org_id}` | `COUNTER#{resource_key}` | Periodic sync worker |
-| 7 | List org quota state | `ORG#{org_id}` | `*` | Admin full org view |
-| 8 | List increase requests | `ORG#{org_id}` | `begins_with(INCREASE#)` | Self-service requests |
-| 9 | Scan all counters | Scan | `begins_with(COUNTER#)` | Startup seed (one-time) |
+### Table (PK/SK)
 
-All reads are single-item `GetItem` (1 RCU) except patterns 4, 7, 8, 9 which use `Query`/`Scan`. Pattern 9 (scan) runs only on cold start.
+| # | Access Pattern | PK | SK | Op |
+|---|---|---|---|---|
+| 1 | Get org tier | `ORG#{org_id}` | `TIER` | GetItem |
+| 2 | Set org tier | `ORG#{org_id}` | `TIER` | PutItem |
+| 3 | Get override | `ORG#{org_id}` | `OVERRIDE#{resource_key}` | GetItem |
+| 4 | List org overrides | `ORG#{org_id}` | `begins_with(OVERRIDE#)` | Query |
+| 5 | Get counter snapshot | `ORG#{org_id}` | `COUNTER#{resource_key}` | GetItem |
+| 6 | Snapshot counter | `ORG#{org_id}` | `COUNTER#{resource_key}` | PutItem |
+| 7 | List all org data | `ORG#{org_id}` | `*` | Query |
+| 8 | List increase requests | `ORG#{org_id}` | `begins_with(INCREASE#)` | Query |
+
+### GSI1 (overloaded — cross-org queries by item type)
+
+| # | Access Pattern | GSI1PK | GSI1SK | Op |
+|---|---|---|---|---|
+| 9 | Seed all counters (startup) | `COUNTER` | — | Query |
+| 10 | List all overrides (admin) | `OVERRIDE` | — | Query |
+| 11 | List all tiers (admin) | `TIER` | — | Query |
+
+All hot-path reads are single-item `GetItem` (1 RCU). Cross-org admin queries use GSI1 Query. **No table scans.**

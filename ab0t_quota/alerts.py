@@ -36,14 +36,10 @@ class LogAlertDispatcher(AlertDispatcher):
     async def dispatch(self, alert: QuotaAlert) -> None:
         log_fn = logger.warning if alert.severity == AlertSeverity.WARNING else logger.error
         log_fn(
-            "quota_alert",
-            org_id=alert.org_id,
-            resource_key=alert.resource_key,
-            severity=alert.severity.value,
-            current=alert.current,
-            limit=alert.limit,
-            utilization=round(alert.utilization, 3),
-            message=alert.message,
+            "quota_alert org_id=%s resource_key=%s severity=%s current=%s limit=%s utilization=%s message=%s",
+            alert.org_id, alert.resource_key, alert.severity.value,
+            alert.current, alert.limit, round(alert.utilization, 3),
+            alert.message,
         )
 
 
@@ -120,6 +116,12 @@ class AlertManager:
         self._dispatchers = dispatchers or [LogAlertDispatcher()]
         self._cooldown = cooldown_seconds
 
+    _SEVERITY_ORDER = {
+        AlertSeverity.WARNING.value: 1,
+        AlertSeverity.CRITICAL.value: 2,
+        AlertSeverity.EXCEEDED.value: 3,
+    }
+
     async def maybe_alert(self, alert: QuotaAlert) -> bool:
         """Dispatch alert if cooldown allows. Returns True if dispatched."""
         if alert.severity in (AlertSeverity.INFO,):
@@ -130,14 +132,15 @@ class AlertManager:
 
         if last_severity:
             last_sev = last_severity.decode() if isinstance(last_severity, bytes) else last_severity
-            # Only re-alert if severity escalated
-            severity_order = {
-                AlertSeverity.WARNING.value: 1,
-                AlertSeverity.CRITICAL.value: 2,
-                AlertSeverity.EXCEEDED.value: 3,
-            }
-            if severity_order.get(alert.severity.value, 0) <= severity_order.get(last_sev, 0):
+            if self._SEVERITY_ORDER.get(alert.severity.value, 0) <= self._SEVERITY_ORDER.get(last_sev, 0):
                 return False  # already alerted at this or higher severity
+
+        # Atomically claim the right to dispatch this alert.
+        # SET NX prevents duplicate dispatches from concurrent requests.
+        dispatch_key = f"{cache_key}:dispatch:{alert.severity.value}"
+        acquired = await self._redis.set(dispatch_key, "1", ex=60, nx=True)
+        if not acquired:
+            return False
 
         # Dispatch to all registered dispatchers
         for dispatcher in self._dispatchers:

@@ -3,7 +3,7 @@
 import pytest
 import pytest_asyncio
 import fakeredis.aioredis
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from ab0t_quota.engine import QuotaEngine
 from ab0t_quota.models.core import (
@@ -172,7 +172,7 @@ class TestOverride:
 
         override = QuotaOverride(
             org_id="org-1", resource_key="sandbox.concurrent", limit=10,
-            expires_at=datetime.utcnow() - timedelta(hours=1),  # expired
+            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),  # expired
         )
 
         async def load_override(org_id, resource_key):

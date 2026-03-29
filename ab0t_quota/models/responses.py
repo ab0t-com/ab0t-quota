@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, computed_field
 
 from .core import AlertSeverity, TierLimits
@@ -154,7 +154,7 @@ class QuotaUsageResponse(BaseModel):
     tier_id: str
     tier_display: str
     resources: list[QuotaUsageItem]
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @computed_field
     @property
@@ -195,7 +195,7 @@ class QuotaAlertResponse(BaseModel):
     """Active alerts for an org."""
     org_id: str
     alerts: list[QuotaAlertItem]
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class QuotaAlertItem(BaseModel):

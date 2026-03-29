@@ -17,7 +17,7 @@ DynamoDB is read on startup (to seed Redis) and written to periodically.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from .models.core import QuotaOverride, TierLimits
@@ -81,6 +81,18 @@ class QuotaStore:
                     AttributeDefinitions=[
                         {"AttributeName": "PK", "AttributeType": "S"},
                         {"AttributeName": "SK", "AttributeType": "S"},
+                        {"AttributeName": "GSI1PK", "AttributeType": "S"},
+                        {"AttributeName": "GSI1SK", "AttributeType": "S"},
+                    ],
+                    GlobalSecondaryIndexes=[
+                        {
+                            "IndexName": "GSI1",
+                            "KeySchema": [
+                                {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                                {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                            ],
+                            "Projection": {"ProjectionType": "ALL"},
+                        },
                     ],
                     BillingMode="PAY_PER_REQUEST",
                     Tags=[
@@ -112,9 +124,11 @@ class QuotaStore:
         await self._table.put_item(Item={
             "PK": f"ORG#{org_id}",
             "SK": "TIER",
+            "GSI1PK": "TIER",
+            "GSI1SK": f"ORG#{org_id}",
             "tier_id": tier_id,
             "changed_by": changed_by or "system",
-            "changed_at": datetime.utcnow().isoformat(),
+            "changed_at": datetime.now(timezone.utc).isoformat(),
         })
 
     # ------------------------------------------------------------------
@@ -137,7 +151,7 @@ class QuotaStore:
             reason=item.get("reason"),
             expires_at=datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None,
             created_by=item.get("created_by"),
-            created_at=datetime.fromisoformat(item["created_at"]) if item.get("created_at") else datetime.utcnow(),
+            created_at=datetime.fromisoformat(item["created_at"]) if item.get("created_at") else datetime.now(timezone.utc),
         )
 
     async def set_override(self, override: QuotaOverride) -> None:
@@ -145,6 +159,8 @@ class QuotaStore:
         item = {
             "PK": f"ORG#{override.org_id}",
             "SK": f"OVERRIDE#{override.resource_key}",
+            "GSI1PK": "OVERRIDE",
+            "GSI1SK": f"ORG#{override.org_id}#{override.resource_key}",
             "limit": str(override.limit) if override.limit is not None else None,
             "reason": override.reason,
             "created_by": override.created_by,
@@ -170,8 +186,10 @@ class QuotaStore:
         await self._table.put_item(Item={
             "PK": f"ORG#{org_id}",
             "SK": f"COUNTER#{resource_key}",
+            "GSI1PK": "COUNTER",
+            "GSI1SK": f"ORG#{org_id}#{resource_key}",
             "value": str(value),
-            "snapshotted_at": datetime.utcnow().isoformat(),
+            "snapshotted_at": datetime.now(timezone.utc).isoformat(),
         })
 
     async def get_counter_snapshot(self, org_id: str, resource_key: str) -> Optional[float]:
@@ -190,29 +208,41 @@ class QuotaStore:
     async def seed_redis(self, redis, registry) -> int:
         """On startup, restore Redis counters from DynamoDB snapshots.
 
+        Uses GSI1 (GSI1PK=COUNTER) to query all counter snapshots without
+        scanning the entire table.
+
         Returns number of counters restored.
         """
         from .counters.factory import create_counter
 
         restored = 0
-        # Scan for all counter snapshots
-        response = await self._table.scan(
-            FilterExpression="begins_with(SK, :prefix)",
-            ExpressionAttributeValues={":prefix": "COUNTER#"},
-        )
-        for item in response.get("Items", []):
-            org_id = item["PK"].replace("ORG#", "")
-            resource_key = item["SK"].replace("COUNTER#", "")
-            value = float(item["value"])
+        query_kwargs = {
+            "IndexName": "GSI1",
+            "KeyConditionExpression": "GSI1PK = :pk",
+            "ExpressionAttributeValues": {":pk": "COUNTER"},
+        }
 
-            resource_def = registry.get(resource_key)
-            if resource_def:
-                counter = create_counter(redis, org_id, resource_def)
-                current = await counter.get()
-                if current == 0 and value > 0:
-                    await counter.reset(value)
-                    restored += 1
-                    logger.info("Restored counter %s for org %s: %s", resource_key, org_id, value)
+        while True:
+            response = await self._table.query(**query_kwargs)
+            for item in response.get("Items", []):
+                org_id = item["PK"].replace("ORG#", "")
+                resource_key = item["SK"].replace("COUNTER#", "")
+                value = float(item["value"])
+
+                resource_def = registry.get(resource_key)
+                if resource_def:
+                    counter = create_counter(redis, org_id, resource_def)
+                    current = await counter.get()
+                    if current == 0 and value > 0:
+                        await counter.reset(value)
+                        restored += 1
+                        logger.info("Restored counter %s for org %s: %s", resource_key, org_id, value)
+
+            # Handle pagination
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_key
 
         logger.info("Seeded %d counters from DynamoDB", restored)
         return restored

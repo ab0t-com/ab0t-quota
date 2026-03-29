@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -255,14 +255,14 @@ class QuotaOverride(BaseModel):
         description="User ID of the admin who created the override",
     )
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
     )
 
     @property
     def is_expired(self) -> bool:
         if self.expires_at is None:
             return False
-        return datetime.utcnow() > self.expires_at
+        return datetime.now(timezone.utc) > self.expires_at
 
 
 # ---------------------------------------------------------------------------
@@ -335,4 +335,4 @@ class QuotaAlert(BaseModel):
     utilization: float = Field(description="0.0–1.0+")
     tier_id: str
     message: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -18,7 +18,7 @@ from .models.core import (
     TierLimits,
     QuotaOverride,
 )
-from .providers import TierProvider, JWTTierProvider, AuthServiceTierProvider
+from .providers import TierProvider, JWTTierProvider, AuthServiceTierProvider, StaticTierProvider
 from .alerts import AlertManager, AlertDispatcher, LogAlertDispatcher, WebhookAlertDispatcher
 from .config import load_config, load_tiers, load_resources
 from .messages import MessageBuilder
@@ -27,20 +27,39 @@ from .persistence import QuotaStore
 __version__ = "0.1.0"
 
 __all__ = [
+    # Engine & middleware
     "QuotaEngine",
     "QuotaGuard",
+    # Responses
     "QuotaResult",
     "QuotaUsageResponse",
     "QuotaLimitsResponse",
+    # Requests
     "QuotaCheckRequest",
     "QuotaIncrementRequest",
     "QuotaBatchCheckRequest",
+    # Core models
     "ResourceDef",
     "CounterType",
     "TierConfig",
     "TierLimits",
     "QuotaOverride",
+    # Providers
     "TierProvider",
     "JWTTierProvider",
     "AuthServiceTierProvider",
+    "StaticTierProvider",
+    # Alerts
+    "AlertManager",
+    "AlertDispatcher",
+    "LogAlertDispatcher",
+    "WebhookAlertDispatcher",
+    # Persistence
+    "QuotaStore",
+    # Config
+    "load_config",
+    "load_tiers",
+    "load_resources",
+    # Messages
+    "MessageBuilder",
 ]
