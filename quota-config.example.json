@@ -37,6 +37,14 @@
     "auto_correct": true
   },
 
+  "$comment_resource_bundles": "Optional. Generic dispatch layer: name → list of resource_keys consumed when one of these is created. The library has no opinion on what bundles represent — pick whatever names suit your domain (instance types, plan tiers, product variants, anything). Use engine.check_for_bundle / increment_for_bundle / decrement_for_bundle in your routes instead of writing per-shape branching logic.",
+  "resource_bundles": {
+    "default":   ["sandbox.concurrent"],
+    "with_gpu":  ["sandbox.concurrent", "sandbox.gpu_instances"],
+    "browser":   ["sandbox.browser_sessions"],
+    "desktop":   ["sandbox.desktop_sessions"]
+  },
+
   "tiers": [
     {
       "tier_id": "free",
@@ -64,6 +72,8 @@
       "sort_order": 1,
       "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access"],
       "upgrade_url": "/billing/upgrade",
+      "$comment_per_user": "default_per_user_fraction caps any single user at this fraction of the org limit. Prevents one team member from exhausting the org quota. Applied to GAUGE resources only when no explicit per_user_limit is set on the resource.",
+      "default_per_user_fraction": 0.5,
       "limits": {
         "sandbox.concurrent": 5,
         "sandbox.monthly_cost": 100.00,
@@ -83,6 +93,7 @@
       "sort_order": 2,
       "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access", "gpu_access", "audit_logs", "priority_support"],
       "upgrade_url": "/billing/upgrade",
+      "default_per_user_fraction": 0.4,
       "limits": {
         "sandbox.concurrent": 25,
         "sandbox.monthly_cost": 1000.00,

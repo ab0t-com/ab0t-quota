@@ -20,11 +20,14 @@ from .models.core import (
 )
 from .providers import TierProvider, JWTTierProvider, AuthServiceTierProvider, StaticTierProvider
 from .alerts import AlertManager, AlertDispatcher, LogAlertDispatcher, WebhookAlertDispatcher
-from .config import load_config, load_tiers, load_resources
+from .config import load_config, load_tiers, load_resources, load_resource_bundles
 from .messages import MessageBuilder
 from .persistence import QuotaStore
+from .setup import setup_quota, QuotaContext
+from .bridge import BridgeClient, BridgeContext, RemoteTierProvider
+from .caches import CachedBridgeClient, TTLCache
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # Engine & middleware
@@ -61,6 +64,16 @@ __all__ = [
     "load_config",
     "load_tiers",
     "load_resources",
+    "load_resource_bundles",
     # Messages
     "MessageBuilder",
+    # Drop-in setup
+    "setup_quota",
+    "QuotaContext",
+    # Bridge mode (third-party HTTP-only deployments)
+    "BridgeClient",
+    "BridgeContext",
+    "RemoteTierProvider",
+    "CachedBridgeClient",
+    "TTLCache",
 ]

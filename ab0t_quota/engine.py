@@ -59,6 +59,7 @@ class QuotaEngine:
         registry: ResourceRegistry,
         tiers: Optional[dict[str, TierConfig]] = None,
         override_loader: Optional[callable] = None,
+        resource_bundles: Optional[dict[str, list[str]]] = None,
     ):
         self._redis = redis
         self._tier_provider = tier_provider
@@ -66,6 +67,34 @@ class QuotaEngine:
         self._tiers = tiers or DEFAULT_TIERS
         self._override_loader = override_loader  # async fn(org_id, resource_key) → QuotaOverride | None
         self._alert_manager: Optional[AlertManager] = None
+        # Bundle name → list[resource_key]: a named set of resources that
+        # are checked / incremented / decremented together when the consumer
+        # creates one "thing" of this kind. Generic — the library knows
+        # nothing about what the bundles represent. Consumers declare whatever
+        # bundle names make sense for their domain in `quota-config.json`:
+        #
+        #   "resource_bundles": {
+        #     "<consumer-defined name>": ["<resource_key>", ...],
+        #     ...
+        #   }
+        #
+        # Examples (consumer-specific, never in the library):
+        #   {"gpu_sandbox": ["sandbox.concurrent", "sandbox.gpu_instances"]}
+        #   {"premium_contact": ["crm.contacts", "crm.premium_contacts"]}
+        #   {"large_index": ["vector.indices", "vector.storage_gb"]}
+        self._resource_bundles: dict[str, list[str]] = dict(resource_bundles or {})
+
+    def set_resource_bundles(self, bundles: dict[str, list[str]]) -> None:
+        """Replace the resource-bundle map. Used by setup_quota() to load
+        bundles from `quota-config.json` after engine construction."""
+        self._resource_bundles = dict(bundles or {})
+
+    def bundle_resources(self, bundle_name: str) -> list[str]:
+        """Return the resource_keys this bundle consumes. Empty list if
+        the bundle is not declared (no checks happen — fail open at the
+        dispatch layer; per-resource enforcement still applies if the
+        consumer calls check() / increment() directly)."""
+        return list(self._resource_bundles.get(bundle_name, []))
 
     # ------------------------------------------------------------------
     # Check
@@ -108,18 +137,21 @@ class QuotaEngine:
             if isinstance(counter, RateCounter):
                 result.retry_after = await counter.seconds_until_slot()
 
-        # Per-user sub-quota check (only for gauges, only when user_id provided)
+        # Per-user sub-quota check (only for gauges, only when user_id provided).
+        # Effective per-user limit = explicit per_user_limit, or derived from
+        # tier.default_per_user_fraction when none is explicitly set.
+        effective_per_user = tier.derive_per_user_limit(tier_limits)
         if (
             result.allowed
             and request.user_id
-            and tier_limits.per_user_limit is not None
+            and effective_per_user is not None
             and resource_def.counter_type == CounterType.GAUGE
         ):
             from .counters.gauge import GaugeCounter
             if isinstance(counter, GaugeCounter):
                 user_current = await counter.get_user(request.user_id)
                 user_after = user_current + request.increment
-                if user_after > tier_limits.per_user_limit:
+                if user_after > effective_per_user:
                     result = QuotaResult(
                         decision=QuotaDecision.DENY,
                         resource_key=request.resource_key,
@@ -133,20 +165,20 @@ class QuotaEngine:
                         severity=AlertSeverity.EXCEEDED,
                         message=(
                             f"You've used {user_current:.0f} of your personal "
-                            f"{tier_limits.per_user_limit:.0f} {resource_def.unit} "
+                            f"{effective_per_user:.0f} {resource_def.unit} "
                             f"allowance. Ask your org admin to increase your limit "
                             f"or stop existing resources."
                         ),
                         user_id=request.user_id,
                         user_current=user_current,
-                        user_limit=tier_limits.per_user_limit,
+                        user_limit=effective_per_user,
                         denied_level="user",
                     )
                 else:
                     # Annotate the allowed result with user info
                     result.user_id = request.user_id
                     result.user_current = user_current
-                    result.user_limit = tier_limits.per_user_limit
+                    result.user_limit = effective_per_user
 
         # Fire alert on warning/critical/exceeded
         if self._alert_manager and result.severity in (
@@ -227,6 +259,90 @@ class QuotaEngine:
             previous_value, request.new_value, request.reason,
         )
         await counter.reset(request.new_value)
+
+    # ------------------------------------------------------------------
+    # Resource-bundle helpers — declarative dispatch for "creating one thing"
+    # ------------------------------------------------------------------
+
+    async def check_for_bundle(
+        self,
+        org_id: str,
+        bundle_name: str,
+        user_id: Optional[str] = None,
+        **provider_kwargs,
+    ) -> QuotaBatchResult:
+        """Pre-flight check for creating one of `bundle_name`.
+
+        Looks up the bundle's declared resource_keys and batch-checks them
+        all. Unknown bundle → trivially allowed (the library knows nothing
+        about consumer-specific names; per-resource enforcement still
+        applies when the consumer calls check() directly).
+        """
+        from .models.requests import QuotaCheckItem
+        resource_keys = self._resource_bundles.get(bundle_name)
+        if not resource_keys:
+            return QuotaBatchResult(
+                allowed=True, results=[], denied_resources=[], warning_resources=[],
+            )
+        return await self.batch_check(
+            QuotaBatchCheckRequest(
+                org_id=org_id,
+                user_id=user_id,
+                checks=[QuotaCheckItem(resource_key=rk) for rk in resource_keys],
+            ),
+            **provider_kwargs,
+        )
+
+    async def increment_for_bundle(
+        self,
+        org_id: str,
+        bundle_name: str,
+        user_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, float]:
+        """Increment every counter the bundle consumes, after successful create.
+
+        Returns {resource_key: new_value}. Per-resource idempotency keys
+        are namespaced so a retry that already partially committed is safe.
+        """
+        out: dict[str, float] = {}
+        for rk in self._resource_bundles.get(bundle_name, []):
+            idem = f"{idempotency_key}:{rk}" if idempotency_key else None
+            new_val = await self.increment(QuotaIncrementRequest(
+                org_id=org_id, resource_key=rk, user_id=user_id, idempotency_key=idem,
+            ))
+            out[rk] = new_val
+        return out
+
+    async def decrement_for_bundle(
+        self,
+        org_id: str,
+        bundle_name: str,
+        user_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, float]:
+        """Decrement every GAUGE counter the bundle consumes, on teardown.
+
+        Non-gauge resources in the bundle (accumulators, rates) are silently
+        skipped — they don't decrement.
+        """
+        out: dict[str, float] = {}
+        for rk in self._resource_bundles.get(bundle_name, []):
+            rd = self._registry.get(rk)
+            if rd is None or rd.counter_type != CounterType.GAUGE:
+                continue
+            idem = f"{idempotency_key}:{rk}" if idempotency_key else None
+            try:
+                new_val = await self.decrement(QuotaDecrementRequest(
+                    org_id=org_id, resource_key=rk, user_id=user_id, idempotency_key=idem,
+                ))
+                out[rk] = new_val
+            except Exception as e:
+                logger.warning(
+                    "decrement_for_bundle_failed org=%s bundle=%s resource=%s error=%s",
+                    org_id, bundle_name, rk, str(e),
+                )
+        return out
 
     # ------------------------------------------------------------------
     # Usage reporting

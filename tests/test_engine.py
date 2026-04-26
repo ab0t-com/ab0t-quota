@@ -240,6 +240,345 @@ class TestPerUser:
 
 
 # ---------------------------------------------------------------------------
+# Per-user sub-quota DERIVED from default_per_user_fraction
+# ---------------------------------------------------------------------------
+
+class TestDefaultPerUserFraction:
+    """When a tier sets default_per_user_fraction, every GAUGE without an
+    explicit per_user_limit gets one derived = ceil(limit * fraction)."""
+
+    def _engine_with_fraction(self, redis, *, fraction):
+        registry = ResourceRegistry()
+        # Just one gauge resource at limit=10
+        registry.register(ResourceDef(
+            service="test", resource_key="sandbox.concurrent",
+            display_name="Concurrent", counter_type=CounterType.GAUGE, unit="sandboxes",
+        ))
+        tiers = {
+            "starter": TierConfig(
+                tier_id="starter", display_name="Starter", sort_order=1,
+                default_per_user_fraction=fraction,
+                limits={"sandbox.concurrent": TierLimits(limit=10)},
+            ),
+        }
+        provider = StaticTierProvider({"org-1": "starter"})
+        return QuotaEngine(redis=redis, tier_provider=provider, registry=registry, tiers=tiers)
+
+    @pytest.mark.asyncio
+    async def test_fraction_caps_user_at_half_of_org(self, redis):
+        """fraction=0.5, org limit=10 → each user capped at 5."""
+        engine = self._engine_with_fraction(redis, fraction=0.5)
+        for _ in range(5):
+            await engine.increment(QuotaIncrementRequest(
+                org_id="org-1", resource_key="sandbox.concurrent", delta=1, user_id="alice",
+            ))
+        # 6th alice request should fail at user level — not org (org is at 5/10)
+        result = await engine.check(QuotaCheckRequest(
+            org_id="org-1", resource_key="sandbox.concurrent", user_id="alice",
+        ))
+        assert result.denied is True
+        assert result.denied_level == "user"
+        assert result.user_current == 5
+        assert result.user_limit == 5
+
+    @pytest.mark.asyncio
+    async def test_fraction_other_user_still_allowed(self, redis):
+        """Alice maxed at 5/5 personal; Bob can still create up to his own 5."""
+        engine = self._engine_with_fraction(redis, fraction=0.5)
+        for _ in range(5):
+            await engine.increment(QuotaIncrementRequest(
+                org_id="org-1", resource_key="sandbox.concurrent", delta=1, user_id="alice",
+            ))
+        result = await engine.check(QuotaCheckRequest(
+            org_id="org-1", resource_key="sandbox.concurrent", user_id="bob",
+        ))
+        assert result.allowed is True
+        assert result.user_limit == 5
+        assert result.user_current == 0
+
+    @pytest.mark.asyncio
+    async def test_explicit_per_user_overrides_fraction(self, redis):
+        """If a TierLimits sets per_user_limit explicitly, fraction is ignored."""
+        registry = ResourceRegistry()
+        registry.register(ResourceDef(
+            service="test", resource_key="sandbox.concurrent",
+            display_name="Concurrent", counter_type=CounterType.GAUGE, unit="sandboxes",
+        ))
+        tiers = {
+            "starter": TierConfig(
+                tier_id="starter", display_name="Starter",
+                default_per_user_fraction=0.5,  # would derive 5
+                limits={"sandbox.concurrent": TierLimits(limit=10, per_user_limit=2)},  # explicit 2 wins
+            ),
+        }
+        provider = StaticTierProvider({"org-1": "starter"})
+        engine = QuotaEngine(redis=redis, tier_provider=provider, registry=registry, tiers=tiers)
+        for _ in range(2):
+            await engine.increment(QuotaIncrementRequest(
+                org_id="org-1", resource_key="sandbox.concurrent", delta=1, user_id="alice",
+            ))
+        result = await engine.check(QuotaCheckRequest(
+            org_id="org-1", resource_key="sandbox.concurrent", user_id="alice",
+        ))
+        assert result.denied is True
+        assert result.denied_level == "user"
+        assert result.user_limit == 2  # explicit, not derived 5
+
+    @pytest.mark.asyncio
+    async def test_no_fraction_means_no_per_user_enforcement(self, redis):
+        """default_per_user_fraction=None means a single user can fill the org."""
+        engine = self._engine_with_fraction(redis, fraction=None) if False else None
+        # Build directly without fraction
+        registry = ResourceRegistry()
+        registry.register(ResourceDef(
+            service="test", resource_key="sandbox.concurrent",
+            display_name="Concurrent", counter_type=CounterType.GAUGE, unit="sandboxes",
+        ))
+        tiers = {
+            "free": TierConfig(
+                tier_id="free", display_name="Free",
+                limits={"sandbox.concurrent": TierLimits(limit=10)},
+            ),
+        }
+        provider = StaticTierProvider({"org-1": "free"})
+        engine = QuotaEngine(redis=redis, tier_provider=provider, registry=registry, tiers=tiers)
+        for _ in range(9):
+            await engine.increment(QuotaIncrementRequest(
+                org_id="org-1", resource_key="sandbox.concurrent", delta=1, user_id="alice",
+            ))
+        result = await engine.check(QuotaCheckRequest(
+            org_id="org-1", resource_key="sandbox.concurrent", user_id="alice",
+        ))
+        assert result.allowed is True  # no per-user cap
+        assert result.user_limit is None
+
+    @pytest.mark.asyncio
+    async def test_fraction_skipped_for_unlimited_tier(self, redis):
+        """Enterprise (limit=None) shouldn't derive a per-user cap from fraction."""
+        registry = ResourceRegistry()
+        registry.register(ResourceDef(
+            service="test", resource_key="sandbox.concurrent",
+            display_name="Concurrent", counter_type=CounterType.GAUGE, unit="sandboxes",
+        ))
+        tiers = {
+            "enterprise": TierConfig(
+                tier_id="enterprise", display_name="Enterprise",
+                default_per_user_fraction=0.5,  # ignored — limit is None
+                limits={"sandbox.concurrent": TierLimits(limit=None)},
+            ),
+        }
+        provider = StaticTierProvider({"org-1": "enterprise"})
+        engine = QuotaEngine(redis=redis, tier_provider=provider, registry=registry, tiers=tiers)
+        for _ in range(100):
+            await engine.increment(QuotaIncrementRequest(
+                org_id="org-1", resource_key="sandbox.concurrent", delta=1, user_id="alice",
+            ))
+        result = await engine.check(QuotaCheckRequest(
+            org_id="org-1", resource_key="sandbox.concurrent", user_id="alice",
+        ))
+        assert result.allowed is True
+        assert result.decision == QuotaDecision.UNLIMITED
+
+    @pytest.mark.asyncio
+    async def test_fraction_floors_at_one(self, redis):
+        """ceil(1 * 0.1) would be 1; we never derive 0 because that blocks all users."""
+        engine = self._engine_with_fraction(redis, fraction=0.1)
+        # org limit=10, fraction=0.1 → derived per-user = ceil(1.0) = 1
+        # So alice can take 1, then is denied
+        await engine.increment(QuotaIncrementRequest(
+            org_id="org-1", resource_key="sandbox.concurrent", delta=1, user_id="alice",
+        ))
+        result = await engine.check(QuotaCheckRequest(
+            org_id="org-1", resource_key="sandbox.concurrent", user_id="alice",
+        ))
+        assert result.denied is True
+        assert result.user_limit == 1
+
+
+class TestResourceBundles:
+    """check_for_bundle / increment_for_bundle / decrement_for_bundle.
+
+    The bundle map is generic — bundle names mean whatever the consumer
+    decides. These tests use neutral names ("single", "multi") to make
+    that explicit.
+    """
+
+    def _engine_with_bundles(self, redis):
+        registry = ResourceRegistry()
+        registry.register(
+            ResourceDef(service="x", resource_key="thing.a",
+                        display_name="A", counter_type=CounterType.GAUGE, unit="x"),
+            ResourceDef(service="x", resource_key="thing.b",
+                        display_name="B", counter_type=CounterType.GAUGE, unit="x"),
+            ResourceDef(service="x", resource_key="thing.cost",
+                        display_name="Cost", counter_type=CounterType.ACCUMULATOR,
+                        unit="USD", reset_period=ResetPeriod.MONTHLY),
+        )
+        tiers = {
+            "free": TierConfig(
+                tier_id="free", display_name="Free",
+                limits={
+                    "thing.a": TierLimits(limit=2),
+                    "thing.b": TierLimits(limit=1),
+                    "thing.cost": TierLimits(limit=10.0),
+                },
+            ),
+        }
+        provider = StaticTierProvider({"org-1": "free"})
+        bundles = {
+            "single": ["thing.a"],
+            "multi":  ["thing.a", "thing.b"],
+            "with_cost": ["thing.a", "thing.cost"],
+        }
+        return QuotaEngine(
+            redis=redis, tier_provider=provider, registry=registry,
+            tiers=tiers, resource_bundles=bundles,
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_resource_bundle_passes(self, redis):
+        engine = self._engine_with_bundles(redis)
+        result = await engine.check_for_bundle("org-1", "single")
+        assert result.allowed is True
+        assert len(result.results) == 1
+        assert result.results[0].resource_key == "thing.a"
+
+    @pytest.mark.asyncio
+    async def test_multi_resource_bundle_batch_checks(self, redis):
+        engine = self._engine_with_bundles(redis)
+        result = await engine.check_for_bundle("org-1", "multi")
+        assert result.allowed is True
+        assert {r.resource_key for r in result.results} == {"thing.a", "thing.b"}
+
+    @pytest.mark.asyncio
+    async def test_bundle_denies_if_any_resource_at_limit(self, redis):
+        """thing.b limit=1; fill it; multi-bundle check should deny."""
+        engine = self._engine_with_bundles(redis)
+        await engine.increment(QuotaIncrementRequest(
+            org_id="org-1", resource_key="thing.b", delta=1,
+        ))
+        result = await engine.check_for_bundle("org-1", "multi")
+        assert result.allowed is False
+        assert "thing.b" in result.denied_resources
+        assert "thing.a" not in result.denied_resources  # only b is at limit
+
+    @pytest.mark.asyncio
+    async def test_unknown_bundle_is_no_op_allow(self, redis):
+        """Library doesn't know consumer-specific bundle names; unknown → allow."""
+        engine = self._engine_with_bundles(redis)
+        result = await engine.check_for_bundle("org-1", "definitely-not-declared")
+        assert result.allowed is True
+        assert result.results == []
+        assert result.denied_resources == []
+
+    @pytest.mark.asyncio
+    async def test_increment_for_bundle_bumps_all(self, redis):
+        engine = self._engine_with_bundles(redis)
+        new_vals = await engine.increment_for_bundle("org-1", "multi")
+        assert new_vals == {"thing.a": 1.0, "thing.b": 1.0}
+
+    @pytest.mark.asyncio
+    async def test_decrement_for_bundle_skips_non_gauges(self, redis):
+        """Bundle with [gauge, accumulator] — decrement only touches the gauge."""
+        engine = self._engine_with_bundles(redis)
+        await engine.increment_for_bundle("org-1", "with_cost")
+        # Only gauge incremented to 1; accumulator also incremented to 1.0
+        # decrement should only touch the gauge
+        new_vals = await engine.decrement_for_bundle("org-1", "with_cost")
+        assert new_vals == {"thing.a": 0.0}  # only gauge decremented
+        # Accumulator value unchanged from increment
+        from ab0t_quota.counters.factory import create_counter
+        from ab0t_quota.models.core import ResetPeriod as RP
+        cost_def = ResourceDef(
+            service="x", resource_key="thing.cost", display_name="Cost",
+            counter_type=CounterType.ACCUMULATOR, unit="USD", reset_period=RP.MONTHLY,
+        )
+        counter = create_counter(redis, "org-1", cost_def)
+        assert await counter.get() == 1.0  # not decremented
+
+    @pytest.mark.asyncio
+    async def test_increment_idempotency_namespaced_per_resource(self, redis):
+        engine = self._engine_with_bundles(redis)
+        # Call twice with the same idempotency_key — second call no-ops on each resource
+        await engine.increment_for_bundle("org-1", "multi", idempotency_key="op-1")
+        await engine.increment_for_bundle("org-1", "multi", idempotency_key="op-1")
+        from ab0t_quota.counters.factory import create_counter
+        a_def = ResourceDef(service="x", resource_key="thing.a", display_name="A",
+                            counter_type=CounterType.GAUGE, unit="x")
+        b_def = ResourceDef(service="x", resource_key="thing.b", display_name="B",
+                            counter_type=CounterType.GAUGE, unit="x")
+        a = create_counter(redis, "org-1", a_def)
+        b = create_counter(redis, "org-1", b_def)
+        assert await a.get() == 1.0
+        assert await b.get() == 1.0
+
+    @pytest.mark.asyncio
+    async def test_set_resource_bundles_after_construction(self, redis):
+        """setup_quota() needs to load bundles after the engine is built."""
+        registry = ResourceRegistry()
+        registry.register(ResourceDef(
+            service="x", resource_key="thing.a", display_name="A",
+            counter_type=CounterType.GAUGE, unit="x",
+        ))
+        engine = QuotaEngine(
+            redis=redis,
+            tier_provider=StaticTierProvider({"org-1": "free"}),
+            registry=registry,
+            tiers={"free": TierConfig(tier_id="free", display_name="Free",
+                                       limits={"thing.a": TierLimits(limit=5)})},
+        )
+        assert engine.bundle_resources("foo") == []
+        engine.set_resource_bundles({"foo": ["thing.a"]})
+        assert engine.bundle_resources("foo") == ["thing.a"]
+        result = await engine.check_for_bundle("org-1", "foo")
+        assert result.allowed is True
+        assert len(result.results) == 1
+
+
+class TestTierConfigDerivation:
+    """Unit-test TierConfig.derive_per_user_limit in isolation."""
+
+    def test_explicit_wins(self):
+        tier = TierConfig(tier_id="t", display_name="T", default_per_user_fraction=0.5)
+        tl = TierLimits(limit=10, per_user_limit=3)
+        assert tier.derive_per_user_limit(tl) == 3
+
+    def test_derives_from_fraction(self):
+        tier = TierConfig(tier_id="t", display_name="T", default_per_user_fraction=0.5)
+        tl = TierLimits(limit=10)
+        assert tier.derive_per_user_limit(tl) == 5
+
+    def test_ceils_up(self):
+        tier = TierConfig(tier_id="t", display_name="T", default_per_user_fraction=0.4)
+        tl = TierLimits(limit=10)
+        assert tier.derive_per_user_limit(tl) == 4
+        tl2 = TierLimits(limit=11)
+        assert tier.derive_per_user_limit(tl2) == 5  # ceil(4.4)
+
+    def test_floors_at_one(self):
+        tier = TierConfig(tier_id="t", display_name="T", default_per_user_fraction=0.1)
+        tl = TierLimits(limit=1)
+        assert tier.derive_per_user_limit(tl) == 1
+
+    def test_returns_none_without_fraction(self):
+        tier = TierConfig(tier_id="t", display_name="T")
+        assert tier.derive_per_user_limit(TierLimits(limit=10)) is None
+
+    def test_returns_none_for_unlimited(self):
+        tier = TierConfig(tier_id="t", display_name="T", default_per_user_fraction=0.5)
+        assert tier.derive_per_user_limit(TierLimits(limit=None)) is None
+
+    def test_validates_fraction_bounds(self):
+        # Pydantic should reject fraction <= 0 or > 1
+        with pytest.raises(Exception):
+            TierConfig(tier_id="t", display_name="T", default_per_user_fraction=0)
+        with pytest.raises(Exception):
+            TierConfig(tier_id="t", display_name="T", default_per_user_fraction=1.5)
+        with pytest.raises(Exception):
+            TierConfig(tier_id="t", display_name="T", default_per_user_fraction=-0.1)
+
+
+# ---------------------------------------------------------------------------
 # batch_check()
 # ---------------------------------------------------------------------------
 

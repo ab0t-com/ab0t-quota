@@ -32,22 +32,21 @@ echo "[pre-commit] gitleaks check passed."
 HOOK
 chmod +x "${HOOKS_DIR}/pre-commit"
 
-# pre-push hook
+# pre-push hook — runs the full pre-publish gate (gitleaks + secrets +
+# tests + version + new-file audits). Bypass with: git push --no-verify
+# (don't bypass unless you know what you're doing).
 cat > "${HOOKS_DIR}/pre-push" << 'HOOK'
 #!/usr/bin/env bash
-set -euo pipefail
-echo "[pre-push] Running full gitleaks scan before push..."
-if ! command -v gitleaks &>/dev/null; then
-    echo "ERROR: gitleaks is not installed. Run: bash scripts/install-hooks.sh"
-    exit 1
-fi
-gitleaks detect --source . --config .gitleaks.toml --verbose
-echo "[pre-push] gitleaks full scan passed."
+set -e
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+echo "[pre-push] Running scripts/pre-publish.sh (full publish-readiness check)..."
+bash "$REPO_ROOT/scripts/pre-publish.sh"
 HOOK
 chmod +x "${HOOKS_DIR}/pre-push"
 
 echo "Hooks installed successfully:"
-echo "  - pre-commit: scans staged changes for secrets"
-echo "  - pre-push:   full repo scan before push"
+echo "  - pre-commit: scans staged changes for secrets (gitleaks)"
+echo "  - pre-push:   full publish-readiness check (scripts/pre-publish.sh)"
 echo ""
+echo "Bypass pre-push hook (NOT recommended): git push --no-verify"
 echo "gitleaks version: $(gitleaks version)"

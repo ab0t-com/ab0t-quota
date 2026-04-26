@@ -45,6 +45,10 @@ class QuotaStore:
         self._region = region
         self._endpoint_url = endpoint_url
         self._table = None
+        # Background sync worker state — set by start_sync_worker(), cleared by stop_sync_worker()
+        self._sync_task = None
+        # Per-(org,resource) cache of last-snapshot value to skip no-op writes
+        self._last_snapshot: dict[tuple[str, str], float] = {}
 
     @classmethod
     def _validate_endpoint_url(cls, url: str) -> None:
@@ -248,7 +252,166 @@ class QuotaStore:
         logger.info("Seeded %d counters from DynamoDB", restored)
         return restored
 
+    # ------------------------------------------------------------------
+    # Periodic Redis → DynamoDB snapshot worker
+    # ------------------------------------------------------------------
+
+    def start_sync_worker(self, redis, registry, interval_seconds: int = 300):
+        """Start a background task that snapshots all live Redis counters
+        to DynamoDB every `interval_seconds`. Returns the asyncio.Task.
+
+        The worker uses Redis SCAN (not KEYS) so it never blocks the
+        server; each pass walks `quota:*:gauge` and `quota:*:acc:*` keys
+        across all orgs, calling `snapshot_counter()` for any value that
+        has changed since the previous snapshot. No-op writes are skipped
+        in-memory to keep DynamoDB write cost bounded.
+
+        This is the recovery path's mirror image: `seed_redis()` reads
+        snapshots back on startup if Redis was wiped.
+        """
+        import asyncio
+        if self._sync_task is not None and not self._sync_task.done():
+            return self._sync_task  # already running
+        self._sync_task = asyncio.create_task(
+            self._sync_loop(redis, registry, interval_seconds),
+            name="ab0t_quota_sync_worker",
+        )
+        logger.info("snapshot_worker_started interval=%ds", interval_seconds)
+        return self._sync_task
+
+    async def stop_sync_worker(self):
+        """Cancel the background sync task. Safe to call if not running."""
+        import asyncio
+        task = self._sync_task
+        self._sync_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        logger.info("snapshot_worker_stopped")
+
+    async def _sync_loop(self, redis, registry, interval_seconds: int):
+        """Run snapshot passes forever, sleeping `interval_seconds` between passes."""
+        import asyncio
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                snapshotted = await self.snapshot_all(redis, registry)
+                if snapshotted:
+                    logger.debug("snapshot_pass_complete count=%d", snapshotted)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("snapshot_pass_error: %s", e)
+                # Don't tight-loop on persistent failure
+                await asyncio.sleep(min(interval_seconds, 30))
+
+    async def snapshot_all(self, redis, registry) -> int:
+        """One snapshot pass: SCAN all quota counter keys, write any
+        whose value has changed since the last pass to DynamoDB.
+
+        Returns the number of counters actually written this pass.
+        Used internally by the sync worker; also exposed for manual
+        flushing on shutdown or for tests.
+        """
+        from .models.core import CounterType
+        # Build a quick lookup of registered resource keys → resource def
+        keys_by_name = {r.resource_key: r for r in registry.all()}
+        if not keys_by_name:
+            return 0
+
+        # SCAN pattern catches gauge keys (`:gauge`) and accumulator
+        # period keys (`:acc:<period>`). Rate counters are excluded —
+        # they're sliding windows that self-expire and don't need snapshots.
+        written = 0
+        cursor = 0
+        while True:
+            cursor, batch = await redis.scan(
+                cursor=cursor, match="quota:*", count=500,
+            )
+            for key in batch:
+                key_str = key.decode() if isinstance(key, bytes) else key
+                parsed = self._parse_quota_key(key_str)
+                if parsed is None:
+                    continue
+                org_id, resource_key, kind = parsed
+
+                resource_def = keys_by_name.get(resource_key)
+                if resource_def is None:
+                    continue
+                # Skip per-user partition keys — org-level totals already cover them
+                if kind == "user":
+                    continue
+                # Snapshot gauges and accumulators only
+                if resource_def.counter_type not in (CounterType.GAUGE, CounterType.ACCUMULATOR):
+                    continue
+
+                raw = await redis.get(key)
+                if raw is None:
+                    continue
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    continue
+
+                # Skip no-op writes
+                cache_key = (org_id, resource_key)
+                if self._last_snapshot.get(cache_key) == value:
+                    continue
+                try:
+                    await self.snapshot_counter(org_id, resource_key, value)
+                    self._last_snapshot[cache_key] = value
+                    written += 1
+                except Exception as e:
+                    logger.warning(
+                        "snapshot_counter_failed org=%s resource=%s error=%s",
+                        org_id, resource_key, e,
+                    )
+
+            if cursor == 0:
+                break
+        return written
+
+    @staticmethod
+    def _parse_quota_key(key: str):
+        """Parse a Redis quota key into (org_id, resource_key, kind).
+
+        Recognized layouts:
+          quota:{org_id}:{resource_key}:gauge                  → ("...", "...", "gauge")
+          quota:{org_id}:{resource_key}:gauge:user:{user_id}   → ("...", "...", "user")
+          quota:{org_id}:{resource_key}:acc:{period}           → ("...", "...", "acc")
+
+        Returns None for keys that don't match (idem keys, alert cooldowns, tier cache, etc).
+        """
+        if not key.startswith("quota:"):
+            return None
+        # Strip the "quota:" prefix
+        remainder = key[len("quota:"):]
+        parts = remainder.split(":")
+        # Need at least: {org_id}, {resource_key_a}.{resource_key_b}, {kind}
+        # resource_key always contains a '.' (validated by ResourceDef regex)
+        if len(parts) < 3:
+            return None
+        org_id = parts[0]
+        # Find the part that ends in a recognized counter suffix
+        # parts[1] is the resource_key (single token containing '.')
+        if "." not in parts[1]:
+            return None
+        resource_key = parts[1]
+        suffix = parts[2]
+        if suffix == "gauge":
+            if len(parts) >= 5 and parts[3] == "user":
+                return (org_id, resource_key, "user")
+            return (org_id, resource_key, "gauge")
+        if suffix == "acc":
+            return (org_id, resource_key, "acc")
+        return None  # idem, alert, tier, dispatch, etc.
+
     async def close(self):
-        """Clean up DynamoDB resource."""
-        if self._resource_ctx:
+        """Clean up DynamoDB resource. Stops the snapshot worker if running."""
+        await self.stop_sync_worker()
+        if getattr(self, "_resource_ctx", None):
             await self._resource_ctx.__aexit__(None, None, None)

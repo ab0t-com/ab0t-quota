@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Processing - Sandbox Platform</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --canvas: #FFFFFF;
+            --ink-primary: #111111;
+            --ink-secondary: #666666;
+            --ink-tertiary: #999999;
+            --highlight: #FAFAFA;
+            --border-thin: 1px solid #EAEAEA;
+            --border-thick: 2px solid #000000;
+            --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            --radius-sm: 4px;
+            --radius-md: 6px;
+            --status-success: #059669;
+            --status-error: #DC2626;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: var(--font-ui);
+            background: var(--canvas);
+            color: var(--ink-primary);
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 480px;
+            width: 90%;
+            text-align: center;
+            padding: 48px 32px;
+            border: var(--border-thick);
+            border-radius: var(--radius-md);
+        }
+        .icon {
+            width: 64px;
+            height: 64px;
+            margin: 0 auto 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .icon-processing { background: var(--highlight); }
+        .icon-success { background: #d1fae5; }
+        .icon-error { background: #fef2f2; }
+        h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; }
+        .subtitle { font-size: 14px; color: var(--ink-secondary); margin-bottom: 32px; }
+        .spinner {
+            width: 32px; height: 32px;
+            border: 3px solid #EAEAEA;
+            border-top-color: var(--ink-primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .plan-badge {
+            display: inline-block;
+            padding: 6px 16px;
+            background: var(--ink-primary);
+            color: var(--canvas);
+            border-radius: var(--radius-sm);
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 16px;
+        }
+        .checklist {
+            text-align: left;
+            margin: 24px 0;
+            padding: 20px;
+            background: var(--highlight);
+            border: var(--border-thin);
+            border-radius: var(--radius-sm);
+            list-style: none;
+        }
+        .checklist li {
+            display: flex; align-items: center; gap: 10px;
+            margin-bottom: 8px; font-size: 14px;
+        }
+        .checklist li:last-child { margin-bottom: 0; }
+        .check { color: var(--status-success); font-weight: 700; }
+        .pending { color: var(--ink-tertiary); }
+        .btn {
+            padding: 12px 24px;
+            border-radius: var(--radius-sm);
+            font-size: 14px;
+            font-weight: 600;
+            text-decoration: none;
+            cursor: pointer;
+            border: none;
+            font-family: inherit;
+            display: inline-block;
+            transition: all 0.15s;
+        }
+        .btn-primary { background: var(--ink-primary); color: var(--canvas); }
+        .btn-primary:hover { background: #333; }
+        .btn-secondary { background: var(--canvas); color: var(--ink-primary); border: 1px solid var(--ink-secondary); }
+        .error-detail { font-size: 13px; color: var(--status-error); margin-top: 12px; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <!-- Processing state -->
+    <div class="container" id="state-processing">
+        <div class="icon icon-processing"><div class="spinner"></div></div>
+        <h1>Processing your payment</h1>
+        <p class="subtitle">Verifying with Stripe and activating your plan...</p>
+        <ul class="checklist" id="processing-steps">
+            <li id="step-verify"><span class="pending">&#9675;</span> Verifying payment</li>
+            <li id="step-tier"><span class="pending">&#9675;</span> Activating plan</li>
+            <li id="step-account"><span class="pending">&#9675;</span> Setting up account</li>
+        </ul>
+    </div>
+
+    <!-- Success state -->
+    <div class="container hidden" id="state-success">
+        <div class="icon icon-success">
+            <svg width="32" height="32" fill="none" stroke="#059669" stroke-width="2.5" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/>
+            </svg>
+        </div>
+        <h1 id="success-title">Payment successful</h1>
+        <p class="subtitle" id="success-subtitle">Your plan is now active.</p>
+        <div id="plan-badge-container"></div>
+        <ul class="checklist">
+            <li><span class="check">&#10003;</span> Payment verified</li>
+            <li><span class="check">&#10003;</span> Plan activated</li>
+            <li><span class="check">&#10003;</span> New limits available</li>
+        </ul>
+        <a href="/dashboard" class="btn btn-primary" id="success-cta">Go to Dashboard</a>
+    </div>
+
+    <!-- Error state -->
+    <div class="container hidden" id="state-error">
+        <div class="icon icon-error">
+            <svg width="32" height="32" fill="none" stroke="#DC2626" stroke-width="2.5" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+        </div>
+        <h1>Something went wrong</h1>
+        <p class="subtitle">We couldn't verify your payment. If you were charged, your plan will activate shortly via our backup system.</p>
+        <p class="error-detail" id="error-detail"></p>
+        <div style="margin-top:24px; display:flex; gap:12px; justify-content:center;">
+            <button onclick="retryVerification()" class="btn btn-secondary">Try Again</button>
+            <a href="/support" class="btn btn-primary">Contact Support</a>
+        </div>
+    </div>
+
+    <script>
+        const params = new URLSearchParams(window.location.search);
+        const sessionId = params.get('session_id');
+        const isNewAccount = params.get('new_account') === 'true';
+
+        function showState(id) {
+            document.querySelectorAll('.container').forEach(c => c.classList.add('hidden'));
+            document.getElementById(id).classList.remove('hidden');
+        }
+
+        function markStep(stepId, done) {
+            const el = document.getElementById(stepId);
+            if (!el) return;
+            const icon = el.querySelector('span');
+            if (done) {
+                icon.className = 'check';
+                icon.innerHTML = '&#10003;';
+            }
+        }
+
+        let retryCount = 0;
+        const MAX_AUTO_RETRIES = 3;
+
+        async function verifyCheckout() {
+            if (!sessionId) {
+                document.getElementById('error-detail').textContent =
+                    'No session ID found in URL. If you completed payment, check your email for confirmation.';
+                showState('state-error');
+                return;
+            }
+
+            try {
+                const resp = await fetch('/api/payments/checkout/complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        new_account: isNewAccount
+                    })
+                });
+
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.detail || 'Verification failed');
+                }
+
+                const result = await resp.json();
+                markStep('step-verify', true);
+
+                // Payment still processing — auto-retry with backoff
+                if (result.retry) {
+                    retryCount++;
+                    if (retryCount <= MAX_AUTO_RETRIES) {
+                        const delay = Math.min(2000 * retryCount, 6000);
+                        setTimeout(verifyCheckout, delay);
+                        return;
+                    }
+                    throw new Error('Payment is still processing. Please wait a moment and try again.');
+                }
+
+                if (result.status !== 'complete' && result.status !== 'paid') {
+                    throw new Error('Payment status: ' + result.status);
+                }
+
+                // Step 2: Tier
+                if (result.tier_synced) {
+                    markStep('step-tier', true);
+                } else if (result.tier_pending) {
+                    // Tier sync failed but payment succeeded — show partial success
+                    markStep('step-tier', true); // Show as done — webhook will handle it
+                }
+
+                // Step 3: Account
+                markStep('step-account', true);
+                if (result.new_account && result.access_token) {
+                    document.getElementById('success-title').textContent = 'Welcome to Sandbox';
+                    document.getElementById('success-subtitle').textContent =
+                        'Your account has been created and your plan is active.';
+                } else if (result.account_error) {
+                    document.getElementById('success-subtitle').textContent =
+                        'Payment successful. ' + result.account_error;
+                }
+
+                if (result.tier) {
+                    document.getElementById('plan-badge-container').innerHTML =
+                        '<span class="plan-badge">' + result.tier + ' Plan</span>';
+                }
+
+                if (result.tier_pending) {
+                    document.getElementById('success-subtitle').textContent =
+                        'Payment successful! Your plan will activate within a few moments.';
+                }
+
+                await new Promise(r => setTimeout(r, 600));
+                showState('state-success');
+
+                const redirectUrl = result.redirect || '/dashboard';
+                document.getElementById('success-cta').href = redirectUrl;
+                setTimeout(() => { window.location.href = redirectUrl; }, 3000);
+
+            } catch (e) {
+                console.error('Verification failed:', e);
+                // Auto-retry on network errors (up to MAX_AUTO_RETRIES)
+                retryCount++;
+                if (retryCount <= MAX_AUTO_RETRIES) {
+                    setTimeout(verifyCheckout, 2000 * retryCount);
+                    return;
+                }
+                document.getElementById('error-detail').textContent = e.message;
+                showState('state-error');
+            }
+        }
+
+        function retryVerification() {
+            retryCount = 0;
+            showState('state-processing');
+            ['step-verify', 'step-tier', 'step-account'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) { el.querySelector('span').className = 'pending'; el.querySelector('span').innerHTML = '&#9675;'; }
+            });
+            setTimeout(verifyCheckout, 500);
+        }
+
+        // Start verification on page load
+        verifyCheckout();
+    </script>
+</body>
+</html>

@@ -39,6 +39,7 @@ DEFAULT_TIERS: dict[str, TierConfig] = {
         sort_order=1,
         features={"basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access"},
         upgrade_url="/billing/upgrade",
+        default_per_user_fraction=0.5,  # one user can take at most half the org quota
         limits={
             "sandbox.concurrent":       TierLimits(limit=5),
             "sandbox.monthly_cost":     TierLimits(limit=100.00),
@@ -63,6 +64,7 @@ DEFAULT_TIERS: dict[str, TierConfig] = {
             "api_access", "gpu_access", "audit_logs", "priority_support",
         },
         upgrade_url="/billing/upgrade",
+        default_per_user_fraction=0.4,  # at most 40% of org quota per user
         limits={
             "sandbox.concurrent":       TierLimits(limit=25),
             "sandbox.monthly_cost":     TierLimits(limit=1000.00),

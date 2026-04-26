@@ -221,10 +221,39 @@ class TierConfig(BaseModel):
         default=None,
         description="URL to upgrade from this tier (shown in 429 responses)",
     )
+    default_per_user_fraction: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Default fraction of an org-level GAUGE limit that any "
+                    "single user in the org may consume. Applied only when a "
+                    "resource's TierLimits has no explicit per_user_limit. "
+                    "Example: 0.5 means one user can take at most half the org "
+                    "quota, preventing one team member from exhausting the org. "
+                    "None disables the default.",
+    )
 
     def get_limit(self, resource_key: str) -> TierLimits:
         """Get limits for a resource, defaulting to unlimited if not defined."""
         return self.limits.get(resource_key, TierLimits())
+
+    def derive_per_user_limit(self, tl: TierLimits) -> Optional[float]:
+        """Resolve the effective per-user limit for a TierLimits entry.
+
+        Precedence:
+          1. Explicit `tl.per_user_limit` always wins.
+          2. Otherwise, if the tier has `default_per_user_fraction` AND the
+             org limit is finite (not None), derive ceil(limit * fraction).
+          3. Otherwise None (no per-user enforcement).
+        """
+        if tl.per_user_limit is not None:
+            return tl.per_user_limit
+        if self.default_per_user_fraction is None or tl.limit is None:
+            return None
+        import math
+        derived = math.ceil(tl.limit * self.default_per_user_fraction)
+        # Never derive a per-user cap below 1 — would block all users
+        return max(1.0, float(derived))
 
 
 # ---------------------------------------------------------------------------

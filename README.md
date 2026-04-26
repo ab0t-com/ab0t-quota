@@ -2,6 +2,10 @@
 
 Shared quota, rate-limiting, and tier enforcement library for the [ab0t mesh network](https://ab0t.com). Any service in the mesh can use this library to enforce usage limits, manage billing tiers, and gate features — without building its own rate-limiting infrastructure.
 
+> **New here?** → **[5-minute quickstart for external clients](docs/quickstart.md)**.
+> One-line FastAPI wiring, two env vars, one config file. Both engine-local
+> and bridge (HTTPS-only) deployment modes covered.
+
 ## What it does
 
 - **Tier-based limits** — Free, Starter, Pro, Enterprise tiers with per-resource limits
@@ -38,54 +42,33 @@ Core dependencies: `redis`, `pydantic`, `fastapi`. That's it.
 ## Quick start
 
 ```python
-from redis.asyncio import Redis
-from ab0t_quota import (
-    QuotaEngine, QuotaGuard, QuotaCheckRequest,
-    QuotaIncrementRequest, ResourceDef, CounterType,
-)
-from ab0t_quota.providers import JWTTierProvider
-from ab0t_quota.registry import ResourceRegistry
-from ab0t_quota.tiers import DEFAULT_TIERS
+from fastapi import FastAPI
+from ab0t_quota import setup_quota
 
-# 1. Set up
-redis = Redis.from_url("redis://localhost:6379/0")
-registry = ResourceRegistry()
-registry.register(
-    ResourceDef(
-        service="my-service",
-        resource_key="sandbox.concurrent",
-        display_name="Concurrent Sandboxes",
-        counter_type=CounterType.GAUGE,
-        unit="sandboxes",
-    ),
-)
-
-engine = QuotaEngine(
-    redis=redis,
-    tier_provider=JWTTierProvider(),
-    registry=registry,
-    tiers=DEFAULT_TIERS,
-)
-
-# 2. Check before provisioning
-result = await engine.check(
-    QuotaCheckRequest(org_id="org-123", resource_key="sandbox.concurrent"),
-    token_claims={"org_tier": "starter"},
-)
-if result.denied:
-    raise HTTPException(status_code=429, detail=result.to_api_error())
-
-# 3. Increment after creation succeeds
-await engine.increment(
-    QuotaIncrementRequest(org_id="org-123", resource_key="sandbox.concurrent")
-)
-
-# 4. Decrement on teardown
-from ab0t_quota.models.requests import QuotaDecrementRequest
-await engine.decrement(
-    QuotaDecrementRequest(org_id="org-123", resource_key="sandbox.concurrent")
-)
+app = FastAPI()
+setup_quota(app)        # one line. Done.
 ```
+
+Plus `quota-config.json` next to your service and two env vars
+(`AB0T_MESH_API_KEY`, `AB0T_CONSUMER_ORG_ID`). Then in a route:
+
+```python
+@app.post("/widgets")
+async def create_widget(request: Request, user):
+    quota = request.app.state.quota
+    await quota.check_bundle(user.org_id, "widget", user_id=user.user_id)  # raises 429 if denied
+    widget = await provision(...)
+    await quota.increment_bundle(user.org_id, "widget", user_id=user.user_id)
+    return widget
+```
+
+That's the whole API surface for 95% of consumers. See
+[**docs/quickstart.md**](docs/quickstart.md) for the full walkthrough
+(config schema, deployment modes, payment surface, cost cap auto-enforcement,
+per-user fairness).
+
+For low-level access to the engine and counter primitives (advanced use),
+see the [Advanced API](#advanced-api) section below.
 
 ## Rate-limiting middleware
 
@@ -199,6 +182,40 @@ Copy `quota-config.example.json` to `quota-config.json` or set `QUOTA_CONFIG_PAT
   "tiers": [ ... ]
 }
 ```
+
+## Advanced API
+
+For consumers who need raw access to the engine, counters, or
+TierProvider (e.g. building admin tooling or a custom dashboard):
+
+```python
+from ab0t_quota import (
+    QuotaEngine, QuotaCheckRequest, QuotaIncrementRequest,
+    QuotaDecrementRequest, QuotaBatchCheckRequest,
+    ResourceDef, CounterType, TierConfig, TierLimits,
+    AlertManager, LogAlertDispatcher, WebhookAlertDispatcher,
+    QuotaStore, MessageBuilder,
+)
+from ab0t_quota.providers import (
+    JWTTierProvider, AuthServiceTierProvider, StaticTierProvider,
+)
+from ab0t_quota.registry import ResourceRegistry
+```
+
+The `QuotaContext` returned by `setup_quota` exposes `.engine` for
+direct engine access. Most consumers never need this — the high-level
+helpers (`check`, `check_bundle`, `increment_bundle`, `decrement_bundle`,
+`usage`, `feature`) cover the API surface.
+
+For bridge mode (third-party HTTPS-only):
+
+```python
+from ab0t_quota import BridgeClient, BridgeContext, CachedBridgeClient
+```
+
+See [docs/quickstart.md](docs/quickstart.md) and
+[docs/mesh-quota-api.md](docs/mesh-quota-api.md) for the full bridge-mode
+documentation.
 
 ## Testing
 

@@ -76,6 +76,7 @@ def load_tiers(config: Optional[dict] = None) -> dict[str, TierConfig]:
             limits=limits,
             features=set(tier_data.get("features", [])),
             upgrade_url=tier_data.get("upgrade_url"),
+            default_per_user_fraction=tier_data.get("default_per_user_fraction"),
         )
 
     logger.info("Loaded %d tiers from config", len(tiers))
@@ -102,3 +103,38 @@ def load_resources(config: Optional[dict] = None) -> list[ResourceDef]:
 
     logger.info("Loaded %d resource definitions from config", len(resources))
     return resources
+
+
+def load_resource_bundles(config: Optional[dict] = None) -> dict[str, list[str]]:
+    """Load resource-bundle definitions from config.
+
+    Bundles are a generic, consumer-defined naming layer over resource_keys.
+    Each entry maps a name (whatever the consumer chooses) to the list of
+    resource_keys consumed when one of those things is created. The library
+    has no opinion on what bundles represent — they're whatever the consumer
+    wants to dispatch by:
+
+      "resource_bundles": {
+        "my_thing":            ["my.concurrent_things"],
+        "my_premium_thing":    ["my.concurrent_things", "my.premium_slots"]
+      }
+
+    Returns {} when no bundles are declared.
+    """
+    if not config or "resource_bundles" not in config:
+        return {}
+
+    raw = config["resource_bundles"] or {}
+    if not isinstance(raw, dict):
+        logger.warning("resource_bundles must be an object, got %s — ignoring", type(raw).__name__)
+        return {}
+
+    bundles: dict[str, list[str]] = {}
+    for name, keys in raw.items():
+        if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+            logger.warning("resource_bundles.%s must be a list of strings — skipping", name)
+            continue
+        bundles[name] = list(keys)
+
+    logger.info("Loaded %d resource bundles from config", len(bundles))
+    return bundles
