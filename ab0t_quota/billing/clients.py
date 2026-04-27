@@ -207,7 +207,8 @@ class PaymentServiceClient:
         return InvoicesResponse.model_validate(data)
 
     async def get_invoice_pdf_url(self, org_id: str, invoice_id: str) -> str:
-        url = f"{self.base_url}/invoices/{org_id}/{invoice_id}/pdf"
+        # Payment's actual download endpoint (the legacy /pdf path doesn't exist)
+        url = f"{self.base_url}/invoices/v2/invoices/{org_id}/{invoice_id}/download"
         try:
             response = await self.client.request(
                 "GET", url, headers=_api_key_headers(self.api_key), follow_redirects=False,
@@ -300,20 +301,43 @@ class BillingServiceClient:
         return BillingBalanceResponse.model_validate(data)
 
     async def get_usage_summary(self, org_id: str) -> BillingUsageSummaryResponse:
-        data = await self._request("GET", f"/billing/{org_id}/usage/summary")
+        # Billing's actual path: /billing/usage/{org}/summary (not /billing/{org}/usage/summary)
+        data = await self._request("GET", f"/billing/usage/{org_id}/summary")
         return BillingUsageSummaryResponse.model_validate(data)
 
     async def get_usage_records(self, org_id: str, limit: int = 20, offset: int = 0) -> BillingUsageRecordsResponse:
-        data = await self._request("GET", f"/billing/{org_id}/usage/", params={"limit": limit, "offset": offset})
+        # Billing's actual path: /billing/usage/{org}/records
+        data = await self._request("GET", f"/billing/usage/{org_id}/records", params={"limit": limit, "offset": offset})
         return BillingUsageRecordsResponse.model_validate(data)
 
     async def get_transactions(self, org_id: str, limit: int = 20, offset: int = 0) -> BillingTransactionsResponse:
-        data = await self._request("GET", f"/billing/{org_id}/transactions/", params={"limit": limit, "offset": offset})
+        # No trailing slash — billing returns 307 then the proxy can't decode it
+        data = await self._request("GET", f"/billing/{org_id}/transactions", params={"limit": limit, "offset": offset})
         return BillingTransactionsResponse.model_validate(data)
 
     async def set_tier(self, org_id: str, tier_id: str, reason: str = "checkout_complete") -> TierChangeResponse:
         data = await self._request("PUT", f"/billing/{org_id}/tier", json={"tier_id": tier_id, "reason": reason})
         return TierChangeResponse.model_validate(data)
+
+    async def record_usage(self, payload: dict) -> dict:
+        """Record a usage event in billing. Caller-supplied payload must
+        include `org_id`; the org_id from the payload is used in the URL
+        so callers don't have to pass it twice.
+
+        Billing's contract: POST /billing/usage/{org_id}/ with body =
+        RecordUsageRequest (org_id, user_id, resource_type, action, ...
+        plus arbitrary extras).
+        """
+        org_id = payload.get("org_id")
+        if not org_id:
+            raise BillingServiceError(400, "record_usage payload missing org_id")
+        try:
+            return await self._request("POST", f"/billing/usage/{org_id}/", json=payload)
+        except BillingServiceError:
+            # Best-effort: usage recording failures must not crash the
+            # caller's primary path. Log + return.
+            logger.warning("record_usage failed for org=%s", org_id)
+            return {}
 
     async def apply_promotional_credit(
         self, org_id: str, amount: float,

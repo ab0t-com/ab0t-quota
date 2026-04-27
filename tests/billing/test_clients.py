@@ -230,7 +230,7 @@ class TestBillingClient:
     async def test_get_transactions(self, billing_client):
         billing_client.client = httpx.AsyncClient(
             transport=_mock_transport({
-                "/billing/org-1/transactions/": (200, {
+                "/billing/org-1/transactions": (200, {
                     "transactions": [
                         {"transaction_id": "tx_1", "type": "credit", "amount": "50.00"},
                     ],
