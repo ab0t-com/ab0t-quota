@@ -317,6 +317,66 @@ class PortalSessionResponse(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class AnonymousCheckoutResponse(BaseModel):
+    """Response for `POST /api/payments/checkout/anonymous/{plan_id}`.
+
+    Extends a Stripe checkout session payload with the freshly-provisioned
+    account's `org_id` and `access_token` (when account creation succeeded).
+    Clients redirect the browser to `url` and may use the access token to
+    log the new user in once they return."""
+    id: str = Field(..., description="Stripe checkout session id")
+    url: str = Field(..., description="Stripe Checkout URL the browser should be redirected to")
+    expires_at: Optional[str] = Field(default=None, description="Session expiry (ISO 8601)")
+    status: str = Field(..., description="open, complete, expired")
+    verification_token: Optional[str] = Field(default=None, description="Anti-fraud verification token")
+    access_token: Optional[str] = Field(
+        default=None,
+        description="JWT for the newly-created account; absent if the account already existed",
+    )
+    org_id: Optional[str] = Field(
+        default=None,
+        description="Org id of the newly-created account; absent if the account already existed",
+    )
+    new_account: Optional[bool] = Field(
+        default=None, description="True when a new account was provisioned in this call"
+    )
+    account_error: Optional[str] = Field(
+        default=None,
+        description="Customer-safe message when account provisioning failed (checkout still proceeded)",
+    )
+    model_config = {"extra": "allow"}
+
+
+class CheckoutCompleteResponse(BaseModel):
+    """Response for `POST /api/payments/checkout/complete`.
+
+    Returned after the browser comes back from Stripe with a session id.
+    Reports the final session status, the org/plan/email decoded from the
+    session metadata, and whether tier sync to billing succeeded."""
+    status: str = Field(..., description="Session status: complete, paid, open, expired")
+    session_id: str = Field(..., description="Stripe checkout session id")
+    email: Optional[str] = Field(default=None, description="Customer email captured at checkout")
+    plan_id: Optional[str] = Field(default=None, description="Plan id the customer purchased")
+    tier: Optional[str] = Field(
+        default=None, description="Resolved tier id (None if plan→tier mapping was not found)"
+    )
+    tier_synced: bool = Field(
+        default=False,
+        description="True iff the tier was successfully PUT to the billing service in this call",
+    )
+    tier_pending: Optional[bool] = Field(
+        default=None, description="True when tier resolved but billing sync failed; webhook will retry"
+    )
+    retry: Optional[bool] = Field(
+        default=None,
+        description="True when the session is not yet paid and the client should retry shortly",
+    )
+    redirect: Optional[str] = Field(
+        default=None, description="Suggested in-app URL for the client to navigate to next"
+    )
+    model_config = {"extra": "allow"}
+
+
 class WebhookResponse(BaseModel):
     status: str = Field(default="ok")
     model_config = {"extra": "allow"}

@@ -39,11 +39,14 @@ from .clients import (
     PaymentServiceError,
 )
 from .models import (
+    AnonymousCheckoutResponse,
     BillingBalanceResponse,
     BillingTransactionsResponse,
     BillingUsageRecordsResponse,
     BillingUsageSummaryResponse,
     CancelSubscriptionResponse,
+    CheckoutCompleteResponse,
+    CheckoutInitResponse,
     CheckoutSessionResponse,
     InvoicesResponse,
     PaymentMethodDeleteResponse,
@@ -186,7 +189,16 @@ def create_billing_router(
             except PaymentServiceError as e:
                 raise HTTPException(status_code=e.status_code, detail="Payment service error")
 
-        @router.get(f"{prefix}/payments/invoices/{'{invoice_id}'}/pdf", tags=["Payments"])
+        @router.get(
+            f"{prefix}/payments/invoices/{'{invoice_id}'}/pdf",
+            tags=["Payments"],
+            description=(
+                "Returns a 302 redirect with a `Location` header pointing at the "
+                "signed PDF URL on the upstream payment service. Clients should "
+                "follow the redirect to download the invoice PDF."
+            ),
+            responses={302: {"description": "Redirect to signed invoice PDF URL"}},
+        )
         async def get_invoice_pdf(request: Request, invoice_id: str, user=Depends(auth_reader)):
             try:
                 url = await payment.get_invoice_pdf_url(user.org_id, invoice_id)
@@ -238,14 +250,37 @@ def create_billing_router(
     # CHECKOUT (static routes BEFORE {plan_id})
     # =====================================================================
 
-    @router.post(f"{prefix}/payments/checkout/init", tags=["Payments"])
+    @router.post(
+        f"{prefix}/payments/checkout/init",
+        response_model=CheckoutInitResponse,
+        tags=["Payments"],
+        description=(
+            "Issue an anti-fraud session token + browser fingerprint hash that the "
+            "client must replay to the anonymous checkout endpoint. Public — "
+            "intended to be called from the pricing page before the user has an "
+            "account."
+        ),
+    )
     async def init_checkout(request: Request):
         try:
             return await payment.init_checkout()
         except PaymentServiceError as e:
             raise HTTPException(status_code=e.status_code, detail="Payment service error")
 
-    @router.post(f"{prefix}/payments/checkout/anonymous/{'{plan_id}'}", tags=["Payments"])
+    @router.post(
+        f"{prefix}/payments/checkout/anonymous/{'{plan_id}'}",
+        response_model=AnonymousCheckoutResponse,
+        tags=["Payments"],
+        description=(
+            "Account-first anonymous checkout: provisions the customer's account "
+            "(when `auth_url`/`auth_org_slug` are configured), creates a Stripe "
+            "checkout session for the chosen plan, and returns the Stripe URL to "
+            "redirect the browser to. When account creation succeeds, the response "
+            "also includes the new `org_id` and a JWT `access_token` so the client "
+            "can sign the user in once they return from Stripe. Sets a "
+            "`checkout_intent` cookie used by the success page to recover state."
+        ),
+    )
     async def create_anonymous_checkout(
         request: Request, plan_id: str,
         email: str = Body(...), session_token: str = Body(...), fingerprint: str = Body(...),
@@ -306,7 +341,17 @@ def create_billing_router(
         except PaymentServiceError as e:
             raise HTTPException(status_code=e.status_code, detail="Payment service error")
 
-    @router.post(f"{prefix}/payments/checkout/complete", tags=["Payments"])
+    @router.post(
+        f"{prefix}/payments/checkout/complete",
+        response_model=CheckoutCompleteResponse,
+        tags=["Payments"],
+        description=(
+            "Verify a returned Stripe checkout session and synchronise the "
+            "customer's tier with the billing service. Idempotent — safe to call "
+            "multiple times. When `tier_synced` is false but a tier was resolved, "
+            "the Stripe webhook will retry the sync (`tier_pending=true`)."
+        ),
+    )
     async def complete_checkout(
         request: Request,
         session_id: str = Body(...),
@@ -384,7 +429,16 @@ def create_billing_router(
             except PaymentServiceError as e:
                 raise HTTPException(status_code=e.status_code, detail="Payment service error")
 
-        @router.post(f"{prefix}/payments/topup", tags=["Payments"])
+        @router.post(
+            f"{prefix}/payments/topup",
+            response_model=CheckoutSessionResponse,
+            tags=["Payments"],
+            description=(
+                "Create a Stripe Checkout session for an account balance top-up "
+                "(one-time payment, USD). The browser must be redirected to the "
+                "returned `url` to complete payment. Capped at $10,000 per call."
+            ),
+        )
         async def create_topup(request: Request, user=Depends(auth_reader),
                                amount: float = Body(..., gt=0, le=10000, embed=True)):
             try:

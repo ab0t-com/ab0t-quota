@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ab0t-quota"
-version = "0.2.3"
+version = "0.2.4"
 description = "Shared quota, rate-limit, and tier enforcement for ab0t platform services"
 requires-python = ">=3.11"
 license = {text = "Proprietary"}
