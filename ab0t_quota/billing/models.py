@@ -7,7 +7,7 @@ pass through without breaking consumers.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -24,10 +24,32 @@ class BillingBalanceResponse(BaseModel):
 
 
 class BillingUsageSummaryResponse(BaseModel):
+    """Billing's actual /billing/usage/{org}/summary shape:
+       {org_id, start_date, end_date, period, summary: {total_cost, ...},
+        group_by}
+    Surface the most-used fields at top-level too via model_post_init so
+    legacy callers reading `.total_cost` directly keep working."""
+    org_id: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    period: Optional[str] = None
+    summary: Optional[dict] = None
+    group_by: Optional[Any] = None
+    # Convenience top-level fields (mirrored from summary{} below)
     total_cost: str = Field(default="0.00", description="Total cost this period")
     period_start: Optional[str] = None
     period_end: Optional[str] = None
     model_config = {"extra": "allow"}
+
+    def model_post_init(self, __context):
+        if self.summary:
+            tc = self.summary.get("total_cost")
+            if tc is not None and self.total_cost == "0.00":
+                self.total_cost = str(tc)
+            if not self.period_start:
+                self.period_start = self.summary.get("period_start") or self.start_date
+            if not self.period_end:
+                self.period_end = self.summary.get("period_end") or self.end_date
 
 
 class BillingUsageRecord(BaseModel):
@@ -46,26 +68,65 @@ class BillingUsageRecordsResponse(BaseModel):
 
 
 class BillingTransactionEntry(BaseModel):
-    transaction_id: str = Field(..., description="Transaction ID")
-    type: str = Field(..., description="credit, debit, reserve, commit, refund")
-    amount: str = Field(..., description="Amount")
+    """Billing transaction entry. Field naming matches billing's actual
+    /billing/{org}/transactions response (id + debit/credit, not the
+    earlier transaction_id + amount). All fields optional so future
+    schema additions in billing flow through via extra='allow'."""
+    id: Optional[str] = Field(default=None, description="Transaction id")
+    type: Optional[str] = Field(default=None, description="balance, credit, debit, reserve, commit, refund")
+    timestamp: Optional[str] = None
     description: Optional[str] = None
+    debit: Optional[str] = None
+    credit: Optional[str] = None
+    balance: Optional[str] = None
+    status: Optional[str] = None
+    metadata: Optional[dict] = None
+    # Backward-compat aliases for older billing schemas
+    transaction_id: Optional[str] = None
+    amount: Optional[str] = None
     created_at: Optional[str] = None
     model_config = {"extra": "allow"}
 
 
 class BillingTransactionsResponse(BaseModel):
+    """Billing's actual /billing/{org}/transactions shape:
+       {transactions: [...], summary: {opening_balance, total_debits, ...}}
+    NO count or has_more in the actual response — derive count from len()
+    and surface summary as a structured dict."""
     transactions: List[BillingTransactionEntry] = Field(default_factory=list)
+    summary: Optional[dict] = Field(default=None, description="Period summary (opening/closing balance, debits, credits)")
+    # Convenience derived fields for legacy consumers
     count: int = 0
     has_more: bool = False
     model_config = {"extra": "allow"}
 
+    def model_post_init(self, __context):
+        if self.count == 0 and self.transactions:
+            self.count = len(self.transactions)
+
 
 class TierChangeResponse(BaseModel):
-    tier_id: str = Field(..., description="New tier ID")
-    previous_tier_id: Optional[str] = Field(None, description="Previous tier ID")
+    """Billing returns this on PUT /billing/{org}/tier.
+    Field names match billing's actual response: new_tier + previous_tier
+    (NOT tier_id + previous_tier_id from earlier drafts of the contract).
+    Provides backward-compat aliases for callers that read the old names."""
     org_id: str = Field(default="", description="Organization ID")
+    new_tier: Optional[str] = Field(default=None, description="Newly-assigned tier id")
+    previous_tier: Optional[str] = Field(default=None, description="Tier before this change")
+    new_tier_display: Optional[str] = None
+    changed_at: Optional[str] = None
+    # Backward-compat aliases for callers that read the old names
+    tier_id: Optional[str] = Field(default=None, description="DEPRECATED — use new_tier")
+    previous_tier_id: Optional[str] = Field(default=None, description="DEPRECATED — use previous_tier")
     model_config = {"extra": "allow"}
+
+    def model_post_init(self, __context):
+        # Mirror the actual fields into the deprecated aliases so older
+        # consumers that read .tier_id keep working.
+        if self.tier_id is None and self.new_tier:
+            self.tier_id = self.new_tier
+        if self.previous_tier_id is None and self.previous_tier:
+            self.previous_tier_id = self.previous_tier
 
 
 class PromotionalCreditResponse(BaseModel):
