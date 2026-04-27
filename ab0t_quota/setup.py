@@ -595,9 +595,13 @@ async def _publish_tier_catalog(
     state. Library-internal — consumers never call this directly.
     """
     import httpx
-    mesh_key = os.getenv("AB0T_MESH_API_KEY", "")
+    # Catalog publish targets billing — use billing-scoped key if set
+    mesh_key = (
+        os.getenv("AB0T_MESH_BILLING_API_KEY", "")
+        or os.getenv("AB0T_MESH_API_KEY", "")
+    )
     if not mesh_key:
-        logger.debug("catalog publish skipped: no AB0T_MESH_API_KEY")
+        logger.debug("catalog publish skipped: no billing mesh API key set")
         return False
 
     payload: dict = {
@@ -698,7 +702,11 @@ def _build_tier_provider(config: dict, redis: Redis) -> TierProvider:
 
     if provider_type in ("mesh", "billing"):
         billing_url = _mesh_url("billing")
-        mesh_key = os.getenv("AB0T_MESH_API_KEY", "")
+        # Tier reads hit billing — billing-scoped key, fall back to unified
+        mesh_key = (
+            os.getenv("AB0T_MESH_BILLING_API_KEY", "")
+            or os.getenv("AB0T_MESH_API_KEY", "")
+        )
 
         async def fetch_tier(org_id: str) -> str:
             import httpx
@@ -746,12 +754,19 @@ def _wire_paid_tier_sync(
 ) -> Optional[dict]:
     """Mount the paid-tier surface synchronously: lifecycle emitter, billing
     proxy router. Returns state needed by the lifespan (heartbeat monitor)."""
+    # Mesh credentials. Today the ab0t mesh issues separate API keys per
+    # upstream service (billing has its own scope set, payment has its own).
+    # Allow per-upstream override; fall back to AB0T_MESH_API_KEY for the
+    # future unified-mesh-credential case.
     mesh_key = os.getenv("AB0T_MESH_API_KEY", "")
+    billing_api_key = os.getenv("AB0T_MESH_BILLING_API_KEY", "") or mesh_key
+    payment_api_key = os.getenv("AB0T_MESH_PAYMENT_API_KEY", "") or mesh_key
     consumer_org_id = os.getenv("AB0T_CONSUMER_ORG_ID", "")
     state: dict = {}
 
-    if not mesh_key:
-        logger.warning("enable_paid=True but AB0T_MESH_API_KEY not set; "
+    if not (billing_api_key or payment_api_key):
+        logger.warning("enable_paid=True but no mesh API key set "
+                       "(AB0T_MESH_API_KEY or AB0T_MESH_{BILLING,PAYMENT}_API_KEY); "
                        "skipping paid-tier wiring")
         return state
 
@@ -784,9 +799,9 @@ def _wire_paid_tier_sync(
         from .billing import create_billing_router
         router = create_billing_router(
             payment_url=_mesh_url("payment"),
-            payment_api_key=mesh_key,
+            payment_api_key=payment_api_key,
             billing_url=_mesh_url("billing"),
-            billing_api_key=mesh_key,
+            billing_api_key=billing_api_key,
             consumer_org_id=consumer_org_id,
             auth_reader=auth_reader,
             auth_admin=auth_admin,

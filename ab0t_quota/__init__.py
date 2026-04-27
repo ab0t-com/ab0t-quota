@@ -27,7 +27,7 @@ from .setup import setup_quota, QuotaContext
 from .bridge import BridgeClient, BridgeContext, RemoteTierProvider
 from .caches import CachedBridgeClient, TTLCache
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     # Engine & middleware
