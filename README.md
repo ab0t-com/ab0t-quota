@@ -50,7 +50,14 @@ setup_quota(app)        # one line. Done.
 ```
 
 Plus `quota-config.json` next to your service and two env vars
-(`AB0T_MESH_API_KEY`, `AB0T_CONSUMER_ORG_ID`). Then in a route:
+(`AB0T_MESH_API_KEY`, `AB0T_CONSUMER_ORG_ID`). Optional third:
+`AB0T_AUTH_WEBHOOK_SECRET` — when set, the lib mounts an auth-event
+webhook at `/api/quotas/_webhooks/auth` that auto-grants
+`tier.initial_credit` on user registration (operator registers the
+subscription once via `python -m ab0t_quota subscribe-events` or raw
+`POST /events/subscriptions`; see `docs/deployment.md` step 5b).
+
+Then in a route:
 
 ```python
 @app.post("/widgets")

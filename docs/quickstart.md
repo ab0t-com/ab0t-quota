@@ -360,6 +360,7 @@ The full set you need:
 | `AB0T_MESH_BILLING_URL` | no — local dev only | `https://billing.service.ab0t.com` | Override for testing against local stack |
 | `AB0T_MESH_PAYMENT_URL` | no — local dev only | `https://payment.service.ab0t.com` | Same |
 | `AB0T_MESH_SNS_LIFECYCLE_TOPIC_ARN` | no — production sets via mesh defaults | — | LocalStack ARN for dev |
+| `AB0T_AUTH_WEBHOOK_SECRET` | no (required for auto-credit-grant) | — | HMAC secret. When set, lib mounts `POST /api/quotas/_webhooks/auth` and grants `tier.initial_credit` on `auth.user.registered`. Operator runs `python -m ab0t_quota subscribe-events` once per env to register the subscription with auth. |
 
 That's it. **Two required env vars.** Compare to a typical
 hand-rolled integration: 6+ URLs/keys/ARNs across multiple service clients.

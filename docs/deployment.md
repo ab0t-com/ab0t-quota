@@ -125,6 +125,55 @@ curl -H "X-API-Key: $AB0T_MESH_API_KEY" \
 # expect 200 with balance JSON
 ```
 
+### 5b. Register the auth-event webhook subscription (for auto-credit-grant)
+
+So new free-tier users get their `tier.initial_credit` automatically on
+signup, the lib subscribes to `auth.user.registered` events. Run once per
+environment after the consumer service is deployed.
+
+**About the secret:** `AB0T_AUTH_WEBHOOK_SECRET` is **per-subscription, operator-generated**. Auth doesn't pre-issue it — you choose it (e.g. `openssl rand -hex 32`), pass it to auth in the subscription `secret` field at create time, and put the same value in the consumer's container env so the receiver can verify HMAC on incoming POSTs. Each subscription you create can use a different secret if you want to rotate or scope per-environment. Auth signs payloads with this secret using HMAC-SHA256 and sends the digest in the `X-Event-Signature` header.
+
+```bash
+export AB0T_AUTH_WEBHOOK_SECRET="$(openssl rand -hex 32)"
+export AB0T_AUTH_ADMIN_TOKEN="<auth admin token>"   # or AB0T_MESH_API_KEY
+
+python -m ab0t_quota subscribe-events \
+  --auth-url https://auth.service.ab0t.com \
+  --endpoint https://<your-consumer>.ab0t.com/api/quotas/_webhooks/auth \
+  --org-id <end-users-org-id-to-watch>
+```
+
+Set the same `AB0T_AUTH_WEBHOOK_SECRET` in the consumer's container env
+so the receiver can verify the HMAC. The CLI is idempotent — safe to
+re-run; it returns the existing subscription id if one already exists
+for the same endpoint.
+
+**Or equivalently, with raw curl** (what the CLI does under the hood):
+
+```bash
+curl -X POST https://auth.service.ab0t.com/events/subscriptions \
+  -H "Authorization: Bearer $AB0T_AUTH_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"name\": \"ab0t-quota-credit-grant\",
+    \"event_types\": [\"auth.user.registered\", \"auth.user.login\"],
+    \"endpoint\": \"https://<your-consumer>.ab0t.com/api/quotas/_webhooks/auth\",
+    \"secret\": \"$AB0T_AUTH_WEBHOOK_SECRET\",
+    \"filters\": [{\"field\": \"org_id\", \"value\": \"<end-users-org-id>\"}]
+  }"
+
+# Verify
+curl -H "Authorization: Bearer $AB0T_AUTH_ADMIN_TOKEN" \
+  https://auth.service.ab0t.com/events/subscriptions
+```
+
+Or via the auth admin dashboard at `<auth_url>/admin` → Events → Subscriptions
+→ Create (same fields). All three paths hit the same `POST /events/subscriptions`
+endpoint and produce the same subscription record.
+
+If you skip this, free users will see a $0 balance until you backfill
+credits manually.
+
 ---
 
 ## Step 6: Configure Stripe

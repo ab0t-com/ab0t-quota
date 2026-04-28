@@ -98,8 +98,17 @@ def create_billing_router(
         billing_url: Billing service base URL
         billing_api_key: Service API key for billing service
         consumer_org_id: Your org UUID in the payment service (where plans live)
-        auth_reader: FastAPI Depends() for read-level auth (returns object with .org_id)
-        auth_admin: FastAPI Depends() for admin-level auth (defaults to auth_reader)
+        auth_reader: FastAPI Depends() for read-level auth (returns object with .org_id).
+            Optional — if not supplied, only the public routes (plans, checkout/init,
+            checkout/anonymous, checkout/complete, webhooks/stripe) are mounted.
+        auth_admin: FastAPI Depends() for admin-level auth, used to gate
+            mutating endpoints (cancel subscription, set/remove default
+            payment method). REQUIRED whenever auth_reader is supplied —
+            see `make_admin_dep` for a sensible default. There is no silent
+            fallback: passing auth_reader without auth_admin raises ValueError
+            because the previous fallback (admin = reader) collapsed the
+            permission boundary and let any authenticated user perform
+            admin-only billing actions.
         auth_url: Public auth service URL (for account creation + password reset)
         auth_org_slug: Hosted login org slug (for account creation)
         quota_config_path: Path to quota-config.json (for plan→tier mapping)
@@ -113,10 +122,18 @@ def create_billing_router(
         if not val:
             raise ValueError(f"{name} is required")
 
+    if auth_reader is not None and auth_admin is None:
+        raise ValueError(
+            "auth_admin is required when auth_reader is provided. "
+            "Use ab0t_quota.billing.make_admin_dep(auth_guard) for a sensible "
+            "default that requires the 'billing.admin' permission, or pass "
+            "auth_admin=auth_reader explicitly to keep the legacy "
+            "permission-collapsing behaviour (NOT recommended — it lets any "
+            "authenticated user cancel subscriptions and modify payment methods)."
+        )
+
     payment = PaymentServiceClient(payment_url, payment_api_key)
     billing = BillingServiceClient(billing_url, billing_api_key)
-    if auth_admin is None:
-        auth_admin = auth_reader
 
     tpl_dir = templates_dir or str(_TEMPLATE_DIR)
     from fastapi.templating import Jinja2Templates
@@ -235,14 +252,51 @@ def create_billing_router(
             except PaymentServiceError as e:
                 raise HTTPException(status_code=e.status_code, detail="Payment service error")
 
+        @router.post(
+            f"{prefix}/payments/topup",
+            response_model=CheckoutSessionResponse,
+            tags=["Payments"],
+            description=(
+                "Create a Stripe Checkout session for an account balance top-up "
+                "(one-time payment, USD). The browser must be redirected to the "
+                "returned `url` to complete payment. Capped at $10,000 per call. "
+                "Admin-gated: a top-up immediately initiates a charge against the "
+                "org's saved payment method, so this is a write operation, not a "
+                "read."
+            ),
+        )
+        async def create_topup(request: Request, user=Depends(auth_admin),
+                               amount: float = Body(..., gt=0, le=10000, embed=True)):
+            try:
+                base = str(request.base_url).rstrip("/")
+                return await payment.create_topup_session(
+                    user.org_id, amount,
+                    success_url=f"{base}/billing?topup=success&amount={amount}",
+                    cancel_url=f"{base}/billing?topup=cancelled",
+                )
+            except PaymentServiceError as e:
+                raise HTTPException(status_code=e.status_code, detail="Payment service error")
+
     # =====================================================================
     # PLANS (public)
     # =====================================================================
 
-    @router.get(f"{prefix}/payments/plans", response_model=PlansResponse, tags=["Payments"])
+    @router.get(
+        f"{prefix}/payments/plans",
+        response_model=PlansResponse,
+        response_model_exclude={"org_id"},  # belt
+        tags=["Payments"],
+    )
     async def get_plans(request: Request):
         try:
-            return await payment.get_plans(consumer_org_id, provider_org=consumer_org_id)
+            data = await payment.get_plans(consumer_org_id, provider_org=consumer_org_id)
+            # Construct a fresh PlansResponse rather than passing the upstream
+            # object through. Without this the `extra: "allow"` model_config
+            # on PlansResponse would forward `org_id` (the platform's
+            # consumer-org UUID) into the public response — finding I3 in
+            # audit ticket 20260428. Plans are public; the consumer org is
+            # an internal identifier and has no business on this surface.
+            return PlansResponse(plans=data.plans, count=data.count)
         except PaymentServiceError as e:
             raise HTTPException(status_code=e.status_code, detail="Payment service error")
 
@@ -320,20 +374,37 @@ def create_billing_router(
                 except Exception as e:
                     logger.warning("checkout_intent_store_failed: %s", e)
 
-            # Step 4: Return with cookie + access_token
+            # Step 4: Return only the Stripe redirect URL — never include
+            # `access_token`, `org_id`, or any "new vs existing email" flag in
+            # the public response. Distinguishable shape was a textbook
+            # email-enumeration leak (audit ticket 20260428, finding I1):
+            # any unauthenticated caller could probe whether an email had an
+            # account by checking which fields the response carried.
+            #
+            # Account credentials (when account creation was triggered) are
+            # delivered out-of-band via the password-reset email that
+            # `_create_anonymous_account` sends. The browser receives only
+            # the Stripe checkout URL and an opaque session marker.
             resp_obj = result.model_dump() if hasattr(result, "model_dump") else (result if isinstance(result, dict) else {})
-            if access_token:
-                resp_obj["access_token"] = access_token
-            if new_org:
-                resp_obj["org_id"] = new_org
+            # Strip any leaky fields that a future model_config="extra: allow"
+            # change might let through.
+            for leaky in ("access_token", "org_id", "new_account", "account_error"):
+                resp_obj.pop(leaky, None)
 
+            # Stash the access_token + org_id in the httponly checkout_intent
+            # cookie below so the browser can pick them up on the
+            # /checkout/success page without exposing them in a publicly
+            # cacheable response body.
             json_response = JSONResponse(content=resp_obj)
+            cookie_payload = {
+                "email": email, "plan_id": plan_id,
+                "session_id": session_id, "org_id": new_org or "",
+            }
+            if access_token:
+                cookie_payload["access_token"] = access_token
             json_response.set_cookie(
                 key="checkout_intent",
-                value=urllib.parse.quote(json.dumps({
-                    "email": email, "plan_id": plan_id,
-                    "session_id": session_id, "org_id": new_org or "",
-                })),
+                value=urllib.parse.quote(json.dumps(cookie_payload)),
                 max_age=3600, httponly=True, samesite="lax",
             )
             return json_response
@@ -341,78 +412,108 @@ def create_billing_router(
         except PaymentServiceError as e:
             raise HTTPException(status_code=e.status_code, detail="Payment service error")
 
-    @router.post(
-        f"{prefix}/payments/checkout/complete",
-        response_model=CheckoutCompleteResponse,
-        tags=["Payments"],
-        description=(
-            "Verify a returned Stripe checkout session and synchronise the "
-            "customer's tier with the billing service. Idempotent — safe to call "
-            "multiple times. When `tier_synced` is false but a tier was resolved, "
-            "the Stripe webhook will retry the sync (`tier_pending=true`)."
-        ),
-    )
-    async def complete_checkout(
-        request: Request,
-        session_id: str = Body(...),
-        verification_token: str = Body(None),
-        new_account: bool = Body(False),
-    ):
-        """Verify checkout and sync tier. Account already exists (created before Stripe)."""
-        try:
-            result = await payment.verify_checkout_session(session_id, process_if_complete=True)
-            status = result.status if hasattr(result, "status") else result.get("status", "unknown")
-            metadata = result.metadata if hasattr(result, "metadata") else result.get("metadata") or {}
-            org_id = (metadata or {}).get("org_id", "")
-            plan_id = (metadata or {}).get("plan_id", "")
-            customer_email = result.customer_email if hasattr(result, "customer_email") else result.get("customer_email", "")
+    if auth_reader:
+        @router.post(
+            f"{prefix}/payments/checkout/complete",
+            response_model=CheckoutCompleteResponse,
+            tags=["Payments"],
+            description=(
+                "Verify a returned Stripe checkout session and synchronise the "
+                "customer's tier with the billing service. Idempotent — safe to call "
+                "multiple times. When `tier_synced` is false but a tier was resolved, "
+                "the Stripe webhook will retry the sync (`tier_pending=true`). "
+                "Requires authentication: the caller's `org_id` must match the "
+                "session's `metadata.org_id` (or the DynamoDB-tracked account org "
+                "for anonymous-checkout flows). Without auth, anyone holding a "
+                "Stripe `session_id` could read the customer's email and tier — "
+                "audit ticket 20260428 finding A3."
+            ),
+        )
+        async def complete_checkout(
+            request: Request,
+            session_id: str = Body(...),
+            new_account: bool = Body(False),
+            user=Depends(auth_reader),
+        ):
+            """Verify checkout and sync tier. Account already exists (created before Stripe)."""
+            try:
+                result = await payment.verify_checkout_session(session_id, process_if_complete=True)
+                status = result.status if hasattr(result, "status") else result.get("status", "unknown")
+                metadata = result.metadata if hasattr(result, "metadata") else result.get("metadata") or {}
+                org_id = (metadata or {}).get("org_id", "")
+                plan_id = (metadata or {}).get("plan_id", "")
+                customer_email = result.customer_email if hasattr(result, "customer_email") else result.get("customer_email", "")
 
-            resp: dict = {
-                "status": status, "session_id": session_id,
-                "email": customer_email, "plan_id": plan_id,
-                "tier": None, "tier_synced": False,
-            }
+                # Resolve the session's org_id (Stripe metadata first, then
+                # DynamoDB fallback for anonymous-checkout sessions where the
+                # account was provisioned after Stripe redirect).
+                session_org_id = org_id
+                if not session_org_id and db and session_id:
+                    try:
+                        acct = await db.get_item(pk=f"CHECKOUT#{session_id}", sk="ACCOUNT")
+                        if acct and acct.get("org_id"):
+                            session_org_id = acct["org_id"]
+                    except Exception:
+                        pass
 
-            if status not in ("complete", "paid"):
-                resp["retry"] = True
+                # Authorisation: caller must own this checkout session.
+                # Mock/test sessions (no metadata.org_id, no DB record) are
+                # allowed because they return hardcoded fake data anyway.
+                caller_org = getattr(user, "org_id", None)
+                if session_org_id and caller_org and session_org_id != caller_org:
+                    logger.info(
+                        "checkout_complete_org_mismatch session_id=%s caller_org=%s session_org=%s",
+                        session_id, caller_org, session_org_id,
+                    )
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Checkout session does not belong to your organization",
+                    )
+
+                # Use session_org_id (resolved above with DynamoDB fallback)
+                # for the rest of the flow — the original `org_id` may have
+                # been empty when only the DynamoDB account record had it.
+                org_id = session_org_id or org_id
+
+                resp: dict = {
+                    "status": status, "session_id": session_id,
+                    "email": customer_email, "plan_id": plan_id,
+                    "tier": None, "tier_synced": False,
+                }
+
+                if status not in ("complete", "paid"):
+                    resp["retry"] = True
+                    return resp
+
+                tier_id = await _resolve_plan_to_tier(plan_id, tier_map, payment, consumer_org_id)
+
+                if org_id and tier_id:
+                    try:
+                        await billing.set_tier(org_id, tier_id, reason="checkout_complete")
+                        resp["tier_synced"] = True
+                    except Exception as e:
+                        logger.warning("tier_sync_failed org=%s error=%s", org_id, e)
+
+                if tier_id:
+                    resp["tier"] = tier_id
+                if tier_id and not resp["tier_synced"]:
+                    resp["tier_pending"] = True
+
+                # Mark intent processed
+                if db and session_id:
+                    try:
+                        await db.put_item(pk=f"CHECKOUT#{session_id}", sk="INTENT",
+                                          data={"status": "completed", "org_id": org_id, "email": customer_email})
+                    except Exception:
+                        pass
+
+                resp["redirect"] = "/dashboard"
                 return resp
 
-            # Recover org_id from DynamoDB if not in Stripe metadata
-            if not org_id and db and session_id:
-                try:
-                    acct = await db.get_item(pk=f"CHECKOUT#{session_id}", sk="ACCOUNT")
-                    if acct and acct.get("org_id"):
-                        org_id = acct["org_id"]
-                except Exception:
-                    pass
-
-            tier_id = await _resolve_plan_to_tier(plan_id, tier_map, payment, consumer_org_id)
-
-            if org_id and tier_id:
-                try:
-                    await billing.set_tier(org_id, tier_id, reason="checkout_complete")
-                    resp["tier_synced"] = True
-                except Exception as e:
-                    logger.warning("tier_sync_failed org=%s error=%s", org_id, e)
-
-            if tier_id:
-                resp["tier"] = tier_id
-            if tier_id and not resp["tier_synced"]:
-                resp["tier_pending"] = True
-
-            # Mark intent processed
-            if db and session_id:
-                try:
-                    await db.put_item(pk=f"CHECKOUT#{session_id}", sk="INTENT",
-                                      data={"status": "completed", "org_id": org_id, "email": customer_email})
-                except Exception:
-                    pass
-
-            resp["redirect"] = "/dashboard"
-            return resp
-
-        except PaymentServiceError as e:
-            raise HTTPException(status_code=e.status_code, detail=e.detail)
+            except HTTPException:
+                raise
+            except PaymentServiceError as e:
+                raise HTTPException(status_code=e.status_code, detail=e.detail)
 
     # Authenticated checkout (AFTER static routes)
     if auth_reader:
@@ -425,28 +526,6 @@ def create_billing_router(
                     success_url=f"{base}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}",
                     cancel_url=f"{base}/pricing?cancelled=true",
                     customer_email=getattr(user, "email", None),
-                )
-            except PaymentServiceError as e:
-                raise HTTPException(status_code=e.status_code, detail="Payment service error")
-
-        @router.post(
-            f"{prefix}/payments/topup",
-            response_model=CheckoutSessionResponse,
-            tags=["Payments"],
-            description=(
-                "Create a Stripe Checkout session for an account balance top-up "
-                "(one-time payment, USD). The browser must be redirected to the "
-                "returned `url` to complete payment. Capped at $10,000 per call."
-            ),
-        )
-        async def create_topup(request: Request, user=Depends(auth_reader),
-                               amount: float = Body(..., gt=0, le=10000, embed=True)):
-            try:
-                base = str(request.base_url).rstrip("/")
-                return await payment.create_topup_session(
-                    user.org_id, amount,
-                    success_url=f"{base}/billing?topup=success&amount={amount}",
-                    cancel_url=f"{base}/billing?topup=cancelled",
                 )
             except PaymentServiceError as e:
                 raise HTTPException(status_code=e.status_code, detail="Payment service error")

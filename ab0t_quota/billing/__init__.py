@@ -26,6 +26,12 @@ from .lifecycle import LifecycleEmitter
 from .budget import BudgetChecker
 from .heartbeat import HeartbeatMonitor
 from .config import load_pricing
+from .auth_helpers import (
+    make_reader_dep,
+    make_admin_dep,
+    DEFAULT_READER_PERMISSIONS,
+    DEFAULT_ADMIN_PERMISSIONS,
+)
 
 
 def create_billing_router(**kwargs):
@@ -48,4 +54,8 @@ __all__ = [
     "BudgetChecker",
     "HeartbeatMonitor",
     "load_pricing",
+    "make_reader_dep",
+    "make_admin_dep",
+    "DEFAULT_READER_PERMISSIONS",
+    "DEFAULT_ADMIN_PERMISSIONS",
 ]

@@ -307,7 +307,13 @@ class CheckoutVerifyResponse(BaseModel):
     amount_total: Optional[int] = None
     currency: Optional[str] = None
     mode: Optional[str] = None
-    metadata: Optional[dict[str, str]] = None
+    # `Any` rather than `str` — Stripe's wire format is dict[str, str], but
+    # mock/test responses upstream sometimes inject bool/int values. Strict
+    # str-only validation here surfaced as a proxy-side ValidationError →
+    # HTML 500 to the client (audit ticket 20260428, finding B2). The proxy
+    # only reads .get("org_id") / .get("plan_id"), so loosening the value
+    # type is safe.
+    metadata: Optional[dict[str, Any]] = None
     model_config = {"extra": "allow"}
 
 
