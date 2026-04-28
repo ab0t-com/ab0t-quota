@@ -138,9 +138,24 @@ class TestPublicRoutes:
         assert response.status_code == 400
         assert "Stripe-Signature" in response.json()["detail"]
 
-    def test_checkout_complete_validates_input(self, client):
-        """Checkout complete must reject missing session_id."""
-        response = client.post(
+    def test_checkout_complete_validates_input(self):
+        """Checkout complete must reject missing session_id.
+
+        /checkout/complete became auth-required in audit ticket 20260428
+        (was previously open — see security note in router.py docstring).
+        Build a separate client with auth deps so the route is mounted at
+        all, then assert input validation still fires.
+        """
+        app = _create_app(
+            payment_url="http://test:8005",
+            payment_api_key="key",
+            billing_url="http://test:8002",
+            billing_api_key="key",
+            consumer_org_id="org-1",
+            auth_reader=mock_auth_reader,
+            auth_admin=mock_auth_admin,
+        )
+        response = TestClient(app).post(
             "/api/payments/checkout/complete",
             json={},
         )
@@ -153,6 +168,9 @@ class TestRouteOrdering:
 
     @pytest.fixture
     def app(self):
+        # auth_admin required when auth_reader is provided — strict mode
+        # introduced by audit ticket 20260428 to stop the silent permission
+        # collapse where any authenticated user could hit admin routes.
         return _create_app(
             payment_url="http://test:8005",
             payment_api_key="key",
@@ -160,6 +178,7 @@ class TestRouteOrdering:
             billing_api_key="key",
             consumer_org_id="org-1",
             auth_reader=mock_auth_reader,
+            auth_admin=mock_auth_admin,
         )
 
     def test_init_not_caught_by_plan_id(self, app):
