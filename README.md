@@ -50,12 +50,30 @@ setup_quota(app)        # one line. Done.
 ```
 
 Plus `quota-config.json` next to your service and two env vars
-(`AB0T_MESH_API_KEY`, `AB0T_CONSUMER_ORG_ID`). Optional third:
-`AB0T_AUTH_WEBHOOK_SECRET` — when set, the lib mounts an auth-event
-webhook at `/api/quotas/_webhooks/auth` that auto-grants
-`tier.initial_credit` on user registration (operator registers the
-subscription once via `python -m ab0t_quota subscribe-events` or raw
-`POST /events/subscriptions`; see `docs/deployment.md` step 5b).
+(`AB0T_MESH_API_KEY`, `AB0T_CONSUMER_ORG_ID`).
+
+### Optional: react to auth events (signups, logins, etc.)
+
+The lib provides a generic registry for auth-event handlers. Register
+your own logic with `@on_auth_event("auth.user.registered")` and the
+lib mounts the receiver, verifies HMACs, and auto-subscribes with auth.
+Same pattern works for `auth.user.login`, `org.created`, `permission.granted`,
+and anything else auth emits.
+
+```python
+from ab0t_quota.auth_events import on_auth_event
+
+@on_auth_event("auth.user.registered")
+async def grant_initial_credit(event):
+    user_id = event["data"]["user_id"]
+    # ...whatever you want
+```
+
+**Full guide:** [docs/auth-events.md](docs/auth-events.md) — covers
+registration patterns, available event types, reusable primitives
+(`PinStore`, `resolve_billing_org`, `grant_initial_credit_for_user`),
+6 handler cookbook recipes, lifecycle, configuration reference,
+operator workflows, and testing.
 
 Then in a route:
 

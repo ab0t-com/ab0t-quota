@@ -125,13 +125,39 @@ curl -H "X-API-Key: $AB0T_MESH_API_KEY" \
 # expect 200 with balance JSON
 ```
 
-### 5b. Register the auth-event webhook subscription (for auto-credit-grant)
+### 5b. Wire auth-event handlers (recommended for auto-credit-grant, etc.)
 
-So new free-tier users get their `tier.initial_credit` automatically on
-signup, the lib subscribes to `auth.user.registered` events. Run once per
-environment after the consumer service is deployed.
+The lib provides a registry pattern: consumer code registers handlers
+via `@on_auth_event` / `register_handler`, the lib mounts the receiver
+and dispatches events. The lib has no opinion on what handlers do —
+each consumer plugs in their own logic.
 
-**About the secret:** `AB0T_AUTH_WEBHOOK_SECRET` is **per-subscription, operator-generated**. Auth doesn't pre-issue it — you choose it (e.g. `openssl rand -hex 32`), pass it to auth in the subscription `secret` field at create time, and put the same value in the consumer's container env so the receiver can verify HMAC on incoming POSTs. Each subscription you create can use a different secret if you want to rotate or scope per-environment. Auth signs payloads with this secret using HMAC-SHA256 and sends the digest in the `X-Event-Signature` header.
+**Step 1 — register handlers** in your consumer (typically `app/quota.py`):
+
+```python
+from ab0t_quota.auth_events import on_auth_event
+
+@on_auth_event("auth.user.registered")
+async def grant_initial_credit(event):
+    user_id = event["data"]["user_id"]
+    org_id  = event["data"]["org_id"]
+    # ...your logic. Reusable primitives also exported:
+    #   from ab0t_quota.auth_events import (
+    #       resolve_billing_org, grant_initial_credit_for_user, PinStore
+    #   )
+```
+
+**Step 2 — set the webhook secret** so the lib mounts the receiver:
+
+```bash
+export AB0T_AUTH_WEBHOOK_SECRET="$(openssl rand -hex 32)"
+```
+
+`AB0T_AUTH_WEBHOOK_SECRET` is **per-subscription, operator-generated**. Auth doesn't pre-issue it — you choose it, pass it to auth in the subscription `secret` field, and put the same value in your consumer's container env so the receiver can verify HMAC. Auth signs payloads with HMAC-SHA256 in the `X-Event-Signature` header.
+
+**Step 3 — register the subscription with auth.** Two ways:
+
+**Auto (preferred):** set `AB0T_AUTH_ADMIN_TOKEN` and `AB0T_AUTH_WEBHOOK_PUBLIC_URL` in your env. The lib auto-registers at startup (idempotent — re-runs every boot, no-op if already exists). One env file, no extra commands.
 
 ```bash
 export AB0T_AUTH_WEBHOOK_SECRET="$(openssl rand -hex 32)"

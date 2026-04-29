@@ -403,6 +403,21 @@ def setup_quota(
             len(registry.all()), len(tiers), len(bundles), enable_paid,
         )
 
+        # Auto-subscribe the auth-event webhook with auth, idempotently.
+        # Reads env directly. Only fires if handlers are registered.
+        # Best-effort: failures log a warning, never block startup.
+        try:
+            from . import auth_events as _ae
+            if _ae.registered_event_types():
+                async def _do_subscribe():
+                    try:
+                        await _ae.subscribe_on_startup()
+                    except Exception as e:
+                        logger.warning("auth-event auto-subscribe failed: %s", e)
+                asyncio.create_task(_do_subscribe())
+        except Exception as e:
+            logger.warning("auth-event auto-subscribe scheduling failed: %s", e)
+
         try:
             if existing_lifespan is not None:
                 async with existing_lifespan(_app):
@@ -817,44 +832,19 @@ def _wire_paid_tier_sync(
     except Exception as e:
         logger.warning("paid-tier router mount failed: %s", e)
 
-    # Auth-event webhook (event-driven initial credit grant). Mounted only
-    # if AB0T_AUTH_WEBHOOK_SECRET is set — without a secret the endpoint
-    # would be unauthenticated, so we refuse to mount it without one.
+    # Auth-event webhook receiver — generic infrastructure, no opinions.
+    # Consumer registers handlers via @on_auth_event / register_handler from
+    # their own code (typically their quota.py). The lib mounts the receiver
+    # and auto-subscribes with auth based on which event types have handlers.
+    # See ab0t_quota/auth_events.py module docstring for the consumer-side
+    # pattern.
     webhook_secret = os.getenv("AB0T_AUTH_WEBHOOK_SECRET", "")
     if webhook_secret:
         try:
-            from .auth_events import make_router as _make_auth_router, PinStore
-            # Build tier_id -> initial_credit map from the loaded config.
-            # The lib's TierConfig doesn't have initial_credit as a first-class
-            # field yet (Phase 6 of the canonical-plans-in-lib ticket), so we
-            # read it directly from the config dict for now.
-            _initial_credits_map = {
-                t.get("tier_id"): float(t.get("initial_credit") or 0)
-                for t in (config.get("tiers") or [])
-                if (t.get("initial_credit") or 0)
-            }
-
-            # PinStore expects an aioboto3-style async DDB client. The consumer
-            # passes one in via app.state.ddb_client, otherwise we skip the mount.
-            ddb = getattr(app.state, "ddb_client", None)
-            if ddb is None:
-                logger.warning("AB0T_AUTH_WEBHOOK_SECRET set but app.state.ddb_client missing; "
-                               "webhook NOT mounted. Set app.state.ddb_client before setup_quota().")
-            else:
-                pin_store = PinStore(os.getenv("QUOTA_STATE_TABLE", "ab0t_quota_state"), ddb)
-                auth_router = _make_auth_router(
-                    webhook_secret=webhook_secret,
-                    auth_url=auth_url or os.getenv("AB0T_AUTH_AUTH_URL", ""),
-                    mesh_api_key=mesh_key,
-                    billing_url=_mesh_url("billing"),
-                    billing_api_key=billing_api_key,
-                    initial_credits=_initial_credits_map,
-                    tier_provider=engine._tier_provider,
-                    redis=redis,
-                    pin_store=pin_store,
-                )
-                app.include_router(auth_router, prefix=route_prefix + "/quotas")
-                logger.info("auth-event webhook mounted at %s/quotas/_webhooks/auth", route_prefix)
+            from . import auth_events as _ae
+            app.include_router(_ae.make_router(webhook_secret=webhook_secret),
+                               prefix=route_prefix + "/quotas")
+            logger.info("auth-event webhook mounted at %s/quotas/_webhooks/auth", route_prefix)
         except Exception as e:
             logger.warning("auth-event webhook setup failed: %s", e)
     else:

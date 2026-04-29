@@ -360,7 +360,10 @@ The full set you need:
 | `AB0T_MESH_BILLING_URL` | no — local dev only | `https://billing.service.ab0t.com` | Override for testing against local stack |
 | `AB0T_MESH_PAYMENT_URL` | no — local dev only | `https://payment.service.ab0t.com` | Same |
 | `AB0T_MESH_SNS_LIFECYCLE_TOPIC_ARN` | no — production sets via mesh defaults | — | LocalStack ARN for dev |
-| `AB0T_AUTH_WEBHOOK_SECRET` | no (required for auto-credit-grant) | — | HMAC secret. When set, lib mounts `POST /api/quotas/_webhooks/auth` and grants `tier.initial_credit` on `auth.user.registered`. Operator runs `python -m ab0t_quota subscribe-events` once per env to register the subscription with auth. |
+| `AB0T_AUTH_WEBHOOK_SECRET` | no (required for auth-event handlers) | — | HMAC secret. When set, lib mounts `POST /api/quotas/_webhooks/auth` and dispatches received events to handlers you register via `@on_auth_event` / `register_handler`. The lib has no opinion on what handlers do — see `ab0t_quota/auth_events.py` module docstring. |
+| `AB0T_AUTH_ADMIN_TOKEN` | no (required for auto-subscribe) | — | Bearer token with `events.subscribe` permission on auth. When set with `AB0T_AUTH_WEBHOOK_PUBLIC_URL`, lib auto-registers the subscription with auth at startup (idempotent). |
+| `AB0T_AUTH_WEBHOOK_PUBLIC_URL` | no (required for auto-subscribe) | — | Externally-reachable base URL of this service. Auth POSTs events to `<this>/api/quotas/_webhooks/auth`. |
+| `AB0T_AUTH_WATCH_ORG_SLUG` | no | from `AB0T_AUTH_ORG_SLUG` | Auth org slug to filter events for. Resolved to org_id at subscribe time. |
 
 That's it. **Two required env vars.** Compare to a typical
 hand-rolled integration: 6+ URLs/keys/ARNs across multiple service clients.
