@@ -255,7 +255,21 @@ def setup_quota(
         or os.getenv("QUOTA_REDIS_URL")
         or os.getenv("REDIS_URL", "redis://localhost:6379/0")
     )
-    redis = Redis.from_url(redis_url, decode_responses=False)
+    # Honor REDIS_PASSWORD env (matches the convention used by every other
+    # ab0t service — billing, payment, auth — so consumers don't have to
+    # embed credentials in REDIS_URL just for this library). The kwarg
+    # overrides any URL-embedded password, so URL-embedded creds still
+    # work for callers that prefer that style.
+    redis_password = (
+        storage.get("redis_password")
+        or os.getenv("QUOTA_REDIS_PASSWORD")
+        or os.getenv("REDIS_PASSWORD")
+    )
+    redis = Redis.from_url(
+        redis_url,
+        password=redis_password or None,
+        decode_responses=False,
+    )
 
     registry = ResourceRegistry()
     for r in load_resources(config):
