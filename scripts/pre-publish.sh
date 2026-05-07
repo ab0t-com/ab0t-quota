@@ -159,8 +159,21 @@ if [ -n "${PRE_PUBLISH_TAG:-}" ]; then
   else
     err "Tag '$PRE_PUBLISH_TAG' doesn't match version (expected '$expected')"
   fi
+  # Idempotency: a local tag at HEAD is fine — it's a legitimate retry of
+  # a push that landed the tag locally but failed before pushing it. Only
+  # flag the tag as 'taken' when it points somewhere OTHER than HEAD, which
+  # is the actual problem case (stale tag from a previous attempt against
+  # different code, or version was already burned).
   if git rev-parse "$PRE_PUBLISH_TAG" >/dev/null 2>&1; then
-    err "Tag $PRE_PUBLISH_TAG already exists — bump version or delete the tag"
+    tag_sha="$(git rev-list -n 1 "$PRE_PUBLISH_TAG")"
+    head_sha="$(git rev-parse HEAD)"
+    if [ "$tag_sha" = "$head_sha" ]; then
+      ok "Tag $PRE_PUBLISH_TAG already exists locally at HEAD — will reuse on push"
+    else
+      err "Tag $PRE_PUBLISH_TAG exists locally at $tag_sha (HEAD is $head_sha)"
+      err "  Stale tag from a previous attempt. Move it (git tag -f $PRE_PUBLISH_TAG)"
+      err "  or delete it (git tag -d $PRE_PUBLISH_TAG) and re-run."
+    fi
   else
     ok "Tag $PRE_PUBLISH_TAG is available"
   fi
