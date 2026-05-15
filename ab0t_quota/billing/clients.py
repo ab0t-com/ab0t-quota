@@ -177,10 +177,20 @@ class PaymentServiceClient:
 
     async def verify_checkout_session(
         self, session_id: str, process_if_complete: bool = True,
+        verification_token: Optional[str] = None,
     ) -> CheckoutVerifyResponse:
+        # Payment service now requires `verification_token` when
+        # process_if_complete=True (returns 403 "Verification token is
+        # required for session processing" otherwise). The token is minted
+        # by `create_checkout_session` and is hashed into the Stripe session's
+        # metadata; the caller is expected to stash the plaintext token and
+        # replay it here.
+        params: dict[str, str] = {"process_if_complete": str(process_if_complete).lower()}
+        if verification_token:
+            params["verification_token"] = verification_token
         data = await self._request(
             "GET", f"/checkout/sessions/{session_id}/verify",
-            params={"process_if_complete": str(process_if_complete).lower()},
+            params=params,
         )
         return CheckoutVerifyResponse.model_validate(data)
 

@@ -360,12 +360,23 @@ def create_billing_router(
                 fingerprint=fingerprint,
             )
 
-            # Step 3: Store correlation data
+            # Step 3: Store correlation data. Capture the plaintext
+            # verification_token so /complete can replay it back to /verify
+            # (payment service 403s otherwise — see clients.py
+            # verify_checkout_session).
             session_id = result.id if hasattr(result, "id") else result.get("id", "")
+            verification_token = (
+                result.verification_token
+                if hasattr(result, "verification_token")
+                else (result.get("verification_token") if isinstance(result, dict) else None)
+            )
             if db and session_id:
                 try:
+                    intent_data: dict = {"email": email, "plan_id": plan_id, "status": "pending"}
+                    if verification_token:
+                        intent_data["verification_token"] = verification_token
                     await db.put_item(pk=f"CHECKOUT#{session_id}", sk="INTENT",
-                                      data={"email": email, "plan_id": plan_id, "status": "pending"},
+                                      data=intent_data,
                                       ttl_seconds=86400 * 7)
                     if new_org:
                         await db.put_item(pk=f"CHECKOUT#{session_id}", sk="ACCOUNT",
@@ -388,7 +399,7 @@ def create_billing_router(
             resp_obj = result.model_dump() if hasattr(result, "model_dump") else (result if isinstance(result, dict) else {})
             # Strip any leaky fields that a future model_config="extra: allow"
             # change might let through.
-            for leaky in ("access_token", "org_id", "new_account", "account_error"):
+            for leaky in ("access_token", "org_id", "new_account", "account_error", "verification_token"):
                 resp_obj.pop(leaky, None)
 
             # Stash the access_token + org_id in the httponly checkout_intent
@@ -437,7 +448,23 @@ def create_billing_router(
         ):
             """Verify checkout and sync tier. Account already exists (created before Stripe)."""
             try:
-                result = await payment.verify_checkout_session(session_id, process_if_complete=True)
+                # Pull the plaintext `verification_token` stashed at
+                # create-session time. Payment service requires it whenever
+                # process_if_complete=True (raises 403 otherwise). Missing-OK
+                # for mock / legacy sessions — the upstream then returns 403
+                # only if the session has a stored hash that mandates a token.
+                verification_token: Optional[str] = None
+                if db and session_id:
+                    try:
+                        intent = await db.get_item(pk=f"CHECKOUT#{session_id}", sk="INTENT")
+                        if intent:
+                            verification_token = intent.get("verification_token") or None
+                    except Exception as e:
+                        logger.warning("checkout_verification_token_read_failed: %s", e)
+                result = await payment.verify_checkout_session(
+                    session_id, process_if_complete=True,
+                    verification_token=verification_token,
+                )
                 status = result.status if hasattr(result, "status") else result.get("status", "unknown")
                 metadata = result.metadata if hasattr(result, "metadata") else result.get("metadata") or {}
                 org_id = (metadata or {}).get("org_id", "")
@@ -521,12 +548,46 @@ def create_billing_router(
         async def create_checkout(request: Request, plan_id: str, user=Depends(auth_reader)):
             try:
                 base = str(request.base_url).rstrip("/")
-                return await payment.create_checkout_session(
+                result = await payment.create_checkout_session(
                     user.org_id, plan_id,
                     success_url=f"{base}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}",
                     cancel_url=f"{base}/pricing?cancelled=true",
                     customer_email=getattr(user, "email", None),
                 )
+                # Payment service now mints a `verification_token` for each
+                # checkout session. The success-page → complete-checkout flow
+                # must replay it back to /verify or the call 403s. Stash the
+                # plaintext token in our CHECKOUT#{sid} INTENT record so
+                # `complete_checkout` (same browser, may be a different
+                # request) can read it. Strip from the response so the token
+                # never reaches the browser — replay must originate from the
+                # server side.
+                session_id = result.id if hasattr(result, "id") else (result.get("id") if isinstance(result, dict) else "")
+                verification_token = (
+                    result.verification_token
+                    if hasattr(result, "verification_token")
+                    else (result.get("verification_token") if isinstance(result, dict) else None)
+                )
+                if db and session_id and verification_token:
+                    try:
+                        await db.put_item(
+                            pk=f"CHECKOUT#{session_id}", sk="INTENT",
+                            data={
+                                "org_id": user.org_id, "plan_id": plan_id,
+                                "user_id": getattr(user, "user_id", None),
+                                "verification_token": verification_token,
+                                "status": "pending",
+                            },
+                            ttl_seconds=86400 * 7,
+                        )
+                    except Exception as e:
+                        logger.warning("checkout_verification_token_store_failed: %s", e)
+                if hasattr(result, "verification_token"):
+                    try:
+                        result.verification_token = None
+                    except Exception:
+                        pass
+                return result
             except PaymentServiceError as e:
                 raise HTTPException(status_code=e.status_code, detail="Payment service error")
 
