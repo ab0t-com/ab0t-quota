@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # push.sh — single command to publish ab0t-quota safely.
 #
+# >>> For the full release runbook (env vars, gate checks, recovery from
+# >>> half-pushed state, when NOT to release), see ../RELEASE.md.
+#
 # Usage:
 #   bash scripts/push.sh                    # push current branch (after gate)
 #   bash scripts/push.sh v0.2.0             # push branch + create & push tag
