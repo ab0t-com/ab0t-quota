@@ -201,24 +201,45 @@ That's it. No Stripe.js, no card forms, no PCI scope.
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `GET /billing/{org_id}/balance` | GET | Required | Get account balance |
+| `GET /billing/{org_id}/balance` | GET | Required | Get account balance (3-bucket: `balance` + `credit_balance` + `subscription_credit`) |
 | `GET /billing/{org_id}/usage/summary` | GET | Required | Get usage summary |
 | `GET /billing/{org_id}/transactions` | GET | Required | List transactions |
 | `POST /billing/{org_id}/credit` | POST | Service key | Credit account (after payment) |
+| `POST /billing/{org_id}/apply-credit-grant` | POST | Service key | Apply a tier-driven credit grant to a bucket (signup, subscription_invoice_paid, etc.) |
+| `POST /billing/{org_id}/reset-subscription-credit` | POST | Service key | Zero out `subscription_credit` bucket on downgrade. Requires `expected_source_tier` safety check |
 | `POST /billing/{org_id}/reserve` | POST | Service key | Reserve funds for operation |
-| `POST /billing/{org_id}/commit` | POST | Service key | Commit reservation with actual cost |
+| `POST /billing/{org_id}/commit` | POST | Service key | Commit reservation with actual cost. Spend order: `subscription_credit → credit_balance → balance` |
 | `POST /billing/{org_id}/refund` | POST | Service key | Refund unused reservation |
 | `GET /billing/{org_id}/tier` | GET | Required | Get current tier |
 | `PUT /billing/{org_id}/tier` | PUT | Service key | Set tier (after subscription change) |
+
+### Balance shape (3-bucket)
+
+```json
+{
+  "balance": "12.50",              // cash / top-ups (refundable)
+  "credit_balance": "0.00",        // promo / signup grants (non-refundable, persistent)
+  "subscription_credit": "10.00",  // per-period bundled with active subscription
+  "reserved_balance": "0.00",
+  "available_balance": "41.50"     // sum of buckets minus reserved
+}
+```
+
+Commit drains in priority order — subscription credit first (use-it-or-lose-it), then promo credit, then cash. New configs with `billing_model: subscription_with_credits` populate `subscription_credit` on each `invoice.paid` webhook.
 
 ## Flows
 
 ### Subscription Flow
 ```
 User clicks "Subscribe" → proxy creates checkout → Stripe hosted page →
-user pays → Stripe webhook → payment service creates subscription →
-_sync_subscription_tier() → billing set_org_tier() → quota limits update
+user pays → Stripe webhook (customer.subscription.created) → payment service:
+  • _sync_subscription_tier() → billing PUT /{org_id}/tier → quota limits update
+Stripe webhook (invoice.paid) → payment service:
+  • If tier has billing_model=subscription_with_credits → billing POST /apply-credit-grant
+    → subscription_credit bucket populated with the period's bundled amount
 ```
+
+Payment service sets `subscription_data.metadata = {org_id, plan_id}` on every subscription checkout (Phase 2.1). This metadata propagates to every `invoice.paid` event from Stripe, letting the credit-grant trigger run without an extra lookup. If you're auditing a stale install, check that `payment/output/app/api/routes/checkout.py` includes the `subscription_data.metadata` field on the Stripe Checkout session — without it, invoice.paid grants are silently skipped.
 
 ### Top-Up Flow
 ```
@@ -261,10 +282,10 @@ Register your public webhook URL in the Stripe Dashboard:
 
 **Events to subscribe:**
 - `checkout.session.completed` — triggers billing credit for top-ups
-- `customer.subscription.created` — triggers tier sync
-- `customer.subscription.updated` — triggers tier change
+- `customer.subscription.created` — triggers tier sync (sets new tier on billing)
+- `customer.subscription.updated` — triggers tier change (and `/reset-subscription-credit` on downgrade if old tier has `reset_on_downgrade=true`)
 - `customer.subscription.deleted` — triggers downgrade to free
-- `invoice.paid` — tracks successful invoice payments
+- `invoice.paid` — triggers credit grant for `subscription_with_credits` tiers (populates `subscription_credit` bucket each period)
 - `invoice.payment_failed` — alerts on failed payments
 
 Your webhook proxy forwards the raw body + `Stripe-Signature` header to the payment service. The payment service verifies the signature and processes the event.

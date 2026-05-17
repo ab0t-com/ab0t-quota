@@ -366,6 +366,77 @@ class BillingServiceClient:
         })
         return PromotionalCreditResponse.model_validate(data)
 
+    async def reset_subscription_credit(
+        self, org_id: str,
+        expected_source_tier: str,
+        idempotency_key: str,
+        reason: str = "downgrade_reset",
+    ) -> dict:
+        """Zero `subscription_credit` after a downgrade, with safety check.
+
+        The endpoint compares the stored `subscription_credit_source_tier`
+        against `expected_source_tier`. Mismatch → 409 (the credit came
+        from a different subscription; don't wipe). Idempotent on
+        `idempotency_key`.
+
+        See ticket 20260516_paid_plan_balance_model_gap (Phase 3.2).
+        """
+        return await self._request(
+            "POST", f"/billing/{org_id}/reset-subscription-credit",
+            json={
+                "expected_source_tier": expected_source_tier,
+                "idempotency_key": idempotency_key,
+                "reason": reason,
+            },
+        )
+
+    async def apply_credit_grant(
+        self, org_id: str, amount: float,
+        destination: str,
+        lifecycle: str,
+        idempotency_key: str,
+        rollover_max: Optional[float] = None,
+        reason: str = "subscription_credit_grant",
+        source: Optional[str] = None,
+        source_tier: Optional[str] = None,
+    ) -> dict:
+        """Apply a credit grant per a consumer-declared lifecycle policy.
+
+        Used by the subscription-invoice webhook handler to land
+        subscription-bundled credits on an org's billing account per
+        the consumer's TierConfig.credit_grant policy.
+
+        Args:
+          org_id: target org.
+          amount: grant amount (positive).
+          destination: "balance" | "credit_balance" | "subscription_credit".
+          lifecycle: "persistent" | "use_it_or_lose_it" |
+                     "rollover_unlimited" | "rollover_capped".
+          rollover_max: required iff lifecycle == "rollover_capped".
+          idempotency_key: typically the source invoice ID, so Stripe
+                           webhook redelivery is naturally idempotent.
+          reason: audit-log reason tag.
+
+        Returns the billing-service response payload (UpdateBalanceResponse
+        shape) on success. Raises BillingServiceError on non-2xx.
+        """
+        body: dict = {
+            "amount": amount,
+            "destination": destination,
+            "lifecycle": lifecycle,
+            "idempotency_key": idempotency_key,
+            "reason": reason,
+        }
+        if rollover_max is not None:
+            body["rollover_max"] = rollover_max
+        if source is not None:
+            body["source"] = source
+        if source_tier is not None:
+            body["source_tier"] = source_tier
+        return await self._request(
+            "POST", f"/billing/{org_id}/apply-credit-grant", json=body,
+        )
+
     # --- Reservation lifecycle ---
 
     async def reserve_funds(

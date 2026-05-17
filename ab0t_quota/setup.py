@@ -333,6 +333,7 @@ def setup_quota(
             checkout_store=paid_checkout_store,
             templates_dir=paid_templates_dir,
             route_prefix=paid_route_prefix,
+            tiers=tiers,  # T0b — pass already-loaded TierConfig dict to the billing router
         ) if enable_paid else None
     )
 
@@ -633,6 +634,11 @@ async def _publish_tier_catalog(
         logger.debug("catalog publish skipped: no billing mesh API key set")
         return False
 
+    # TODO(public-mesh-ga): Catalog publish currently sends limits/features
+    # but not billing_model, price, credit_grant, lifecycle, or plan/price
+    # mappings. Extend this before billing/bridge/admin views rely on the
+    # catalog as the complete consumer policy source. Backlink:
+    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
     payload: dict = {
         "tiers": [
             {
@@ -780,6 +786,7 @@ def _wire_paid_tier_sync(
     checkout_store: Optional[Any] = None,
     templates_dir: Optional[str] = None,
     route_prefix: str = "/api",
+    tiers: Optional[dict] = None,
 ) -> Optional[dict]:
     """Mount the paid-tier surface synchronously: lifecycle emitter, billing
     proxy router. Returns state needed by the lifespan (heartbeat monitor)."""
@@ -840,6 +847,11 @@ def _wire_paid_tier_sync(
             checkout_store=checkout_store,
             templates_dir=templates_dir,
             prefix=route_prefix,
+            # T0b — thread the already-loaded tier_registry through so the
+            # Stripe webhook proxy can use it for invoice.payment_succeeded
+            # dispatch (T2/T3). Same instance as the engine's tier dict;
+            # startup validation and runtime policy stay in sync.
+            tier_registry=tiers,
         )
         app.include_router(router)
         logger.info("paid-tier proxy router mounted at prefix=%s", route_prefix)
@@ -852,6 +864,10 @@ def _wire_paid_tier_sync(
     # and auto-subscribes with auth based on which event types have handlers.
     # See ab0t_quota/auth_events.py module docstring for the consumer-side
     # pattern.
+    # TODO(public-mesh-ga): Align setup with auth_events.py docs: either
+    # auto-register the built-in signup credit handler with tier_registry, or
+    # document that consumers must register their own handler. Backlink:
+    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
     webhook_secret = os.getenv("AB0T_AUTH_WEBHOOK_SECRET", "")
     if webhook_secret:
         try:

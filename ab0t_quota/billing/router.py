@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
@@ -32,6 +33,7 @@ from typing import Any, Callable, Optional, Protocol
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from ..models.core import TierConfig
 from .clients import (
     BillingServiceClient,
     BillingServiceError,
@@ -89,6 +91,7 @@ def create_billing_router(
     checkout_store: Optional[CheckoutStore] = None,
     templates_dir: Optional[str] = None,
     prefix: str = "/api",
+    tier_registry: Optional[dict[str, TierConfig]] = None,
 ) -> APIRouter:
     """Create a FastAPI router with all billing & payment proxy routes.
 
@@ -115,6 +118,14 @@ def create_billing_router(
         checkout_store: DynamoDB-like store for checkout intent tracking
         templates_dir: Override template directory
         prefix: URL prefix for all routes (default: /api)
+        tier_registry: Loaded TierConfig dict keyed by tier_id, passed in from
+            setup_quota's load_tiers() result. Required for the Stripe webhook
+            proxy's invoice.payment_succeeded dispatch (T2/T3 in ticket
+            20260516_auto_credit_invoice_paid_wiring) — without it, the
+            dispatch handlers can't read the consumer's billing_model /
+            credit_grant / lifecycle / destination policy. Logged as WARNING
+            at startup if not provided; the Stripe dispatch then falls back
+            to "all events skipped" rather than silently mis-granting.
     """
     for name, val in [("payment_url", payment_url), ("payment_api_key", payment_api_key),
                        ("billing_url", billing_url), ("billing_api_key", billing_api_key),
@@ -140,13 +151,58 @@ def create_billing_router(
     templates = Jinja2Templates(directory=tpl_dir)
 
     tier_map: dict[str, str] = {}
+    # T0e — explicit ID→tier maps from quota-config.json's optional
+    # `billing_integration` block. Both maps are flat dicts:
+    #   {
+    #     "billing_integration": {
+    #       "plan_to_tier":       {"<payment-plan-uuid>": "starter", ...},
+    #       "stripe_price_to_tier": {"price_<stripe-id>":   "starter", ...}
+    #     }
+    #   }
+    # These let consumers pin the mapping in one place instead of relying
+    # on payment-plan display-name equality with tier display-name. Read
+    # once at router creation; passed to _resolve_id_to_tier at call sites.
+    explicit_plan_to_tier: dict[str, str] = {}
+    explicit_stripe_price_to_tier: dict[str, str] = {}
     if quota_config_path:
         try:
             with open(quota_config_path) as f:
                 config = json.load(f)
+            # TODO(public-mesh-ga): Keep display-name tier maps as legacy
+            # fallback only; public consumers need stable plan/price IDs or
+            # metadata mappings as the source of truth. Backlink:
+            # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
             tier_map = {t["display_name"].lower(): t["tier_id"] for t in config.get("tiers", [])}
+            bi = config.get("billing_integration") or {}
+            explicit_plan_to_tier = dict(bi.get("plan_to_tier") or {})
+            explicit_stripe_price_to_tier = dict(bi.get("stripe_price_to_tier") or {})
+            if explicit_plan_to_tier or explicit_stripe_price_to_tier:
+                logger.info(
+                    "create_billing_router: loaded explicit ID→tier maps "
+                    "(plan_to_tier=%d entries, stripe_price_to_tier=%d entries)",
+                    len(explicit_plan_to_tier), len(explicit_stripe_price_to_tier),
+                )
         except Exception as e:
             logger.warning("Failed to load quota config for tier mapping: %s", e)
+
+    # T0b — capture tier_registry from caller for the Stripe webhook proxy's
+    # invoice.payment_succeeded dispatch (T2/T3). Warn loudly at startup if
+    # missing so misconfiguration is visible immediately rather than at the
+    # first paid invoice. Ticket: 20260516_auto_credit_invoice_paid_wiring.
+    if tier_registry is None:
+        logger.warning(
+            "create_billing_router: tier_registry not provided. The Stripe "
+            "webhook proxy will mount, but invoice.payment_succeeded dispatch "
+            "(T2) cannot fire credit grants without the consumer's tier "
+            "policy. Pass tier_registry=load_tiers(config) from your "
+            "setup_quota wiring."
+        )
+    else:
+        logger.info(
+            "create_billing_router: tier_registry attached with %d tiers (%s)",
+            len(tier_registry),
+            ", ".join(sorted(tier_registry.keys())),
+        )
 
     db = checkout_store
     router = APIRouter()
@@ -609,15 +665,265 @@ def create_billing_router(
         signature = request.headers.get("stripe-signature", "")
         if not signature:
             raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
+
+        # T1 — local Stripe signature verification.
+        # Ticket: 20260516_auto_credit_invoice_paid_wiring.
+        #
+        # After §8 Step 6 cutover, Stripe Dashboard points at this endpoint
+        # directly. The proxy must verify locally before processing or
+        # forwarding to payment-service. The forwarded request reaches
+        # payment-service with the SAME Stripe-Signature header; payment-
+        # service's multi-secret support (T0d) accepts our endpoint's secret
+        # alongside its legacy secret, so the forward verifies cleanly.
+        #
+        # Env var is namespaced (AB0T_QUOTA_STRIPE_WEBHOOK_SECRET) to avoid
+        # collision with payment-service's same-named STRIPE_WEBHOOK_SECRET
+        # when both services run in the same compose/k8s namespace. Falls
+        # back to STRIPE_WEBHOOK_SECRET for local dev convenience.
+        import stripe as _stripe  # local import: 'stripe' is in the [billing] extra (T0c)
+
+        secret = (
+            os.getenv("AB0T_QUOTA_STRIPE_WEBHOOK_SECRET")
+            or os.getenv("STRIPE_WEBHOOK_SECRET", "")
+        )
+        # TODO(public-mesh-ga): Support a comma-separated
+        # AB0T_QUOTA_STRIPE_WEBHOOK_SECRETS list for endpoint-secret
+        # rotation, mirroring payment-service cutover behavior. Backlink:
+        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+        if not secret:
+            logger.error(
+                "AB0T_QUOTA_STRIPE_WEBHOOK_SECRET unset (and STRIPE_WEBHOOK_SECRET "
+                "fallback also empty) — cannot verify Stripe signature. Configure "
+                "this in your sandbox-platform/.env.production before Stripe "
+                "Dashboard cuts over to this endpoint."
+            )
+            raise HTTPException(status_code=500, detail="Server config error")
+
+        try:
+            event = _stripe.Webhook.construct_event(body, signature, secret)
+        except _stripe.error.SignatureVerificationError:
+            logger.warning(
+                "stripe_signature_invalid — request rejected. Likely cause: "
+                "AB0T_QUOTA_STRIPE_WEBHOOK_SECRET doesn't match the secret "
+                "Stripe Dashboard generated for this endpoint."
+            )
+            raise HTTPException(status_code=400, detail="Invalid signature")
+        except ValueError as e:
+            logger.warning("stripe_payload_invalid: %s", e)
+            raise HTTPException(status_code=400, detail="Invalid payload")
+
+        # T1 success: `event` is verified. T2 dispatches invoice.paid below,
+        # T3 dispatches customer.subscription.{updated,deleted}. All dispatch
+        # runs on the verified event BEFORE the forward to payment-service.
+
+        # T2 — dispatch invoice.payment_succeeded to handle_subscription_invoice_paid.
+        # Ticket: 20260516_auto_credit_invoice_paid_wiring.
+        #
+        # The library helper takes consumer-supplied tier_registry +
+        # plan_to_tier resolver (both in this closure from T0b/T0e) and
+        # routes the credit grant to billing-service per the tier's declared
+        # billing_model + credit_grant policy.
+        #
+        # Status → HTTP response decision matrix (per ticket §6 T2):
+        #   applied / skipped_*  → 200 (continue to forward)
+        #   deferred_transient   → 503 (Stripe retries; grant is idempotent
+        #                               on invoice:{id}:credit_grant so the
+        #                               eventual successful retry won't double-credit)
+        #   failed_permanent     → 200 + ERROR log (don't retry-storm a
+        #                               permanent failure; surface for paging)
+        event_type = event.get("type", "")
+
+        if event_type == "invoice.payment_succeeded":
+            from .subscription_credit import handle_subscription_invoice_paid
+
+            # Adapter: the lib helper expects Callable[[str], Awaitable[Optional[str]]].
+            # Our T0e resolver takes more kwargs; close over them here.
+            async def _resolve(identifier: str) -> Optional[str]:
+                return await _resolve_id_to_tier(
+                    identifier,
+                    tier_map=tier_map,
+                    payment=payment,
+                    consumer_org_id=consumer_org_id,
+                    explicit_plan_to_tier=explicit_plan_to_tier,
+                    explicit_stripe_price_to_tier=explicit_stripe_price_to_tier,
+                )
+
+            invoice = event.get("data", {}).get("object", {}) or {}
+            try:
+                dispatch_result = await handle_subscription_invoice_paid(
+                    invoice=invoice,
+                    tier_registry=tier_registry or {},
+                    plan_to_tier=_resolve,
+                    billing_client=billing,
+                )
+            except Exception as e:
+                # Unexpected exception in dispatch (not a clean status return).
+                # Don't swallow — return 500 so Stripe retries. Log fully.
+                logger.exception(
+                    "invoice_paid_dispatch_unexpected_exception event_id=%s err=%s",
+                    event.get("id"), e,
+                )
+                raise HTTPException(status_code=500, detail="Dispatch error")
+
+            status = dispatch_result.get("status")
+            # stdlib-compatible positional format (NOT structlog kwargs per
+            # ticket Report 1 H6 — module uses stdlib logging).
+            logger.info(
+                "invoice_paid_dispatch_result status=%s event_id=%s "
+                "invoice_id=%s org_id=%s tier_id=%s",
+                status, event.get("id"),
+                dispatch_result.get("invoice_id"),
+                dispatch_result.get("org_id"),
+                dispatch_result.get("tier_id"),
+            )
+
+            if status == "deferred_transient":
+                # Stripe will retry. Grant idempotency key prevents double-credit.
+                raise HTTPException(
+                    status_code=503,
+                    detail="Transient billing failure; will retry",
+                )
+            if status == "failed_permanent":
+                # Log at ERROR for paging; respond 200 so Stripe doesn't
+                # retry-storm a permanent failure that won't self-resolve.
+                logger.error(
+                    "invoice_paid_failed_permanent_PAGE status_code=%s event_id=%s "
+                    "invoice_id=%s org_id=%s tier_id=%s",
+                    dispatch_result.get("status_code"),
+                    event.get("id"),
+                    dispatch_result.get("invoice_id"),
+                    dispatch_result.get("org_id"),
+                    dispatch_result.get("tier_id"),
+                )
+            # All other statuses (applied, skipped_*) fall through to forward.
+
+        # T3 — dispatch customer.subscription.{updated,deleted} for downgrade reset.
+        # Ticket: 20260516_auto_credit_invoice_paid_wiring.
+        #
+        # .updated: a tier change is signalled by price_id changing on the
+        #   subscription items. Stripe sends the new subscription object in
+        #   data.object and the OLD attributes in data.previous_attributes.
+        #   Library helper reset_subscription_credit_on_tier_change handles
+        #   the actual decision (downgrade detection via sort_order, the
+        #   reset_on_downgrade policy check, and the source-tier 409 safety).
+        # .deleted: full cancellation. payment-service's _sync_subscription_tier
+        #   sets billing tier=free; we mirror that here by treating
+        #   new_tier_id="free" and letting the helper decide whether to reset.
+        #
+        # Status → HTTP same matrix as T2.
+        elif event_type in ("customer.subscription.updated",
+                            "customer.subscription.deleted"):
+            from .subscription_credit import reset_subscription_credit_on_tier_change
+
+            sub = event.get("data", {}).get("object", {}) or {}
+            previous = event.get("data", {}).get("previous_attributes", {}) or {}
+            org_id = _extract_org_id_from_subscription(sub)
+
+            # Resolve old/new price IDs by event type
+            if event_type == "customer.subscription.deleted":
+                # On delete: subscription.items still carries the last price.
+                old_price_id = _extract_subscription_price_id(sub)
+                # TODO(public-mesh-ga): Replace hardcoded cancellation target
+                # with the consumer catalog's configured default/free tier.
+                # Backlink:
+                # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+                new_tier_id = "free"  # mirror payment-service's _sync_subscription_tier
+                new_price_id = None
+            else:
+                # On update: previous_attributes carries the old items shape
+                # (partial — only fields that changed). Current sub has the new.
+                new_price_id = _extract_subscription_price_id(sub)
+                old_price_id = _extract_previous_subscription_price_id(previous)
+                new_tier_id = None  # resolved below if we have a new price
+
+            # Short-circuit when there's nothing to act on
+            if not org_id or not old_price_id:
+                logger.info(
+                    "subscription_update_skip event_id=%s reason=no_org_or_no_old_price "
+                    "(not a tier change, or missing metadata)",
+                    event.get("id"),
+                )
+            else:
+                # Adapter — same shape as T2's _resolve, scoped to this branch.
+                async def _resolve(identifier: str) -> Optional[str]:
+                    return await _resolve_id_to_tier(
+                        identifier,
+                        tier_map=tier_map,
+                        payment=payment,
+                        consumer_org_id=consumer_org_id,
+                        explicit_plan_to_tier=explicit_plan_to_tier,
+                        explicit_stripe_price_to_tier=explicit_stripe_price_to_tier,
+                    )
+
+                old_tier_id = await _resolve(old_price_id)
+                if event_type == "customer.subscription.updated" and new_price_id:
+                    new_tier_id = await _resolve(new_price_id)
+
+                if not old_tier_id or not new_tier_id:
+                    logger.info(
+                        "subscription_update_skip event_id=%s reason=unresolved_tier "
+                        "old_price=%s old_tier=%s new_price=%s new_tier=%s",
+                        event.get("id"), old_price_id, old_tier_id, new_price_id, new_tier_id,
+                    )
+                else:
+                    try:
+                        reset_result = await reset_subscription_credit_on_tier_change(
+                            org_id=org_id,
+                            old_tier_id=old_tier_id,
+                            new_tier_id=new_tier_id,
+                            tier_registry=tier_registry or {},
+                            billing_client=billing,
+                            tier_change_event_id=event.get("id"),
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            "subscription_update_dispatch_unexpected_exception "
+                            "event_id=%s err=%s",
+                            event.get("id"), e,
+                        )
+                        raise HTTPException(status_code=500, detail="Dispatch error")
+
+                    reset_status = reset_result.get("status")
+                    logger.info(
+                        "subscription_update_dispatch_result event_type=%s status=%s "
+                        "event_id=%s org_id=%s old_tier=%s new_tier=%s",
+                        event_type, reset_status, event.get("id"),
+                        org_id, old_tier_id, new_tier_id,
+                    )
+
+                    if reset_status == "deferred_transient":
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Transient billing failure; will retry",
+                        )
+                    if reset_status == "failed":
+                        logger.error(
+                            "subscription_update_failed_PAGE status_code=%s "
+                            "event_id=%s org_id=%s old_tier=%s new_tier=%s",
+                            reset_result.get("status_code"),
+                            event.get("id"), org_id, old_tier_id, new_tier_id,
+                        )
+                    # All other statuses (reset, skipped_*) fall through to forward.
+
+        # Forward to payment-service. payment-service accepts the same
+        # signature thanks to T0d's multi-secret support.
         try:
             result = await payment.forward_webhook(body, signature)
         except PaymentServiceError as e:
-            raise HTTPException(status_code=e.status_code, detail="Webhook processing error")
+            # Forward failures (including 4xx from payment-service) bubble
+            # back to Stripe as 503 so Stripe redelivers. The grant work T2
+            # does is idempotent on invoice:{id}:credit_grant, and payment-
+            # service dedups on Stripe event_id, so retry is safe.
+            logger.warning(
+                "payment_service_forward_failed status_code=%d event_id=%s",
+                getattr(e, "status_code", 0), event.get("id"),
+            )
+            raise HTTPException(status_code=503, detail="Forward failed; will retry")
 
-        # Webhook fallback: tier sync for checkouts where success page didn't process
+        # Webhook fallback: tier sync for checkouts where success page didn't process.
+        # Uses the verified event dict from T1 instead of re-parsing body.
         if db:
             try:
-                event = json.loads(body)
                 if event.get("type") == "checkout.session.completed":
                     session_obj = event.get("data", {}).get("object", {})
                     sid = session_obj.get("id", "")
@@ -628,7 +934,15 @@ def create_billing_router(
                             acct = await db.get_item(pk=f"CHECKOUT#{sid}", sk="ACCOUNT")
                             org_id = (acct or {}).get("org_id", "")
                             if org_id and plan_id:
-                                tid = await _resolve_plan_to_tier(plan_id, tier_map, payment, consumer_org_id)
+                                # T0e — pass the explicit maps loaded from
+                                # quota-config.json's billing_integration block
+                                # so the webhook-fallback path benefits from
+                                # consumer-pinned mappings too (not just T2/T3).
+                                tid = await _resolve_plan_to_tier(
+                                    plan_id, tier_map, payment, consumer_org_id,
+                                    explicit_plan_to_tier=explicit_plan_to_tier,
+                                    explicit_stripe_price_to_tier=explicit_stripe_price_to_tier,
+                                )
                                 if tid:
                                     try:
                                         await billing.set_tier(org_id, tid, reason="webhook_fallback")
@@ -659,25 +973,230 @@ def create_billing_router(
 # Helpers
 # =========================================================================
 
+# ---------------------------------------------------------------------------
+# Stripe-shape extraction helpers — used by T3 dispatch.
+# Kept module-level for unit testing against real Stripe-shaped fixtures.
+# Tolerant of partial / missing nested structure (Stripe's
+# previous_attributes only carries CHANGED fields, not the whole sub).
+# ---------------------------------------------------------------------------
+
+def _extract_subscription_price_id(sub):
+    """Pull the current price_id from a Stripe subscription object.
+
+    Shape: sub.items.data[0].price.id
+    Returns None if any link in the chain is missing.
+
+    Ticket: 20260516_auto_credit_invoice_paid_wiring (T3).
+    """
+    if not sub:
+        return None
+    items = (sub.get("items") or {}).get("data") or []
+    if not items:
+        return None
+    price = items[0].get("price") or {}
+    pid = price.get("id")
+    return pid if isinstance(pid, str) else None
+
+
+def _extract_previous_subscription_price_id(previous):
+    """Pull the OLD price_id from a Stripe customer.subscription.updated event's
+    `previous_attributes`.
+
+    Caveat: `previous_attributes` is partial — Stripe only sends fields that
+    changed. If items didn't change, this returns None and the caller should
+    treat the event as a non-tier-change (no reset).
+
+    Same nested shape as the current-price extractor.
+
+    Ticket: 20260516_auto_credit_invoice_paid_wiring (T3).
+    """
+    if not previous:
+        return None
+    items = (previous.get("items") or {}).get("data") or []
+    if not items:
+        return None
+    price = items[0].get("price") or {}
+    pid = price.get("id")
+    return pid if isinstance(pid, str) else None
+
+
+def _extract_org_id_from_subscription(sub):
+    """Pull org_id from a Stripe subscription's metadata.
+
+    Set by payment-service's checkout flow (Phase 2.1 of parent ticket).
+    Pre-2.1 subscriptions don't have it; caller treats None as "skip".
+
+    Ticket: 20260516_auto_credit_invoice_paid_wiring (T3).
+    """
+    if not sub:
+        return None
+    md = sub.get("metadata") or {}
+    org_id = md.get("org_id") if isinstance(md, dict) else None
+    return org_id if isinstance(org_id, str) and org_id else None
+
+
+async def _resolve_id_to_tier(
+    identifier: str,
+    *,
+    tier_map: dict[str, str],
+    payment: PaymentServiceClient,
+    consumer_org_id: str,
+    explicit_plan_to_tier: Optional[dict[str, str]] = None,
+    explicit_stripe_price_to_tier: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    """Stable, multi-ID-space resolver.
+
+    `identifier` can be any of:
+      - payment-service plan UUID (from invoice.metadata.plan_id, Phase 2.1 propagation)
+      - Stripe price ID (from customer.subscription.updated items[].price.id)
+      - Stripe plan ID (legacy; rare today)
+
+    Resolution priority (most-stable first):
+      1. Explicit consumer-declared map in quota-config.json's
+         `billing_integration.plan_to_tier` / `stripe_price_to_tier` —
+         a flat dict from the consumer's config, never depends on
+         payment-service responses or display-name drift.
+      2. Payment plan `metadata.tier_id` — set at seed time when the
+         consumer's seed_plans.sh includes `metadata = {"tier_id": ...}`.
+         Stable across renames.
+      3. Match `identifier` against any price's `stripe_price_id` to
+         find the parent plan, then resolve as in priority 2.
+      4. Display-name match (legacy fallback): map plan.name.lower() →
+         tier_id via tier_map. Logs a WARNING because display-name
+         drift will silently break this — fix by adding the mapping
+         to step 1 or to seed metadata for step 2.
+
+    Returns None if no path resolves. Logs at the matching level so
+    operators can see WHICH path resolved (debug/warning).
+
+    Ticket: 20260516_auto_credit_invoice_paid_wiring (T0e).
+    """
+    if not identifier:
+        return None
+
+    explicit_plan_to_tier = explicit_plan_to_tier or {}
+    explicit_stripe_price_to_tier = explicit_stripe_price_to_tier or {}
+
+    # Priority 1: explicit consumer maps — both ID spaces in one shot.
+    if identifier in explicit_plan_to_tier:
+        logger.debug("resolve_id_to_tier identifier=%s via explicit_plan_to_tier", identifier)
+        return explicit_plan_to_tier[identifier]
+    if identifier in explicit_stripe_price_to_tier:
+        logger.debug("resolve_id_to_tier identifier=%s via explicit_stripe_price_to_tier", identifier)
+        return explicit_stripe_price_to_tier[identifier]
+
+    # Priorities 2-4 need to query the payment service.
+    try:
+        plans_data = await payment.get_plans(consumer_org_id, provider_org=consumer_org_id)
+    except Exception as e:
+        logger.warning("resolve_id_to_tier: get_plans failed: %s", e)
+        return None
+
+    # Priority 2: direct plan_id match → check metadata.tier_id
+    for p in plans_data.plans:
+        if p.plan_id != identifier:
+            continue
+        # PlanItem.model_config allows extras; metadata flows through if
+        # payment-service returns it. Read defensively.
+        meta = getattr(p, "metadata", None) or {}
+        if isinstance(meta, dict) and meta.get("tier_id"):
+            tid = meta["tier_id"]
+            logger.debug("resolve_id_to_tier identifier=%s via plan.metadata.tier_id=%s",
+                         identifier, tid)
+            return tid
+        # No metadata.tier_id on this plan — fall through to priority 4
+        # (display-name) for THIS plan only.
+        break
+
+    # Priority 3: Stripe price ID → find parent plan → check metadata.tier_id
+    for p in plans_data.plans:
+        prices = getattr(p, "prices", None) or []
+        for price in prices:
+            sp_id = getattr(price, "stripe_price_id", None)
+            if sp_id and sp_id == identifier:
+                meta = getattr(p, "metadata", None) or {}
+                if isinstance(meta, dict) and meta.get("tier_id"):
+                    tid = meta["tier_id"]
+                    logger.debug(
+                        "resolve_id_to_tier identifier=%s via price.stripe_price_id → "
+                        "plan.metadata.tier_id=%s",
+                        identifier, tid,
+                    )
+                    return tid
+                # Found the plan but no metadata.tier_id — fall through to
+                # priority 4 with the parent plan's display name.
+                name = (p.name or "").lower()
+                if name in tier_map:
+                    tid = tier_map[name]
+                    # TODO(public-mesh-ga): Make this fallback dev-only or
+                    # emit an operator error once plan metadata/config maps
+                    # are standard; display names are not stable IDs.
+                    # Backlink:
+                    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+                    logger.warning(
+                        "resolve_id_to_tier identifier=%s resolved via plan display-name "
+                        "fallback (Stripe price %s → plan %r → tier %s). Pin this in "
+                        "quota-config.json's billing_integration.stripe_price_to_tier "
+                        "to avoid drift.",
+                        identifier, sp_id, p.name, tid,
+                    )
+                    return tid
+
+    # Priority 4 (final): plan_id matches but no metadata, use display name.
+    for p in plans_data.plans:
+        if p.plan_id == identifier:
+            name = (p.name or "").lower()
+            if name in tier_map:
+                tid = tier_map[name]
+                # TODO(public-mesh-ga): Make this fallback dev-only or
+                # emit an operator error once plan metadata/config maps
+                # are standard; display names are not stable IDs.
+                # Backlink:
+                # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+                logger.warning(
+                    "resolve_id_to_tier identifier=%s resolved via plan display-name "
+                    "fallback (%r → %s). Pin this in quota-config.json's "
+                    "billing_integration.plan_to_tier to avoid drift.",
+                    identifier, p.name, tid,
+                )
+                return tid
+
+    logger.info(
+        "resolve_id_to_tier identifier=%s did not resolve via any path "
+        "(checked %d plans).", identifier, len(plans_data.plans),
+    )
+    return None
+
+
 async def _resolve_plan_to_tier(
     plan_id: str,
     tier_map: dict[str, str],
     payment: PaymentServiceClient,
     consumer_org_id: str,
+    explicit_plan_to_tier: Optional[dict[str, str]] = None,
+    explicit_stripe_price_to_tier: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
-    """Map plan_id to tier_id by looking up plan name from the payment service."""
+    """Back-compat shim. Delegates to _resolve_id_to_tier.
+
+    Existing call sites that only have a payment plan_id continue to work.
+    New call sites (T2/T3 invoice/subscription dispatch) should call
+    _resolve_id_to_tier directly to express that the identifier may be
+    either a plan_id or a Stripe price_id.
+    """
+    # TODO(public-mesh-ga): Do not require the legacy display-name tier_map
+    # when explicit plan/price maps are present; explicit maps should be
+    # sufficient for production resolution. Backlink:
+    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
     if not plan_id or not tier_map:
         return None
-    try:
-        plans_data = await payment.get_plans(consumer_org_id, provider_org=consumer_org_id)
-        for p in plans_data.plans:
-            if p.plan_id == plan_id:
-                name = (p.name or "").lower()
-                if name in tier_map:
-                    return tier_map[name]
-        return None
-    except Exception:
-        return None
+    return await _resolve_id_to_tier(
+        plan_id,
+        tier_map=tier_map,
+        payment=payment,
+        consumer_org_id=consumer_org_id,
+        explicit_plan_to_tier=explicit_plan_to_tier,
+        explicit_stripe_price_to_tier=explicit_stripe_price_to_tier,
+    )
 
 
 async def _create_anonymous_account(

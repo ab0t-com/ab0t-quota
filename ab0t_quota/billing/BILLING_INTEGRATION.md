@@ -269,3 +269,132 @@ Your Service                    Billing Service              Payment Service
 
 Billing service is generic — commits amounts, tracks balances.
 Your service owns pricing, proration timing, and resource health.
+
+---
+
+## Billing relationships — choosing a model for your tier
+
+ab0t-quota supports multiple SaaS billing archetypes via declarative
+config per tier. The library implements primitives (reservation,
+commit, debit, credit grant, counter); consumers declare which model
+applies to each tier in their `quota-config.json`.
+
+### Schema (TierConfig fields, all optional)
+
+```jsonc
+{
+  "tier_id": "starter",
+  "billing_model": "subscription_with_credits",
+  "price": {
+    "amount_per_period": 10.00,
+    "currency": "USD",
+    "period": "month"
+  },
+  "credit_grant": {
+    "trigger": "subscription_invoice_paid",
+    "amount_per_period": 10.00,
+    "currency": "USD",
+    "lifecycle": "use_it_or_lose_it",
+    "destination": "subscription_credit",
+    "reset_on_downgrade": true,
+    "reset_on_upgrade": false
+  },
+  "limits": { ... }
+}
+```
+
+### Supported `billing_model` values
+
+| Value | Archetype | When to use |
+|---|---|---|
+| `capacity_only` *(default)* | Pure quota tier | Free tier with limits only, or paid capacity-unlock that grants no credit |
+| `consumption_only` | Pay-as-you-go | No subscription concept; user tops up via Stripe Checkout |
+| `subscription_with_credits` | Bundled credit | Most consumer SaaS: paying $X/mo grants $Y of credit per period (Y typically equals or exceeds X) |
+| `subscription_unlock_only` | Capacity unlock | Subscription pays for higher LIMITS; user tops up separately for spending |
+| `subscription_with_overage` | Hybrid | Subscription includes $X; usage beyond auto-charges card (NOT YET IMPLEMENTED) |
+| `seat_based` | Per-user | Price scales with active users (NOT YET IMPLEMENTED) |
+| `metered` | Usage-based | Stripe `usage_record` push per period (NOT YET IMPLEMENTED) |
+
+### Credit grant triggers
+
+| `trigger` | Fires when | Use case |
+|---|---|---|
+| `signup` | `auth.user.registered` webhook | One-shot signup grant. Replaces the legacy `initial_credit` field. |
+| `subscription_invoice_paid` | Stripe `invoice.payment_succeeded` (with `subscription_data.metadata.org_id` set) | Period grant on every successful subscription invoice. |
+| `scheduled_period_start` | Cron at start of each billing period | Alternative when Stripe isn't the source of truth. |
+| `manual` | Admin POST to `/promotional-credit` | Referrals, support compensation. |
+| `webhook_admin` | Custom event webhook | Consumer-defined triggers. |
+
+### Lifecycle options
+
+| `lifecycle` | Behavior | Example use |
+|---|---|---|
+| `persistent` | ADD amount; never expires | Signup grant ($10 free credit) |
+| `use_it_or_lose_it` | SET to amount; previous remainder forfeit | Standard monthly subscription credit |
+| `rollover_unlimited` | ADD amount; carry forward indefinitely | Annual prepay |
+| `rollover_capped` | ADD amount, cap at `rollover_max_periods × amount_per_period` | Enterprise (e.g., 3 months max rollover) |
+
+### Ledger destination
+
+Three balance fields on `BillingAccount`. Each grant lands in exactly one:
+
+| `destination` | Field | Lifecycle implication |
+|---|---|---|
+| `balance` | User cash (refundable). Topped up via Stripe Checkout `type=account_funding`. |
+| `credit_balance` | Promo/signup grants. Non-refundable, typically persistent. |
+| `subscription_credit` | Subscription-bundled credit. Period-bounded per `lifecycle`. Tracks provenance via `subscription_credit_source` + `_source_tier` + `_granted_at` pointers on the account. |
+
+Spend order at commit time: `subscription_credit` → `credit_balance` → `balance`. Use-it-or-lose-it drains before promo; promo drains before user cash.
+
+### Endpoints added for credit-grant management
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /billing/{org_id}/apply-credit-grant` | Apply a grant per the consumer-declared lifecycle. Idempotent on `idempotency_key` (typically the source invoice ID). |
+| `POST /billing/{org_id}/reset-subscription-credit` | Zero `subscription_credit` after a tier downgrade, with `expected_source_tier` safety check (rejects 409 if the recorded credit came from a different tier — protects multi-sub orgs). |
+| `POST /billing/{org_id}/promotional-credit` | Legacy one-shot promo credit. Kept for back-compat; new consumers should use `/apply-credit-grant` with `destination=credit_balance`. |
+
+### Library helpers (in `ab0t_quota.billing.subscription_credit`)
+
+| Function | Purpose |
+|---|---|
+| `handle_subscription_invoice_paid(invoice, ...)` | Webhook receiver for Stripe `invoice.payment_succeeded`. Routes to `apply_credit_grant` per the org's tier config. |
+| `reset_subscription_credit_on_tier_change(org_id, old_tier_id, new_tier_id, ...)` | Library helper: detects downgrade via `sort_order`, checks `reset_on_downgrade` policy, calls reset endpoint with safety check. |
+
+### Required wiring for `subscription_with_credits` to function end-to-end
+
+1. **`payment-service`**: subscription-mode Stripe Checkout sessions must set `subscription_data.metadata = {"org_id": org_id, "plan_id": plan_id}` so the metadata propagates to subscription + invoice records.
+2. **`ab0t-quota`** (your service): wire `handle_subscription_invoice_paid` as a webhook receiver for Stripe `invoice.payment_succeeded` events (delivery mechanism is consumer-specific — typically payment-service forwards to a consumer endpoint, or via SNS event mesh).
+3. **Tier config**: `billing_model: "subscription_with_credits"` + `price` + `credit_grant` (with `trigger: "subscription_invoice_paid"`) in your `quota-config.json`.
+
+### Observability — structured log events
+
+The library emits the following keys via `structlog`. Wire alerts/dashboards to these:
+
+| Event key | Severity | Meaning |
+|---|---|---|
+| `subscription_invoice_paid_applied` | INFO | Successful credit grant landed |
+| `subscription_invoice_paid_skip` | INFO | Grant skipped (no metadata / no tier / no credit_grant configured / wrong trigger) — expected, not an error |
+| `subscription_invoice_paid_transient` | WARNING | Billing-service returned 5xx / 429; retry-eligible |
+| `subscription_invoice_paid_failed_permanent` | ERROR | Billing-service returned 4xx; investigation needed |
+| `credit_grant_applied` | INFO | (billing-service) Credit landed; logs destination + lifecycle + amount + forfeit |
+| `reset_subscription_credit_applied` | INFO | Downgrade reset succeeded |
+| `reset_subscription_credit_tier_mismatch` | WARNING | Reset rejected by safety check (recorded credit belongs to different tier) |
+| `downgrade_reset_applied` | INFO | (library helper) Reset succeeded |
+| `downgrade_reset_skipped_safety_check` | INFO | (library helper) Safety check rejected; expected behavior in multi-sub orgs |
+| `lifecycle_commit_lost_to_expiry` | ERROR | **Revenue loss**: reservation expired before commit could fire. Alertable. |
+
+The `lifecycle_commit_lost_to_expiry` key in particular should fire a paging alert — it signals a usage event that wasn't billed.
+
+### Future architecture: credit-entries table (multi-source / per-grant expiry)
+
+The current `subscription_credit` field tracks a single provenance pointer per account (Option B in the parent design doc). This works for single-subscription-per-org and basic downgrade-reset.
+
+When the product needs:
+- Multiple subscriptions on one org with independent credit pools
+- Per-grant expiry dates that differ from the subscription period
+- Selective refund: clawback ONLY the credit from a specific cancelled subscription
+
+…migrate to a credit-entries table (one item per grant). The public endpoints (`apply-credit-grant`, `reset-subscription-credit`) stay the same — only the internal representation changes.
+
+A consumer-side migration ticket exists for this future work; the public contract (the `apply-credit-grant` + `reset-subscription-credit` endpoints) does not change when migrating.

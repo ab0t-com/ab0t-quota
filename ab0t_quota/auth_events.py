@@ -361,9 +361,29 @@ async def grant_initial_credit_for_user(
     redis: Any,
     billing_url: str,
     billing_api_key: str,
+    tier_registry: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Grant the configured initial_credit for the user's tier, idempotently.
-    Safe to call from a handler OR directly from a consumer-owned receiver."""
+    """Grant the configured signup credit for the user's tier, idempotently.
+
+    Resolution order (per ticket 20260516_paid_plan_balance_model_gap, D5):
+      1. If `tier_registry` is provided AND the tier has a `credit_grant`
+         with trigger=signup configured, use THAT (the new schema).
+      2. Otherwise, fall back to the legacy `initial_credits[tier_id]`
+         dict (the pre-schema shape).
+
+    This makes the handler back-compat across the rollout:
+      - Pre-Phase-1 callers passing only `initial_credits` keep working.
+      - Post-Phase-1 callers passing `tier_registry` honor the new
+        TierConfig.credit_grant policy (including destination + lifecycle).
+
+    The `initial_credits` dict path always lands credit in `credit_balance`
+    (legacy behavior, preserves the existing free-tier signup grant). The
+    `tier_registry` path uses whatever `destination` the tier declares —
+    typically `credit_balance` for signup grants, but consumers may
+    declare otherwise.
+
+    Safe to call from a handler OR directly from a consumer-owned receiver.
+    """
     try:
         tier_id = await tier_provider.get_tier(org_id)
     except Exception as e:
@@ -371,7 +391,27 @@ async def grant_initial_credit_for_user(
                        user_id, org_id, e)
         return
 
-    amount = initial_credits.get(tier_id)
+    # New path: read tier.credit_grant if available + applicable.
+    tier_grant = None
+    if tier_registry is not None:
+        tier = tier_registry.get(tier_id)
+        if tier is not None:
+            grant = getattr(tier, "credit_grant", None)
+            if grant is not None:
+                trigger_val = getattr(grant.trigger, "value", grant.trigger)
+                if trigger_val == "signup":
+                    tier_grant = grant
+
+    if tier_grant is not None:
+        amount = float(tier_grant.amount_per_period)
+        destination = getattr(tier_grant.destination, "value", tier_grant.destination)
+    else:
+        # Legacy path: dict lookup, always credit_balance.
+        amount = initial_credits.get(tier_id)
+        if not amount:
+            return
+        destination = "credit_balance"
+
     if not amount:
         return
 
@@ -383,22 +423,53 @@ async def grant_initial_credit_for_user(
         pass  # rely on billing's own idempotency if redis check fails
 
     idempotency_key = f"user:{user_id}:initial_credit:{tier_id}"
+
+    # Choose the billing-service endpoint based on destination. The legacy
+    # `/promotional-credit` endpoint always writes to credit_balance; the
+    # new `/apply-credit-grant` endpoint honors the destination + lifecycle.
+    if tier_grant is None:
+        # Legacy path: existing /promotional-credit endpoint.
+        url = f"{billing_url.rstrip('/')}/billing/{org_id}/promotional-credit"
+        body = {
+            "amount": amount,
+            "reason": f"initial_credit_{tier_id}",
+            "idempotency_key": idempotency_key,
+        }
+    else:
+        # New path: route through /apply-credit-grant with the declared
+        # destination + lifecycle. For signup grants the typical lifecycle
+        # is `persistent` (one-shot, never expires); the validator on
+        # TierConfig.credit_grant prevents misconfiguration.
+        url = f"{billing_url.rstrip('/')}/billing/{org_id}/apply-credit-grant"
+        lifecycle_val = getattr(tier_grant.lifecycle, "value", tier_grant.lifecycle)
+        body = {
+            "amount": amount,
+            "destination": destination,
+            "lifecycle": lifecycle_val,
+            "idempotency_key": idempotency_key,
+            "reason": f"signup_grant_{tier_id}",
+        }
+        if lifecycle_val == "rollover_capped" and tier_grant.rollover_max_periods is not None:
+            body["rollover_max"] = float(
+                tier_grant.rollover_max_periods * tier_grant.amount_per_period
+            )
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
-                f"{billing_url.rstrip('/')}/billing/{org_id}/promotional-credit",
+                url,
                 headers={"X-API-Key": billing_api_key, "Content-Type": "application/json"},
-                json={"amount": amount,
-                      "reason": f"initial_credit_{tier_id}",
-                      "idempotency_key": idempotency_key},
+                json=body,
             )
             if resp.status_code in (200, 400):
                 try:
                     await redis.set(flag_key, "1", ex=86400 * 30)
                 except Exception:
                     pass
-                logger.info("credit granted user=%s org=%s tier=%s amount=%s",
-                            user_id, org_id, tier_id, amount)
+                logger.info(
+                    "credit granted user=%s org=%s tier=%s amount=%s destination=%s",
+                    user_id, org_id, tier_id, amount, destination,
+                )
             else:
                 logger.warning("credit grant unexpected status=%s body=%s",
                                resp.status_code, resp.text[:200])
@@ -494,6 +565,10 @@ def _build_default_credit_grant_handler(
         else:
             org_id = event_org_id
 
+        # TODO(public-mesh-ga): Thread tier_registry through this default
+        # factory so signup grants can honor TierConfig.credit_grant instead
+        # of falling back to legacy initial_credits only. Backlink:
+        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
         await grant_initial_credit_for_user(
             user_id, org_id,
             initial_credits=initial_credits,

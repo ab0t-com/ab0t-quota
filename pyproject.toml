@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ab0t-quota"
-version = "0.2.9"
+version = "0.4.0"
 description = "Shared quota, rate-limit, and tier enforcement for ab0t platform services"
 requires-python = ">=3.11"
 license = {text = "Proprietary"}
@@ -20,11 +20,20 @@ Homepage = "https://ab0t.com"
 Repository = "https://github.com/ab0t-com/ab0t-quota"
 
 [project.optional-dependencies]
-billing = ["httpx>=0.24", "jinja2>=3.0"]
+# 'stripe' is required by the lib's /api/webhooks/stripe proxy for local
+# signature verification (T1 in ticket 20260516_auto_credit_invoice_paid_wiring).
+# Pinned to the same major as payment-service (==7.0.0) for cross-service
+# compatibility.
+#
+# 'structlog' is required because the billing module's call sites use
+# structlog-style kwargs (logger.info("event", key=value)). The previous
+# try/except fallback to stdlib logging raised TypeError on those kwargs;
+# making structlog a hard dep on the billing extra removes that footgun.
+billing = ["httpx>=0.24", "jinja2>=3.0", "stripe>=7,<8", "structlog>=23.1"]
 webhooks = ["httpx>=0.24"]
 dynamo = ["aioboto3>=12.0"]
-all = ["httpx>=0.24", "aioboto3>=12.0", "jinja2>=3.0"]
-dev = ["pytest", "pytest-asyncio", "fakeredis", "httpx"]
+all = ["httpx>=0.24", "aioboto3>=12.0", "jinja2>=3.0", "stripe>=7,<8", "structlog>=23.1"]
+dev = ["pytest", "pytest-asyncio", "fakeredis", "httpx", "stripe>=7,<8", "structlog>=23.1"]
 
 [tool.setuptools.packages.find]
 include = ["ab0t_quota*"]

@@ -155,6 +155,10 @@ class BridgeClient:
                 return resp.json().get("tier_id", "free")
         except httpx.RequestError as e:
             logger.warning("bridge_tier_fetch_network_error: %s", e)
+        # TODO(public-mesh-ga): Make bridge tier fallback configurable
+        # fail-open/fail-closed per consumer; hardcoded "free" can silently
+        # downgrade paid orgs during billing outages. Backlink:
+        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
         return "free"
 
     @staticmethod
@@ -168,6 +172,9 @@ class BridgeClient:
         except Exception:
             detail = resp.text or f"HTTP {resp.status_code}"
         logger.warning("bridge_%s_error status=%d detail=%s", op, resp.status_code, detail)
+        # TODO(public-mesh-ga): Replace hardcoded fail-open bridge behavior
+        # with explicit per-consumer outage policy and telemetry. Backlink:
+        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
         return {
             "decision": "allow",  # fail-open on bridge errors (configurable later)
             "current": 0,
@@ -180,6 +187,10 @@ class BridgeClient:
 
 def _network_error_result(resource_key: str, error: str) -> dict:
     """Shape of a check result when the network call itself failed."""
+    # TODO(public-mesh-ga): Use the same explicit outage policy as _parse();
+    # public mesh consumers need to opt into fail-open for billing gates.
+    # Backlink:
+    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
     return {
         "decision": "allow",  # fail-open by default
         "resource_key": resource_key,
@@ -248,7 +259,10 @@ class BridgeContext:
         # Acceptable for low-volume; revisit if a batch endpoint is added.
         # The list of resources is unknown without an extra round-trip — for
         # now this is a no-op; consumers should call increment() per resource.
-        # TODO: add batch_increment endpoint to the public API.
+        # TODO(public-mesh-ga): Add batch increment/decrement endpoints to
+        # the public mesh quota API before bridge mode is advertised as a
+        # full drop-in replacement for engine-local mode. Backlink:
+        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
         logger.warning("bridge increment_bundle is not yet supported — call increment per resource")
         return {}
 
@@ -256,6 +270,10 @@ class BridgeContext:
         self, org_id: str, bundle: str,
         user_id: Optional[str] = None, idempotency_key: Optional[str] = None,
     ) -> dict:
+        # TODO(public-mesh-ga): Keep this aligned with increment_bundle's
+        # eventual batch endpoint so bundle checks and mutations have
+        # equivalent semantics in bridge mode. Backlink:
+        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
         logger.warning("bridge decrement_bundle is not yet supported — call decrement per resource")
         return {}
 
@@ -266,5 +284,8 @@ class BridgeContext:
         # Bridge mode doesn't have a feature endpoint yet — derive from usage.
         u = await self._client.usage(org_id)
         # Features aren't included in usage response. Fall back to None.
-        # TODO: add /quota/{service}/{org}/feature/{name} endpoint.
+        # TODO(public-mesh-ga): Add /quota/{service}/{org}/feature/{name}
+        # to billing's public bridge API; returning False can hide paid
+        # features during bridge adoption. Backlink:
+        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
         return False

@@ -23,11 +23,24 @@ Each tier defines:
 - `features` — feature flags (gpu_access, sso, audit_logs)
 - `limits` — resource_key → numeric limit (null = unlimited)
 - `upgrade_url` — where to send denied users
+- `billing_model` — discriminator picking which money primitives the tier wires up (see below)
+- `price` *(optional)* — `{ amount_per_period, currency, period }` block; required for any paid tier
+- `credit_grant` *(optional)* — `{ trigger, amount_per_period, lifecycle, destination, reset_on_downgrade, rollover_max_periods }`; defines whether/how the tier grants credit
+- `initial_credit` *(back-compat alias)* — shorthand for `credit_grant` with `trigger=signup`, `lifecycle=persistent`, `destination=credit_balance`
 
 Limit values:
 - Integer/float: hard cap (e.g. `5` sandboxes)
 - `null`: unlimited
 - `0`: feature not available on this tier (triggers "not available" message)
+
+`billing_model` values:
+- `capacity_only` *(default)* — limits-only, no money side-effects
+- `consumption_only` — pay-as-you-go top-ups, no subscription
+- `subscription_with_credits` — paid subscription that grants credit each period (requires `price` + `credit_grant` with `trigger=subscription_invoice_paid`)
+- `subscription_unlock_only` — paid subscription that only raises limits, no credit
+- `subscription_with_overage` / `seat_based` / `metered` — schema-supported, implementation pending
+
+Full schema reference + worked archetype examples: see `BILLING_MODELS_GUIDE.md` in the ab0t-quota library root (or copy in `Skills/quota-paid-tier-onboarding/references/billing-models-guide.md`).
 
 ## Stripe-to-Tier Mapping
 

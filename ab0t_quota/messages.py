@@ -16,6 +16,9 @@ from .models.core import ResourceDef, TierConfig
 # Per-resource action hints (what the user can do RIGHT NOW)
 # ---------------------------------------------------------------------------
 
+# TODO(public-mesh-ga): Move resource action hints into consumer config so
+# public mesh companies do not inherit sandbox/auth-specific copy. Backlink:
+# /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
 ACTION_HINTS: dict[str, str] = {
     "sandbox.concurrent":       "Stop an existing sandbox to free up a slot.",
     "sandbox.monthly_cost":     "Wait until next month when your spending limit resets.",
@@ -32,6 +35,9 @@ ACTION_HINTS: dict[str, str] = {
 }
 
 # Next tier that unlocks more of a resource (for upgrade messaging)
+# TODO(public-mesh-ga): Replace the hardcoded free->starter->pro ladder
+# with per-consumer upgrade targets from quota-config/plans metadata. Backlink:
+# /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
 UPGRADE_TIER_MAP: dict[str, dict[str, str]] = {
     "free": {
         "sandbox.gpu_instances":    "Starter",

@@ -26,6 +26,85 @@ redis>=5.0
 git+https://github.com/ab0t-com/ab0t-quota.git
 ```
 
+## Step 1b: Declare billing model in quota-config.json
+
+If your service charges for anything, each tier in `quota-config.json` needs a `billing_model` plus optional `price` and `credit_grant` blocks. The library reads these and the ecosystem (payment-service webhooks + billing-service) handles the wiring — you don't call any credit-grant endpoints yourself.
+
+Illustrative shape (prices and limits are placeholders — set yours):
+
+```json
+{
+  "tiers": [
+    {
+      "tier_id": "free",
+      "display_name": "Free",
+      "sort_order": 0,
+      "billing_model": "consumption_only",
+      "initial_credit": 10.00,
+      "limits": { "widgets.concurrent": 1, "widgets.monthly_cost": 10.00 }
+    },
+    {
+      "tier_id": "starter",
+      "display_name": "Starter",
+      "sort_order": 1,
+      "billing_model": "subscription_with_credits",
+      "price": { "amount_per_period": 10.00, "currency": "USD", "period": "month" },
+      "credit_grant": {
+        "trigger": "subscription_invoice_paid",
+        "amount_per_period": 10.00,
+        "currency": "USD",
+        "lifecycle": "use_it_or_lose_it",
+        "destination": "subscription_credit",
+        "reset_on_downgrade": true,
+        "reset_on_upgrade": false
+      },
+      "limits": { "widgets.concurrent": 5, "widgets.monthly_cost": 100.00 }
+    },
+    {
+      "tier_id": "enterprise",
+      "display_name": "Enterprise",
+      "sort_order": 3,
+      "billing_model": "subscription_with_credits",
+      "price": { "amount_per_period": 200.00, "currency": "USD", "period": "month" },
+      "credit_grant": {
+        "trigger": "subscription_invoice_paid",
+        "amount_per_period": 200.00,
+        "currency": "USD",
+        "lifecycle": "rollover_capped",
+        "rollover_max_periods": 3,
+        "destination": "subscription_credit",
+        "reset_on_downgrade": true,
+        "reset_on_upgrade": false
+      },
+      "limits": { "widgets.concurrent": null, "widgets.monthly_cost": null }
+    }
+  ]
+}
+```
+
+Money literals are JSON numbers, not strings. The `currency` field appears in BOTH `price` and `credit_grant` (a mismatch between them is a config error). `reset_on_upgrade: false` is the typical pairing with `reset_on_downgrade: true` — you don't want an upgrade to wipe what the user just got.
+
+Pick one `billing_model` per tier:
+
+| Value | Use for |
+|---|---|
+| `capacity_only` *(default)* | Limits-only tier with no money side-effects |
+| `consumption_only` | Pay-as-you-go top-ups (no subscription). Combine with `initial_credit` to grant a starting balance — that's how sandbox-platform's free tier gives every user $10 to try things |
+| `subscription_with_credits` | Paid sub that grants $Y of bundled spend each period (the dominant paid-tier model in sandbox-platform) |
+| `subscription_unlock_only` | Paid sub that only raises limits — no credit grant. Use when the value of the tier is purely capacity, not bundled spend |
+
+Lifecycle choices on `credit_grant`:
+- `persistent` — adds amount, never expires (signup grants)
+- `use_it_or_lose_it` — sets to amount each period, leftover forfeit (most consumer SaaS)
+- `rollover_unlimited` / `rollover_capped` — carry forward
+
+Once these are declared, no further code is needed for credit handling:
+- **Signup grants** — `auth_events.grant_initial_credit_for_user(tier_registry=...)` reads the tier with `trigger: "signup"` and applies the grant
+- **Subscription grants** — payment-service's `invoice.paid` webhook reads the tier and applies the period grant
+- **Downgrade reset** — payment-service's `subscription.updated` webhook resets `subscription_credit` if the old tier had `reset_on_downgrade: true`
+
+Full cookbook with all 11 billing archetypes + worked examples: `BILLING_MODELS_GUIDE.md` in the ab0t-quota library root (also at `Skills/quota-paid-tier-onboarding/references/billing-models-guide.md`).
+
 ## Step 2: Create quota.py Module
 
 Create `app/quota.py` as the single integration point. See [references/quota-module-template.md](references/quota-module-template.md) for the full template.

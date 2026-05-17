@@ -8,8 +8,9 @@ quota state is tracked.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field, model_validator
 
@@ -189,6 +190,153 @@ class TierLimits(BaseModel):
         return self.limit is None
 
 
+# ---------------------------------------------------------------------------
+# Billing relationship — schema (decided in ticket
+# 20260516_paid_plan_balance_model_gap, context_03)
+#
+# The library defines the SCHEMA and library-wide DEFAULTS. Consumers
+# declare per-tier policy in their own quota-config.json. The library
+# never hardcodes a dollar amount, tier name, or consumer-specific rule.
+# ---------------------------------------------------------------------------
+
+class BillingModel(str, Enum):
+    """How a tier relates to money. Default is `capacity_only` — safest
+    possible: quota enforcement, no money side-effects from the
+    subscription itself. Consumers opt into money flows by declaring a
+    non-default `billing_model`.
+    """
+    CAPACITY_ONLY = "capacity_only"
+    CONSUMPTION_ONLY = "consumption_only"
+    SUBSCRIPTION_WITH_CREDITS = "subscription_with_credits"
+    SUBSCRIPTION_UNLOCK_ONLY = "subscription_unlock_only"
+    # TODO(public-mesh-ga): These advanced models are schema-advertised but
+    # runtime-incomplete; gate them behind explicit validation/docs before
+    # public consumers depend on them. Backlink:
+    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+    SUBSCRIPTION_WITH_OVERAGE = "subscription_with_overage"
+    SEAT_BASED = "seat_based"
+    METERED = "metered"
+
+
+class CreditTrigger(str, Enum):
+    """When a `credit_grant` fires."""
+    SIGNUP = "signup"
+    SUBSCRIPTION_INVOICE_PAID = "subscription_invoice_paid"
+    SCHEDULED_PERIOD_START = "scheduled_period_start"
+    MANUAL = "manual"
+    WEBHOOK_ADMIN = "webhook_admin"
+
+
+class CreditLifecycle(str, Enum):
+    """What happens to a credit_grant at the next period boundary."""
+    PERSISTENT = "persistent"
+    USE_IT_OR_LOSE_IT = "use_it_or_lose_it"
+    ROLLOVER_UNLIMITED = "rollover_unlimited"
+    ROLLOVER_CAPPED = "rollover_capped"
+
+
+class CreditDestination(str, Enum):
+    """Which ledger field receives the grant."""
+    BALANCE = "balance"
+    CREDIT_BALANCE = "credit_balance"
+    SUBSCRIPTION_CREDIT = "subscription_credit"
+
+
+class BillingPeriod(str, Enum):
+    """Period over which a price or grant is denominated."""
+    MONTH = "month"
+    YEAR = "year"
+
+
+class Price(BaseModel):
+    """Recurring price for a paid tier. Library-agnostic to provider —
+    consumer wires this to Stripe (or any other PSP) themselves.
+    """
+    amount_per_period: Decimal = Field(
+        ...,
+        gt=Decimal("0"),
+        description="Amount charged per period (in `currency`). Must be > 0.",
+    )
+    currency: str = Field(
+        default="USD",
+        pattern=r"^[A-Z]{3}$",
+        description="ISO-4217 currency code.",
+    )
+    period: BillingPeriod = Field(
+        default=BillingPeriod.MONTH,
+        description="Billing period.",
+    )
+
+
+class CreditGrant(BaseModel):
+    """Per-tier declaration of when and how credit is granted to an org.
+
+    Fields with library-level defaults track context_03 decisions D2 + D3.
+    Consumers override per-tier; library never declares an amount.
+    """
+    trigger: CreditTrigger = Field(
+        ...,
+        description="When the grant fires. The library's webhook/event "
+                    "handlers for each trigger value carry the grant out.",
+    )
+    amount_per_period: Decimal = Field(
+        ...,
+        gt=Decimal("0"),
+        description="Money granted on each trigger fire. Consumer-declared; "
+                    "library never hardcodes amounts.",
+    )
+    currency: str = Field(
+        default="USD",
+        pattern=r"^[A-Z]{3}$",
+    )
+    # D2 — library default. Matches consumer-SaaS norm (OpenAI/Vercel/
+    # Cloudflare). Consumers can override per-tier.
+    lifecycle: CreditLifecycle = Field(
+        default=CreditLifecycle.USE_IT_OR_LOSE_IT,
+        description="What happens to unused balance at each new grant. "
+                    "Library default is USE_IT_OR_LOSE_IT (consumer-SaaS norm).",
+    )
+    rollover_max_periods: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Cap for ROLLOVER_CAPPED lifecycle: max periods' worth of "
+                    "credit allowed to accumulate. Required only when "
+                    "lifecycle == ROLLOVER_CAPPED.",
+    )
+    destination: CreditDestination = Field(
+        default=CreditDestination.SUBSCRIPTION_CREDIT,
+        description="Which ledger field receives the grant. SIGNUP-style "
+                    "grants typically use CREDIT_BALANCE; subscription "
+                    "grants typically use SUBSCRIPTION_CREDIT.",
+    )
+    reset_on_downgrade: bool = Field(
+        default=True,
+        description="When org moves to a strictly-lower tier, zero this "
+                    "grant's destination field. Default true (downgrade is "
+                    "voluntary, less surprising).",
+    )
+    # D3 — library default false. Tier upgrades preserve existing
+    # subscription_credit; the next invoice adds on top.
+    reset_on_upgrade: bool = Field(
+        default=False,
+        description="When org moves to a higher tier, zero this grant's "
+                    "destination field. Default false (avoid surprise wipes "
+                    "during voluntary upgrades).",
+    )
+
+    @model_validator(mode="after")
+    def _validate_rollover_cap(self) -> "CreditGrant":
+        if self.lifecycle == CreditLifecycle.ROLLOVER_CAPPED and self.rollover_max_periods is None:
+            raise ValueError(
+                "rollover_max_periods is required when lifecycle == 'rollover_capped'"
+            )
+        if self.lifecycle != CreditLifecycle.ROLLOVER_CAPPED and self.rollover_max_periods is not None:
+            raise ValueError(
+                "rollover_max_periods only applies to lifecycle == 'rollover_capped'"
+            )
+        return self
+
+
 class TierConfig(BaseModel):
     """A named tier with limits for every resource it governs.
 
@@ -233,6 +381,52 @@ class TierConfig(BaseModel):
                     "None disables the default.",
     )
 
+    # -----------------------------------------------------------------------
+    # Billing-relationship fields (see context_03_billing_model_decision.md
+    # in ticket 20260516_paid_plan_balance_model_gap)
+    #
+    # D1: schema is the same shape for every consumer; choices are made by
+    #     declarative per-tier config in the consumer's quota-config.json.
+    # D5: library DEFINES schema + defaults; library NEVER hardcodes a
+    #     consumer-specific amount or policy.
+    # -----------------------------------------------------------------------
+
+    billing_model: BillingModel = Field(
+        default=BillingModel.CAPACITY_ONLY,
+        description="How this tier relates to money. Default CAPACITY_ONLY: "
+                    "limits only, no money side-effects from the tier itself. "
+                    "Consumers opt into money flows by setting this to a "
+                    "non-default value AND configuring the matching fields "
+                    "(price, credit_grant).",
+    )
+    price: Optional[Price] = Field(
+        default=None,
+        description="Recurring price for the tier. Required for paid "
+                    "subscription billing models; absent for free / "
+                    "consumption-only / capacity-only.",
+    )
+    credit_grant: Optional[CreditGrant] = Field(
+        default=None,
+        description="Per-tier credit-grant policy. When set, the library "
+                    "fires the configured trigger and writes the configured "
+                    "amount/destination. When unset (default), no automatic "
+                    "credit grants happen for this tier.",
+    )
+
+    # Back-compat alias for the legacy `initial_credit: <float>` shape on
+    # free-tier configs. If `credit_grant` is unset and `initial_credit` is
+    # set, the validator below synthesizes a CreditGrant from it.
+    #
+    # New configs should use `credit_grant` directly; this field exists
+    # purely to avoid breaking existing consumer quota-config.json files.
+    initial_credit: Optional[Decimal] = Field(
+        default=None,
+        gt=Decimal("0"),
+        description="DEPRECATED back-compat shim. Use `credit_grant` instead. "
+                    "When present without `credit_grant`, synthesizes a "
+                    "signup-trigger persistent grant to credit_balance.",
+    )
+
     def get_limit(self, resource_key: str) -> TierLimits:
         """Get limits for a resource, defaulting to unlimited if not defined."""
         return self.limits.get(resource_key, TierLimits())
@@ -254,6 +448,94 @@ class TierConfig(BaseModel):
         derived = math.ceil(tl.limit * self.default_per_user_fraction)
         # Never derive a per-user cap below 1 — would block all users
         return max(1.0, float(derived))
+
+    # -----------------------------------------------------------------------
+    # Cross-field validation for billing-relationship config.
+    # Runs AFTER individual fields are validated. A misconfigured tier
+    # fails LOAD time, not first-spend time.
+    # -----------------------------------------------------------------------
+    @model_validator(mode="after")
+    def _validate_billing_config(self) -> "TierConfig":
+        # Back-compat: synthesize a CreditGrant from the legacy
+        # `initial_credit: <float>` shape on free-tier configs.
+        # New configs should declare `credit_grant` directly.
+        if self.initial_credit is not None and self.credit_grant is None:
+            self.credit_grant = CreditGrant(
+                trigger=CreditTrigger.SIGNUP,
+                amount_per_period=self.initial_credit,
+                currency="USD",
+                lifecycle=CreditLifecycle.PERSISTENT,
+                destination=CreditDestination.CREDIT_BALANCE,
+                reset_on_downgrade=False,
+                reset_on_upgrade=False,
+            )
+
+        # If both are set, the explicit credit_grant wins (back-compat
+        # alias is only a default for the unset case). The `initial_credit`
+        # value is kept on the model for audit but the synthesized grant
+        # is not re-derived — explicit always wins over implicit.
+
+        bm = self.billing_model
+
+        # subscription_with_credits — must declare a credit_grant whose
+        # trigger is invoice-paid; price is required so we know what the
+        # subscription costs (even if credit amount differs from price).
+        if bm == BillingModel.SUBSCRIPTION_WITH_CREDITS:
+            if self.price is None:
+                raise ValueError(
+                    f"tier '{self.tier_id}': billing_model 'subscription_with_credits' "
+                    f"requires `price`"
+                )
+            if self.credit_grant is None:
+                raise ValueError(
+                    f"tier '{self.tier_id}': billing_model 'subscription_with_credits' "
+                    f"requires `credit_grant`"
+                )
+            if self.credit_grant.trigger != CreditTrigger.SUBSCRIPTION_INVOICE_PAID:
+                raise ValueError(
+                    f"tier '{self.tier_id}': billing_model 'subscription_with_credits' "
+                    f"requires credit_grant.trigger == 'subscription_invoice_paid'"
+                )
+
+        # subscription_unlock_only — paid tier with no auto-credit. Price
+        # required; credit_grant must be absent (otherwise consumer should
+        # use subscription_with_credits).
+        elif bm == BillingModel.SUBSCRIPTION_UNLOCK_ONLY:
+            if self.price is None:
+                raise ValueError(
+                    f"tier '{self.tier_id}': billing_model 'subscription_unlock_only' "
+                    f"requires `price`"
+                )
+            if self.credit_grant is not None:
+                raise ValueError(
+                    f"tier '{self.tier_id}': billing_model 'subscription_unlock_only' "
+                    f"must NOT have `credit_grant` — use 'subscription_with_credits' instead"
+                )
+
+        # consumption_only — no recurring subscription concept, so no
+        # `price` (would be misleading). May still have a signup credit
+        # grant (degenerate "free tier with initial credit" case).
+        elif bm == BillingModel.CONSUMPTION_ONLY:
+            if self.price is not None:
+                raise ValueError(
+                    f"tier '{self.tier_id}': billing_model 'consumption_only' "
+                    f"must NOT have `price` — use 'subscription_unlock_only' "
+                    f"or 'subscription_with_credits' for paid tiers"
+                )
+            if (self.credit_grant is not None
+                    and self.credit_grant.trigger == CreditTrigger.SUBSCRIPTION_INVOICE_PAID):
+                raise ValueError(
+                    f"tier '{self.tier_id}': billing_model 'consumption_only' "
+                    f"cannot use trigger 'subscription_invoice_paid' "
+                    f"(no subscription invoices to trigger on)"
+                )
+
+        # capacity_only — pure quota tier. May have a price (e.g. paid
+        # tier that just unlocks limits) OR be free. credit_grant on a
+        # capacity_only tier is unusual but not forbidden — could be a
+        # signup grant on a free capacity-only tier.
+
+        return self
 
 
 # ---------------------------------------------------------------------------

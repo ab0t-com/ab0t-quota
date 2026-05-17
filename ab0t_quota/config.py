@@ -128,16 +128,31 @@ def load_tiers(config: Optional[dict] = None) -> dict[str, TierConfig]:
             elif isinstance(limit_data, dict):
                 limits[key] = TierLimits(**limit_data)
 
-        tiers[tier_data["tier_id"]] = TierConfig(
-            tier_id=tier_data["tier_id"],
-            display_name=tier_data.get("display_name", tier_data["tier_id"].title()),
-            description=tier_data.get("description"),
-            sort_order=tier_data.get("sort_order", 0),
-            limits=limits,
-            features=set(tier_data.get("features", [])),
-            upgrade_url=tier_data.get("upgrade_url"),
-            default_per_user_fraction=tier_data.get("default_per_user_fraction"),
-        )
+        # Billing-relationship fields (billing_model, price, credit_grant,
+        # initial_credit) are passed through to TierConfig. Pydantic validators
+        # on the model handle:
+        #   - default billing_model=capacity_only when unset
+        #   - synthesizing a CreditGrant from legacy initial_credit (back-compat)
+        #   - cross-field validation (e.g. subscription_with_credits requires price)
+        # See models/core.py::TierConfig::_validate_billing_config.
+        # Ticket: 20260516_auto_credit_invoice_paid_wiring (T0a)
+        tier_kwargs = {
+            "tier_id": tier_data["tier_id"],
+            "display_name": tier_data.get("display_name", tier_data["tier_id"].title()),
+            "description": tier_data.get("description"),
+            "sort_order": tier_data.get("sort_order", 0),
+            "limits": limits,
+            "features": set(tier_data.get("features", [])),
+            "upgrade_url": tier_data.get("upgrade_url"),
+            "default_per_user_fraction": tier_data.get("default_per_user_fraction"),
+        }
+        # Pass billing fields through only if declared in the config; lets
+        # Pydantic apply its own defaults (capacity_only / None) otherwise.
+        for billing_field in ("billing_model", "price", "credit_grant", "initial_credit"):
+            if billing_field in tier_data:
+                tier_kwargs[billing_field] = tier_data[billing_field]
+
+        tiers[tier_data["tier_id"]] = TierConfig(**tier_kwargs)
 
     logger.info("Loaded %d tiers from config", len(tiers))
     return tiers

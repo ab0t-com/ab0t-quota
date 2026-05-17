@@ -83,6 +83,10 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="ab0t_quota", description="ab0t-quota CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    # TODO(public-mesh-ga): Add a provider-neutral sync-plans command that
+    # reads quota-config.json plans/prices and publishes plan metadata/tier
+    # mappings, replacing consumer-specific shell seed scripts. Backlink:
+    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
     s = sub.add_parser("subscribe-events", help="register webhook subscription against auth")
     s.add_argument("--auth-url", help="defaults to $AB0T_AUTH_AUTH_URL")
     s.add_argument("--endpoint", required=True, help="public webhook URL on the consumer service")
