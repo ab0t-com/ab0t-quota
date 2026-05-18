@@ -236,7 +236,8 @@ In the Stripe dashboard:
   - `customer.subscription.created`
   - `customer.subscription.updated`
   - `customer.subscription.deleted`
-  - `invoice.payment_succeeded`
+  - `invoice.paid`
+  - `invoice.payment_succeeded` (older Stripe API versions; safe to also enable — lib accepts both)
   - `invoice.payment_failed`
 - Copy the signing secret → set `STRIPE_WEBHOOK_SECRET` in payment service env
 

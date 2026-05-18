@@ -590,17 +590,23 @@ class TestStripeWebhookProxyInvoicePaidDispatch:
         return f"t={ts},v1={sig}"
 
     def _invoice_paid_event(self, *, org_id="org-test", plan_id="plan-starter",
-                            invoice_id="in_test_t2"):
-        """Build a Stripe-shape invoice.payment_succeeded event payload.
+                            invoice_id="in_test_t2",
+                            event_type="invoice.payment_succeeded"):
+        """Build a Stripe-shape paid-invoice event payload.
 
         Mirrors what Stripe sends after Phase 2.1's subscription_data.metadata
         propagation lands org_id + plan_id on invoice.metadata.
+
+        event_type defaults to "invoice.payment_succeeded" for back-compat with
+        existing tests. Pass "invoice.paid" to simulate the newer Stripe API
+        version event for the same business outcome (X2, ticket
+        20260518_post_upgrade_credit_and_ux_propagation).
         """
         import json as _json
         return _json.dumps({
             "id": f"evt_{invoice_id}",
             "object": "event",
-            "type": "invoice.payment_succeeded",
+            "type": event_type,
             "data": {
                 "object": {
                     "id": invoice_id,
@@ -729,6 +735,125 @@ class TestStripeWebhookProxyInvoicePaidDispatch:
         assert call["source_tier"] == "starter"
         # Idempotency key follows the documented contract
         assert call["idempotency_key"] == "invoice:in_test_t2:credit_grant"
+
+    # ------------------------------------------------------------------
+    # X2 — both invoice.payment_succeeded AND invoice.paid must dispatch.
+    # Ticket: 20260518_post_upgrade_credit_and_ux_propagation.
+    #
+    # Stripe emits both event types for the same business outcome (an
+    # invoice was paid in full). The lib MUST accept both — older Stripe
+    # API versions emit invoice.payment_succeeded; newer versions emit
+    # invoice.paid; some accounts emit both. The idempotency key is
+    # invoice-id-based so billing-service dedupes regardless of how many
+    # event types arrive for one invoice.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("event_type", [
+        "invoice.payment_succeeded",
+        "invoice.paid",
+    ])
+    def test_dispatch_fires_for_both_paid_invoice_event_types(
+        self, event_type, webhook_secret, monkeypatch
+    ):
+        """X2 — both invoice.payment_succeeded and invoice.paid trigger
+        the subscription_credit grant. Regression guard: a refactor that
+        narrows the match condition (e.g. drops one event type) breaks
+        the credit-grant path silently in production. This test fails
+        loudly the moment that happens.
+        """
+        registry = {"starter": self._starter_tier_with_grant()}
+        client, captured = self._build_app(
+            monkeypatch, webhook_secret,
+            tier_registry=registry,
+            apply_grant_response={"new_balance": "29.00", "applied": True},
+        )
+        payload = self._invoice_paid_event(event_type=event_type)
+        r = client.post(
+            "/api/webhooks/stripe",
+            content=payload,
+            headers={"Stripe-Signature": self._sign(payload, webhook_secret)},
+        )
+        assert r.status_code == 200, r.text
+        assert len(captured["apply_credit_grant_calls"]) == 1, (
+            f"Expected exactly one grant call for {event_type}; "
+            f"got {len(captured['apply_credit_grant_calls'])}. "
+            f"If zero: dispatch match condition was narrowed."
+        )
+        call = captured["apply_credit_grant_calls"][0]
+        # Routing must be identical regardless of event type
+        assert call["org_id"] == "org-test"
+        assert call["destination"] == "subscription_credit"
+        assert call["lifecycle"] == "use_it_or_lose_it"
+        assert call["source"] == "in_test_t2"
+        assert call["source_tier"] == "starter"
+        # Idempotency key is invoice-id-based, NOT event-type-based.
+        # This is the dedup contract that makes both events safe to receive.
+        assert call["idempotency_key"] == "invoice:in_test_t2:credit_grant"
+
+    def test_idempotency_key_stable_across_event_types_for_same_invoice(
+        self, webhook_secret, monkeypatch
+    ):
+        """X2 — security/payments invariant: if Stripe emits BOTH event
+        types for the same paid invoice (some accounts do), the lib calls
+        billing-service twice with the SAME idempotency key. Billing-
+        service's existing dedup-by-idempotency-key behavior then ensures
+        only one actual grant lands. This test validates the lib half of
+        that contract; billing-service has its own dedup tests.
+        """
+        registry = {"starter": self._starter_tier_with_grant()}
+        client, captured = self._build_app(
+            monkeypatch, webhook_secret,
+            tier_registry=registry,
+            apply_grant_response={"new_balance": "29.00", "applied": True},
+        )
+
+        # POST both event types for the SAME invoice
+        for et in ("invoice.payment_succeeded", "invoice.paid"):
+            payload = self._invoice_paid_event(event_type=et)
+            r = client.post(
+                "/api/webhooks/stripe",
+                content=payload,
+                headers={"Stripe-Signature": self._sign(payload, webhook_secret)},
+            )
+            assert r.status_code == 200, r.text
+
+        # Lib called billing exactly twice (no internal dedup at lib layer)
+        assert len(captured["apply_credit_grant_calls"]) == 2
+        # Both calls used the same idempotency_key — the dedup contract
+        # billing-service relies on to deduplicate
+        keys = [c["idempotency_key"] for c in captured["apply_credit_grant_calls"]]
+        assert keys[0] == keys[1] == "invoice:in_test_t2:credit_grant", (
+            f"Idempotency keys diverged across event types: {keys}. "
+            f"This breaks billing-service dedup; same invoice would be "
+            f"credited twice in production."
+        )
+
+    def test_invoice_paid_with_invalid_signature_still_rejected(
+        self, webhook_secret, monkeypatch
+    ):
+        """Security: adding invoice.paid to the dispatch match MUST NOT
+        weaken signature verification. A bad signature on an invoice.paid
+        event must still be rejected at the route's verifier (router.py
+        :703-710) BEFORE dispatch logic runs. No auth-bypass via newer
+        event type.
+        """
+        registry = {"starter": self._starter_tier_with_grant()}
+        client, captured = self._build_app(
+            monkeypatch, webhook_secret,
+            tier_registry=registry,
+            apply_grant_response={"should_not_be_called": True},
+        )
+        payload = self._invoice_paid_event(event_type="invoice.paid")
+        # Deliberately-bad signature
+        r = client.post(
+            "/api/webhooks/stripe",
+            content=payload,
+            headers={"Stripe-Signature": "t=0,v1=deadbeef"},
+        )
+        assert r.status_code == 400, r.text
+        assert "signature" in r.json()["detail"].lower()
+        # Dispatch did NOT run — billing was never called
+        assert len(captured["apply_credit_grant_calls"]) == 0
 
     def test_skipped_no_grant_when_tier_is_capacity_only(self, webhook_secret, monkeypatch):
         """A capacity_only tier (no credit_grant) → handler returns

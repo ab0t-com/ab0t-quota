@@ -135,6 +135,109 @@ class TestCrossFieldValidation:
             )
 
 
+class TestExperimentalBillingModelGate:
+    """Experimental billing models (overage / seat_based / metered) must
+    fail load by default. Opt in via env var; loud WARNING on use.
+
+    Rationale: enum advertises them for schema forward-compat, but no
+    runtime path exists. A silent no-op tier would break the drop-in
+    promise ("declared config actually does something").
+    """
+
+    EXPERIMENTAL = [
+        BillingModel.SUBSCRIPTION_WITH_OVERAGE,
+        BillingModel.SEAT_BASED,
+        BillingModel.METERED,
+    ]
+
+    @pytest.mark.parametrize("bm", EXPERIMENTAL)
+    def test_experimental_rejected_without_opt_in(self, bm, monkeypatch):
+        monkeypatch.delenv(
+            "AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS", raising=False
+        )
+        with pytest.raises(Exception, match="experimental"):
+            TierConfig(
+                tier_id="x", display_name="X",
+                billing_model=bm,
+                price=Price(amount_per_period=Decimal("10")),
+            )
+
+    @pytest.mark.parametrize("bm", EXPERIMENTAL)
+    def test_experimental_accepted_with_opt_in(self, bm, monkeypatch):
+        monkeypatch.setenv(
+            "AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS", "true"
+        )
+        # Should not raise.
+        t = TierConfig(
+            tier_id="x", display_name="X",
+            billing_model=bm,
+            price=Price(amount_per_period=Decimal("10")),
+        )
+        assert t.billing_model == bm
+
+    @pytest.mark.parametrize(
+        "flag_val,should_allow",
+        [
+            ("true", True), ("True", True), ("TRUE", True),
+            ("1", True), ("yes", True), ("on", True),
+            ("false", False), ("0", False), ("no", False),
+            ("", False), ("anything-else", False),
+        ],
+    )
+    def test_opt_in_flag_parsing(self, flag_val, should_allow, monkeypatch):
+        monkeypatch.setenv(
+            "AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS", flag_val
+        )
+        if should_allow:
+            TierConfig(
+                tier_id="x", display_name="X",
+                billing_model=BillingModel.METERED,
+                price=Price(amount_per_period=Decimal("1")),
+            )
+        else:
+            with pytest.raises(Exception, match="experimental"):
+                TierConfig(
+                    tier_id="x", display_name="X",
+                    billing_model=BillingModel.METERED,
+                    price=Price(amount_per_period=Decimal("1")),
+                )
+
+    def test_supported_models_unaffected(self, monkeypatch):
+        """Non-experimental models load regardless of flag state."""
+        monkeypatch.delenv(
+            "AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS", raising=False
+        )
+        # capacity_only (default) — always loads
+        TierConfig(tier_id="free", display_name="Free")
+        # subscription_unlock_only with price — always loads
+        TierConfig(
+            tier_id="pro", display_name="Pro",
+            billing_model=BillingModel.SUBSCRIPTION_UNLOCK_ONLY,
+            price=Price(amount_per_period=Decimal("20")),
+        )
+        # consumption_only — always loads
+        TierConfig(
+            tier_id="payg", display_name="PAYG",
+            billing_model=BillingModel.CONSUMPTION_ONLY,
+        )
+
+    def test_error_lists_supported_alternatives(self, monkeypatch):
+        """Error message must guide the consumer to a supported choice."""
+        monkeypatch.delenv(
+            "AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS", raising=False
+        )
+        with pytest.raises(Exception) as exc:
+            TierConfig(
+                tier_id="x", display_name="X",
+                billing_model=BillingModel.SEAT_BASED,
+                price=Price(amount_per_period=Decimal("10")),
+            )
+        msg = str(exc.value)
+        assert "AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS" in msg
+        assert "capacity_only" in msg
+        assert "subscription_with_credits" in msg
+
+
 class TestCreditGrantValidators:
     def test_rollover_capped_requires_max(self):
         with pytest.raises(Exception, match="rollover_max_periods is required"):

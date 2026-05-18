@@ -120,8 +120,10 @@ def create_billing_router(
         prefix: URL prefix for all routes (default: /api)
         tier_registry: Loaded TierConfig dict keyed by tier_id, passed in from
             setup_quota's load_tiers() result. Required for the Stripe webhook
-            proxy's invoice.payment_succeeded dispatch (T2/T3 in ticket
-            20260516_auto_credit_invoice_paid_wiring) — without it, the
+            proxy's paid-invoice dispatch (T2/T3 in ticket
+            20260516_auto_credit_invoice_paid_wiring; dispatches both
+            `invoice.paid` and `invoice.payment_succeeded` per ticket
+            20260518_post_upgrade_credit_and_ux_propagation) — without it, the
             dispatch handlers can't read the consumer's billing_model /
             credit_grant / lifecycle / destination policy. Logged as WARNING
             at startup if not provided; the Stripe dispatch then falls back
@@ -171,7 +173,7 @@ def create_billing_router(
             # TODO(public-mesh-ga): Keep display-name tier maps as legacy
             # fallback only; public consumers need stable plan/price IDs or
             # metadata mappings as the source of truth. Backlink:
-            # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+            # audit: 2026-05-16 public-mesh-ga readiness pass
             tier_map = {t["display_name"].lower(): t["tier_id"] for t in config.get("tiers", [])}
             bi = config.get("billing_integration") or {}
             explicit_plan_to_tier = dict(bi.get("plan_to_tier") or {})
@@ -186,14 +188,17 @@ def create_billing_router(
             logger.warning("Failed to load quota config for tier mapping: %s", e)
 
     # T0b — capture tier_registry from caller for the Stripe webhook proxy's
-    # invoice.payment_succeeded dispatch (T2/T3). Warn loudly at startup if
-    # missing so misconfiguration is visible immediately rather than at the
-    # first paid invoice. Ticket: 20260516_auto_credit_invoice_paid_wiring.
+    # paid-invoice dispatch (T2/T3; both invoice.paid and
+    # invoice.payment_succeeded). Warn loudly at startup if missing so
+    # misconfiguration is visible immediately rather than at the first
+    # paid invoice. Tickets: 20260516_auto_credit_invoice_paid_wiring,
+    # 20260518_post_upgrade_credit_and_ux_propagation.
     if tier_registry is None:
         logger.warning(
             "create_billing_router: tier_registry not provided. The Stripe "
-            "webhook proxy will mount, but invoice.payment_succeeded dispatch "
-            "(T2) cannot fire credit grants without the consumer's tier "
+            "webhook proxy will mount, but paid-invoice dispatch (T2; both "
+            "invoice.paid and invoice.payment_succeeded) cannot fire credit "
+            "grants without the consumer's tier "
             "policy. Pass tier_registry=load_tiers(config) from your "
             "setup_quota wiring."
         )
@@ -689,7 +694,7 @@ def create_billing_router(
         # TODO(public-mesh-ga): Support a comma-separated
         # AB0T_QUOTA_STRIPE_WEBHOOK_SECRETS list for endpoint-secret
         # rotation, mirroring payment-service cutover behavior. Backlink:
-        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+        # audit: 2026-05-16 public-mesh-ga readiness pass
         if not secret:
             logger.error(
                 "AB0T_QUOTA_STRIPE_WEBHOOK_SECRET unset (and STRIPE_WEBHOOK_SECRET "
@@ -716,8 +721,26 @@ def create_billing_router(
         # T3 dispatches customer.subscription.{updated,deleted}. All dispatch
         # runs on the verified event BEFORE the forward to payment-service.
 
-        # T2 — dispatch invoice.payment_succeeded to handle_subscription_invoice_paid.
-        # Ticket: 20260516_auto_credit_invoice_paid_wiring.
+        # T2 — dispatch paid-invoice events to handle_subscription_invoice_paid.
+        # Tickets: 20260516_auto_credit_invoice_paid_wiring (original wiring),
+        #          20260518_post_upgrade_credit_and_ux_propagation (X2 — added invoice.paid).
+        #
+        # Stripe emits TWO event types for the same business outcome:
+        #   - invoice.payment_succeeded: a payment attempt on an invoice succeeded
+        #                                (older API versions, payment-method-specific)
+        #   - invoice.paid:              the invoice transitioned to paid state
+        #                                (newer API versions; the documented modern event)
+        # Per Stripe docs (https://docs.stripe.com/api/events/types) both can fire
+        # for the same paid invoice depending on API version + endpoint config; some
+        # accounts get only one. We dispatch on both because the business event
+        # (an invoice was paid → grant the period's credit) is identical.
+        #
+        # Idempotency: the grant call uses `invoice:{invoice_id}:credit_grant` as
+        # the dedup key in billing-service. If a Stripe account emits BOTH event
+        # types for the same invoice, the second dispatch reaches billing,
+        # billing's idempotency check returns the cached result, and no double-
+        # credit occurs. The lib's returned status is "applied" in both cases
+        # (the lib does NOT distinguish first-write vs cached-return).
         #
         # The library helper takes consumer-supplied tier_registry +
         # plan_to_tier resolver (both in this closure from T0b/T0e) and
@@ -733,7 +756,7 @@ def create_billing_router(
         #                               permanent failure; surface for paging)
         event_type = event.get("type", "")
 
-        if event_type == "invoice.payment_succeeded":
+        if event_type in ("invoice.payment_succeeded", "invoice.paid"):
             from .subscription_credit import handle_subscription_invoice_paid
 
             # Adapter: the lib helper expects Callable[[str], Awaitable[Optional[str]]].
@@ -826,7 +849,7 @@ def create_billing_router(
                 # TODO(public-mesh-ga): Replace hardcoded cancellation target
                 # with the consumer catalog's configured default/free tier.
                 # Backlink:
-                # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+                # audit: 2026-05-16 public-mesh-ga readiness pass
                 new_tier_id = "free"  # mirror payment-service's _sync_subscription_tier
                 new_price_id = None
             else:
@@ -1132,7 +1155,7 @@ async def _resolve_id_to_tier(
                     # emit an operator error once plan metadata/config maps
                     # are standard; display names are not stable IDs.
                     # Backlink:
-                    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+                    # audit: 2026-05-16 public-mesh-ga readiness pass
                     logger.warning(
                         "resolve_id_to_tier identifier=%s resolved via plan display-name "
                         "fallback (Stripe price %s → plan %r → tier %s). Pin this in "
@@ -1152,7 +1175,7 @@ async def _resolve_id_to_tier(
                 # emit an operator error once plan metadata/config maps
                 # are standard; display names are not stable IDs.
                 # Backlink:
-                # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+                # audit: 2026-05-16 public-mesh-ga readiness pass
                 logger.warning(
                     "resolve_id_to_tier identifier=%s resolved via plan display-name "
                     "fallback (%r → %s). Pin this in quota-config.json's "
@@ -1186,7 +1209,7 @@ async def _resolve_plan_to_tier(
     # TODO(public-mesh-ga): Do not require the legacy display-name tier_map
     # when explicit plan/price maps are present; explicit maps should be
     # sufficient for production resolution. Backlink:
-    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+    # audit: 2026-05-16 public-mesh-ga readiness pass
     if not plan_id or not tier_map:
         return None
     return await _resolve_id_to_tier(

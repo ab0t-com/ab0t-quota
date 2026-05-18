@@ -8,11 +8,19 @@ quota state is tracked.
 
 from __future__ import annotations
 
+import logging
+import os
 from decimal import Decimal
 from enum import Enum
 from typing import Literal, Optional
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field, model_validator
+
+try:  # pragma: no cover - structlog optional at import time
+    import structlog  # type: ignore
+    _log = structlog.get_logger(__name__)
+except Exception:  # pragma: no cover
+    _log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +217,25 @@ class BillingModel(str, Enum):
     CONSUMPTION_ONLY = "consumption_only"
     SUBSCRIPTION_WITH_CREDITS = "subscription_with_credits"
     SUBSCRIPTION_UNLOCK_ONLY = "subscription_unlock_only"
-    # TODO(public-mesh-ga): These advanced models are schema-advertised but
-    # runtime-incomplete; gate them behind explicit validation/docs before
-    # public consumers depend on them. Backlink:
-    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+    # Experimental — schema-advertised but runtime-incomplete. Rejected by
+    # TierConfig validation unless AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS=true.
+    # See TierConfig._validate_billing_config below.
     SUBSCRIPTION_WITH_OVERAGE = "subscription_with_overage"
     SEAT_BASED = "seat_based"
     METERED = "metered"
+
+
+# Experimental billing models gated by AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS.
+# Reason: the enum advertises them so the schema is forward-compatible, but
+# no runtime path exists yet for overage metering, seat counting, or pure
+# metered billing. A consumer who declares one of these without the opt-in
+# would silently get a no-op tier and never know — that violates the drop-in
+# promise. Fail loud at load time instead.
+_EXPERIMENTAL_BILLING_MODELS: frozenset[BillingModel] = frozenset({
+    BillingModel.SUBSCRIPTION_WITH_OVERAGE,
+    BillingModel.SEAT_BASED,
+    BillingModel.METERED,
+})
 
 
 class CreditTrigger(str, Enum):
@@ -476,6 +496,38 @@ class TierConfig(BaseModel):
         # is not re-derived — explicit always wins over implicit.
 
         bm = self.billing_model
+
+        # Experimental-model gate. These enum values exist for schema
+        # forward-compat but have no runtime implementation yet. A consumer
+        # configuring one would otherwise get a silent no-op tier — breaking
+        # the drop-in promise that "configured behaviour actually happens".
+        # Fail load by default; let advanced consumers opt in explicitly.
+        if bm in _EXPERIMENTAL_BILLING_MODELS:
+            opt_in = os.environ.get(
+                "AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS", ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if not opt_in:
+                raise ValueError(
+                    f"tier '{self.tier_id}': billing_model '{bm.value}' is "
+                    f"experimental and not runtime-supported. Set env var "
+                    f"AB0T_QUOTA_ALLOW_EXPERIMENTAL_BILLING_MODELS=true to "
+                    f"opt in, or pick one of: capacity_only, consumption_only, "
+                    f"subscription_with_credits, subscription_unlock_only."
+                )
+            try:
+                _log.warning(
+                    "experimental_billing_model_in_use",
+                    tier_id=self.tier_id,
+                    billing_model=bm.value,
+                    note="runtime is incomplete; behaviour may change",
+                )
+            except TypeError:
+                _log.warning(
+                    "experimental billing_model '%s' on tier '%s' — runtime "
+                    "incomplete; behaviour may change",
+                    bm.value,
+                    self.tier_id,
+                )
 
         # subscription_with_credits — must declare a credit_grant whose
         # trigger is invoice-paid; price is required so we know what the

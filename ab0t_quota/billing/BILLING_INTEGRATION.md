@@ -320,7 +320,7 @@ applies to each tier in their `quota-config.json`.
 | `trigger` | Fires when | Use case |
 |---|---|---|
 | `signup` | `auth.user.registered` webhook | One-shot signup grant. Replaces the legacy `initial_credit` field. |
-| `subscription_invoice_paid` | Stripe `invoice.payment_succeeded` (with `subscription_data.metadata.org_id` set) | Period grant on every successful subscription invoice. |
+| `subscription_invoice_paid` | Stripe `invoice.paid` OR `invoice.payment_succeeded` (with `subscription_data.metadata.org_id` set) | Period grant on every successful subscription invoice. The lib accepts both event types since Stripe emits one or both depending on API version (see WEBHOOK_AND_CREDIT_GRANT_ARCHITECTURE.md). |
 | `scheduled_period_start` | Cron at start of each billing period | Alternative when Stripe isn't the source of truth. |
 | `manual` | Admin POST to `/promotional-credit` | Referrals, support compensation. |
 | `webhook_admin` | Custom event webhook | Consumer-defined triggers. |
@@ -358,13 +358,13 @@ Spend order at commit time: `subscription_credit` → `credit_balance` → `bala
 
 | Function | Purpose |
 |---|---|
-| `handle_subscription_invoice_paid(invoice, ...)` | Webhook receiver for Stripe `invoice.payment_succeeded`. Routes to `apply_credit_grant` per the org's tier config. |
+| `handle_subscription_invoice_paid(invoice, ...)` | Webhook receiver for Stripe paid-invoice events (`invoice.paid` and `invoice.payment_succeeded`). Routes to `apply_credit_grant` per the org's tier config. Idempotent on `invoice:{id}:credit_grant` so accounts that emit both event types do not double-credit. |
 | `reset_subscription_credit_on_tier_change(org_id, old_tier_id, new_tier_id, ...)` | Library helper: detects downgrade via `sort_order`, checks `reset_on_downgrade` policy, calls reset endpoint with safety check. |
 
 ### Required wiring for `subscription_with_credits` to function end-to-end
 
 1. **`payment-service`**: subscription-mode Stripe Checkout sessions must set `subscription_data.metadata = {"org_id": org_id, "plan_id": plan_id}` so the metadata propagates to subscription + invoice records.
-2. **`ab0t-quota`** (your service): wire `handle_subscription_invoice_paid` as a webhook receiver for Stripe `invoice.payment_succeeded` events (delivery mechanism is consumer-specific — typically payment-service forwards to a consumer endpoint, or via SNS event mesh).
+2. **`ab0t-quota`** (your service): wire `handle_subscription_invoice_paid` as a webhook receiver for Stripe paid-invoice events (`invoice.paid` and `invoice.payment_succeeded`; the lib accepts both). Delivery mechanism is consumer-specific — typically payment-service forwards to a consumer endpoint, or via SNS event mesh.
 3. **Tier config**: `billing_model: "subscription_with_credits"` + `price` + `credit_grant` (with `trigger: "subscription_invoice_paid"`) in your `quota-config.json`.
 
 ### Observability — structured log events

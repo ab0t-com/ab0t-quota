@@ -221,3 +221,129 @@ class TestPublishTierCatalog:
         monkeypatch.setenv("AB0T_MESH_API_KEY", "ab0t_sk_test")
         ok = await _publish_tier_catalog("svc-1", tiers)
         assert ok is False  # never blocks startup
+
+
+class TestCatalogOmitsBillingPolicy:
+    """Lock in `context_03_billing_model_decision.md` D5: billing-policy fields
+    (billing_model, price, credit_grant, initial_credit) MUST NOT appear in
+    the published catalog payload, even on tiers that have them set.
+
+    Rationale:
+      - The catalog is for cross-service admin views + bridge-mode engine.
+        Neither needs billing policy.
+      - Publishing billing policy would put billing-service in the
+        policy-resolution path, recreating the boundary violation T8/T9 fixed.
+      - Consumer billing policy stays consumer-local; it's resolved against
+        the local TierConfig via `_build_default_credit_grant_handler`.
+
+    If a future contributor adds these fields to the catalog payload, this
+    test will fail and they must justify the change against D5.
+    """
+
+    @pytest.fixture
+    def tiers_with_billing_policy(self):
+        """Tiers that exercise EVERY billing-policy field — none should leak."""
+        from decimal import Decimal
+        from ab0t_quota.models.core import (
+            BillingModel, BillingPeriod, CreditDestination, CreditGrant,
+            CreditLifecycle, CreditTrigger, Price, TierConfig, TierLimits,
+        )
+        return {
+            "free": TierConfig(
+                tier_id="free", display_name="Free",
+                # Back-compat shim: free tier with legacy initial_credit
+                initial_credit=Decimal("5.00"),
+                limits={"thing.concurrent": TierLimits(limit=1)},
+            ),
+            "starter": TierConfig(
+                tier_id="starter", display_name="Starter",
+                billing_model=BillingModel.SUBSCRIPTION_WITH_CREDITS,
+                price=Price(
+                    amount_per_period=Decimal("20.00"),
+                    currency="USD",
+                    period=BillingPeriod.MONTH,
+                ),
+                credit_grant=CreditGrant(
+                    trigger=CreditTrigger.SUBSCRIPTION_INVOICE_PAID,
+                    amount_per_period=Decimal("25.00"),
+                    currency="USD",
+                    lifecycle=CreditLifecycle.USE_IT_OR_LOSE_IT,
+                    destination=CreditDestination.SUBSCRIPTION_CREDIT,
+                ),
+                limits={"thing.concurrent": TierLimits(limit=10)},
+            ),
+            "pro": TierConfig(
+                tier_id="pro", display_name="Pro",
+                billing_model=BillingModel.SUBSCRIPTION_UNLOCK_ONLY,
+                price=Price(amount_per_period=Decimal("100")),
+                limits={"thing.concurrent": TierLimits(limit=100)},
+            ),
+        }
+
+    @pytest.mark.asyncio
+    async def test_billing_policy_fields_never_in_payload(
+        self, fake_billing, tiers_with_billing_policy
+    ):
+        await _publish_tier_catalog("svc-1", tiers_with_billing_policy)
+        import json
+        body = json.loads(fake_billing["body"])
+
+        # The top-level payload must not contain any billing-policy keys.
+        FORBIDDEN_TOP = {"prices", "credit_grants", "billing_models"}
+        for k in FORBIDDEN_TOP:
+            assert k not in body, (
+                f"D5 violation: catalog payload exposed top-level '{k}'. "
+                f"See context_03_billing_model_decision.md."
+            )
+
+        # No tier entry may carry billing-policy fields.
+        FORBIDDEN_PER_TIER = {
+            "billing_model", "price", "credit_grant", "initial_credit",
+        }
+        for tier in body["tiers"]:
+            leaked = FORBIDDEN_PER_TIER & set(tier.keys())
+            assert not leaked, (
+                f"D5 violation: tier '{tier['tier_id']}' exposed billing-policy "
+                f"fields {leaked} in catalog payload. These must stay "
+                f"consumer-local. See context_03_billing_model_decision.md."
+            )
+
+    @pytest.mark.asyncio
+    async def test_only_quota_policy_fields_published(
+        self, fake_billing, tiers_with_billing_policy
+    ):
+        """Inverse of the forbidden check — payload SHOULD include the
+        quota-policy fields the catalog actually exists for."""
+        await _publish_tier_catalog("svc-1", tiers_with_billing_policy)
+        import json
+        body = json.loads(fake_billing["body"])
+        starter = next(t for t in body["tiers"] if t["tier_id"] == "starter")
+        # Quota-policy fields the catalog IS for
+        assert "tier_id" in starter
+        assert "display_name" in starter
+        assert "limits" in starter
+        assert "features" in starter
+
+    @pytest.mark.asyncio
+    async def test_payload_keys_are_an_allowlist(
+        self, fake_billing, tiers_with_billing_policy
+    ):
+        """Defence in depth: assert each tier dict only contains the
+        allow-listed quota-policy keys. If someone adds a new key (billing
+        or otherwise), this test forces them to update the allowlist AND
+        check against D5.
+        """
+        await _publish_tier_catalog("svc-1", tiers_with_billing_policy)
+        import json
+        body = json.loads(fake_billing["body"])
+        ALLOWED = {
+            "tier_id", "display_name", "description", "sort_order",
+            "features", "upgrade_url", "default_per_user_fraction", "limits",
+        }
+        for tier in body["tiers"]:
+            extra = set(tier.keys()) - ALLOWED
+            assert not extra, (
+                f"tier '{tier['tier_id']}' carries unexpected keys {extra}. "
+                f"If adding a new quota-policy field, extend ALLOWED here "
+                f"AND verify it does not constitute billing policy per D5."
+            )

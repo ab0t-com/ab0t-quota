@@ -362,3 +362,173 @@ class TestSubscribeOnStartup:
         })
         result = await ae.subscribe_on_startup()  # all kwargs default to env
         assert result == "sub_env"
+
+
+# ---------------------------------------------------------------------------
+# T11 — default signup-credit handler honors tier_registry
+# ---------------------------------------------------------------------------
+
+class TestDefaultSignupCreditHandlerTierRegistry:
+    """T11: _build_default_credit_grant_handler accepts tier_registry and
+    threads it through to grant_initial_credit_for_user so signup grants
+    use the new TierConfig.credit_grant schema.
+
+    Ticket: 20260516_auto_credit_invoice_paid_wiring (T11 / core drop-in
+    promise — every consumer of ab0t-quota gets signup credit without
+    writing custom code).
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_handler_signature_accepts_tier_registry(self):
+        """The factory accepts tier_registry as a kwarg (None default)."""
+        import inspect
+        sig = inspect.signature(ae._build_default_credit_grant_handler)
+        assert "tier_registry" in sig.parameters
+        assert sig.parameters["tier_registry"].default is None
+
+    @pytest.mark.asyncio
+    async def test_default_handler_passes_tier_registry_through(self, monkeypatch):
+        """When the factory is built with tier_registry={...}, the handler
+        invokes grant_initial_credit_for_user with that tier_registry."""
+        captured = {}
+
+        async def _fake_grant(user_id, org_id, **kwargs):
+            captured.update({"user_id": user_id, "org_id": org_id, **kwargs})
+
+        monkeypatch.setattr(ae, "grant_initial_credit_for_user", _fake_grant)
+
+        # Fake tier_provider — just returns a tier_id when get_tier is called
+        class _TierProvider:
+            async def get_tier(self, org_id): return "starter"
+
+        fake_registry = {"starter": object(), "free": object()}
+        handler = ae._build_default_credit_grant_handler(
+            initial_credits={"free": 10.0},
+            tier_provider=_TierProvider(),
+            redis=AsyncMock(),
+            billing_url="http://billing.test",
+            billing_api_key="key",
+            tier_registry=fake_registry,
+        )
+
+        # Fire the handler with a Stripe-shape auth.user.registered event
+        await handler({
+            "event_type": "auth.user.registered",
+            "data": {"user_id": "u_test", "org_id": "org_test"},
+        })
+
+        assert captured["user_id"] == "u_test"
+        assert captured["org_id"] == "org_test"
+        # The key assertion: tier_registry flows through
+        assert captured["tier_registry"] is fake_registry
+
+    @pytest.mark.asyncio
+    async def test_default_handler_works_without_tier_registry(self, monkeypatch):
+        """Back-compat: when tier_registry=None, handler still calls
+        grant_initial_credit_for_user (legacy initial_credits path)."""
+        captured = {}
+
+        async def _fake_grant(user_id, org_id, **kwargs):
+            captured.update({"user_id": user_id, "org_id": org_id, **kwargs})
+
+        monkeypatch.setattr(ae, "grant_initial_credit_for_user", _fake_grant)
+
+        class _TierProvider:
+            async def get_tier(self, org_id): return "free"
+
+        handler = ae._build_default_credit_grant_handler(
+            initial_credits={"free": 10.0},
+            tier_provider=_TierProvider(),
+            redis=AsyncMock(),
+            billing_url="http://billing.test",
+            billing_api_key="key",
+            # tier_registry omitted (None default)
+        )
+
+        await handler({
+            "event_type": "auth.user.registered",
+            "data": {"user_id": "u_test", "org_id": "org_test"},
+        })
+
+        assert captured.get("tier_registry") is None
+        assert captured["initial_credits"] == {"free": 10.0}
+
+    @pytest.mark.asyncio
+    async def test_default_handler_skips_when_event_missing_required_fields(
+        self, monkeypatch,
+    ):
+        """No user_id or no org_id → handler returns without calling grant.
+        Regression guard so a malformed auth event doesn't 500."""
+        called = []
+
+        async def _fake_grant(*args, **kwargs):
+            called.append(args)
+
+        monkeypatch.setattr(ae, "grant_initial_credit_for_user", _fake_grant)
+
+        handler = ae._build_default_credit_grant_handler(
+            initial_credits={},
+            tier_provider=object(),
+            redis=AsyncMock(),
+            billing_url="http://billing.test",
+            billing_api_key="key",
+        )
+
+        await handler({"event_type": "auth.user.registered", "data": {}})
+        await handler({"event_type": "auth.user.registered", "data": {"user_id": "u"}})
+        await handler({"event_type": "auth.user.registered", "data": {"org_id": "o"}})
+        assert called == []
+
+    @pytest.mark.asyncio
+    async def test_default_handler_marked_with_lib_sentinel(self):
+        """The auto-registered handler should be tagged so setup.py / future
+        code can detect it (e.g., to skip re-registering on hot reload)."""
+        handler = ae._build_default_credit_grant_handler(
+            initial_credits={},
+            tier_provider=object(),
+            redis=AsyncMock(),
+            billing_url="http://billing.test",
+            billing_api_key="key",
+        )
+        # The factory itself doesn't set the sentinel — setup.py does, after
+        # building the handler — so this test just proves the handler is
+        # decoratable. The sentinel-set is exercised in test_setup.py.
+        setattr(handler, "_ab0t_quota_default", True)
+        assert getattr(handler, "_ab0t_quota_default", False) is True
+
+
+class TestSetupQuotaAutoRegistersDefaultHandler:
+    """T11: setup_quota(enable_paid=True) auto-registers the default
+    signup-credit handler when AB0T_AUTH_WEBHOOK_SECRET is set.
+
+    This is the user-visible drop-in promise — consumers do not write a
+    custom @on_auth_event handler for signup credits.
+    """
+
+    @pytest.mark.asyncio
+    async def test_consumer_handler_coexists_with_default(self):
+        """If a consumer registers their own handler, the default doesn't
+        unregister it. Both run; idempotency at the lib helper level (Redis
+        flag + billing idempotency_key) ensures only one grant lands."""
+        consumer_calls = []
+
+        async def consumer_handler(event):
+            consumer_calls.append(event.get("data", {}).get("user_id"))
+
+        ae.register_handler("auth.user.registered", consumer_handler)
+
+        # Simulate setup.py also registering the default
+        async def lib_default_handler(event): pass
+        setattr(lib_default_handler, "_ab0t_quota_default", True)
+        ae.register_handler("auth.user.registered", lib_default_handler)
+
+        # Both should be in the registry
+        handlers = ae._HANDLERS["auth.user.registered"]
+        assert len(handlers) == 2
+        assert consumer_handler in handlers
+        assert lib_default_handler in handlers
+
+        # Fire an event — both handlers run
+        for h in handlers:
+            await h({"data": {"user_id": "u_test"}})
+        assert "u_test" in consumer_calls

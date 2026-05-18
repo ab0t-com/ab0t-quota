@@ -221,8 +221,17 @@ mesh.
   routes.
 - **No Stripe code.** Stripe runs inside the ab0t payment service. You
   see `POST /api/payments/checkout/{plan_id}` returning a redirect URL.
-- **No webhook signing.** The webhook proxy forwards to ab0t and
-  verifies signatures upstream.
+- **No webhook signature code.** Stripe-signed events arrive at the
+  library's `POST /api/webhooks/stripe` route; the library verifies the
+  HMAC-SHA256 signature against `AB0T_QUOTA_STRIPE_WEBHOOK_SECRET`
+  before forwarding to payment-service for processing. Forged or
+  unsigned requests are rejected with 400 *before* leaving your edge.
+  You configure the secret once; the library does the cryptography.
+- **No tier policy in payment-service.** Paid-invoice events
+  (`invoice.paid` and `invoice.payment_succeeded` — the lib accepts both)
+  are dispatched into the lib's tier-aware handler, which reads your
+  `credit_grant` config and grants accordingly. No tier IDs or amounts
+  in payment-service code.
 - **No PCI scope.** Card numbers never touch your service.
 - **No tier definitions in code.** Edit `quota-config.json` (no deploy
   needed, library publishes the new catalog to ab0t on next startup).
@@ -360,7 +369,8 @@ The full set you need:
 | `AB0T_MESH_BILLING_URL` | no — local dev only | `https://billing.service.ab0t.com` | Override for testing against local stack |
 | `AB0T_MESH_PAYMENT_URL` | no — local dev only | `https://payment.service.ab0t.com` | Same |
 | `AB0T_MESH_SNS_LIFECYCLE_TOPIC_ARN` | no — production sets via mesh defaults | — | LocalStack ARN for dev |
-| `AB0T_AUTH_WEBHOOK_SECRET` | no (required for auth-event handlers) | — | HMAC secret. When set, lib mounts `POST /api/quotas/_webhooks/auth` and dispatches received events to handlers you register via `@on_auth_event` / `register_handler`. The lib has no opinion on what handlers do — see `ab0t_quota/auth_events.py` module docstring. |
+| `AB0T_QUOTA_STRIPE_WEBHOOK_SECRET` | no (required for Stripe webhook routes) | — | HMAC-SHA256 secret from your Stripe Dashboard webhook endpoint config. When set, the library's `POST /api/webhooks/stripe` route verifies the `Stripe-Signature` header before forwarding to payment-service. Missing/forged signatures rejected with 400. **If unset, the route 503s** — Stripe Dashboard cutover MUST set this. |
+| `AB0T_AUTH_WEBHOOK_SECRET` | no (required for auth-event handlers) | — | HMAC secret. When set, lib mounts `POST /api/quotas/_webhooks/auth` and dispatches received events to handlers you register via `@on_auth_event` / `register_handler`. With `enable_paid=True`, the lib AUTO-REGISTERS a default signup-credit handler that reads `tier.credit_grant` (signup trigger) and `tier.initial_credit` (legacy shim) — so a consumer with config alone gets initial-credit grants without writing any handler code. Consumer-registered handlers coexist with the default; the lib dedups via Redis flag + billing idempotency_key. |
 | `AB0T_AUTH_ADMIN_TOKEN` | no (required for auto-subscribe) | — | Bearer token with `events.subscribe` permission on auth. When set with `AB0T_AUTH_WEBHOOK_PUBLIC_URL`, lib auto-registers the subscription with auth at startup (idempotent). |
 | `AB0T_AUTH_WEBHOOK_PUBLIC_URL` | no (required for auto-subscribe) | — | Externally-reachable base URL of this service. Auth POSTs events to `<this>/api/quotas/_webhooks/auth`. |
 | `AB0T_AUTH_WATCH_ORG_SLUG` | no | from `AB0T_AUTH_ORG_SLUG` | Auth org slug to filter events for. Resolved to org_id at subscribe time. |

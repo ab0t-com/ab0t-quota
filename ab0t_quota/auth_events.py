@@ -544,9 +544,21 @@ def _build_default_credit_grant_handler(
     auth_url: str = "",
     mesh_api_key: str = "",
     pin_store: Optional[PinStore] = None,
+    tier_registry: Optional[dict[str, Any]] = None,
 ) -> Handler:
     """Returns a handler that resolves billing org (if pin_store provided)
-    then grants initial_credit. Composes the two primitives above."""
+    then grants initial_credit. Composes the two primitives above.
+
+    When `tier_registry` is provided, the underlying call honors
+    `TierConfig.credit_grant` (new schema, can route to any destination
+    bucket). Without it, falls back to the legacy `initial_credits` dict
+    (always lands in credit_balance).
+
+    T11 in ticket 20260516_auto_credit_invoice_paid_wiring threads
+    tier_registry through so setup_quota(enable_paid=True) can auto-register
+    this handler with the consumer's loaded TierConfig dict — no custom
+    consumer code required for signup credit grants.
+    """
 
     async def grant_initial_credit(event: dict) -> None:
         data = event.get("data") or event
@@ -565,10 +577,6 @@ def _build_default_credit_grant_handler(
         else:
             org_id = event_org_id
 
-        # TODO(public-mesh-ga): Thread tier_registry through this default
-        # factory so signup grants can honor TierConfig.credit_grant instead
-        # of falling back to legacy initial_credits only. Backlink:
-        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
         await grant_initial_credit_for_user(
             user_id, org_id,
             initial_credits=initial_credits,
@@ -576,6 +584,7 @@ def _build_default_credit_grant_handler(
             redis=redis,
             billing_url=billing_url,
             billing_api_key=billing_api_key,
+            tier_registry=tier_registry,
         )
 
     return grant_initial_credit

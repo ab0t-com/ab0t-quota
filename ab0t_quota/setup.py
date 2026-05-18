@@ -634,11 +634,30 @@ async def _publish_tier_catalog(
         logger.debug("catalog publish skipped: no billing mesh API key set")
         return False
 
-    # TODO(public-mesh-ga): Catalog publish currently sends limits/features
-    # but not billing_model, price, credit_grant, lifecycle, or plan/price
-    # mappings. Extend this before billing/bridge/admin views rely on the
-    # catalog as the complete consumer policy source. Backlink:
-    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+    # DECISION (locked, do not relitigate):
+    #   The catalog publishes quota policy (tier_id, limits, features,
+    #   resource bundles) only. It deliberately OMITS billing-policy fields:
+    #   `billing_model`, `price`, `credit_grant`, `initial_credit`.
+    #
+    #   Rationale — see `context_03_billing_model_decision.md` D5 in ticket
+    #   20260516_paid_plan_balance_model_gap:
+    #     * D5: library DEFINES the schema + defaults; library NEVER hardcodes
+    #       a consumer-specific amount or policy.
+    #     * Billing-policy lives in the consumer's `quota-config.json` and is
+    #       resolved consumer-side. Publishing it to billing would (a) leak
+    #       consumer pricing into a multi-tenant central store and (b) put
+    #       billing-service in the policy-resolution path, recreating the
+    #       service-boundary violation T8/T9 fixed.
+    #
+    #   The catalog exists for:
+    #     1. Admin views: `/billing/{org}/tier/limits?service=...` shows tier
+    #        names + limits across services. No money concerns.
+    #     2. Bridge mode: billing runs a per-service engine for consumers who
+    #        opted out of in-process enforcement. Engine needs resources +
+    #        bundles + limits — NOT prices or credit-grant policy.
+    #
+    #   Regression test: tests/test_tier_catalog_publish.py
+    #     ::TestCatalogOmitsBillingPolicy
     payload: dict = {
         "tiers": [
             {
@@ -848,9 +867,10 @@ def _wire_paid_tier_sync(
             templates_dir=templates_dir,
             prefix=route_prefix,
             # T0b — thread the already-loaded tier_registry through so the
-            # Stripe webhook proxy can use it for invoice.payment_succeeded
-            # dispatch (T2/T3). Same instance as the engine's tier dict;
-            # startup validation and runtime policy stay in sync.
+            # Stripe webhook proxy can use it for paid-invoice event
+            # dispatch (T2/T3 — both invoice.paid and invoice.payment_succeeded).
+            # Same instance as the engine's tier dict; startup validation
+            # and runtime policy stay in sync.
             tier_registry=tiers,
         )
         app.include_router(router)
@@ -858,16 +878,24 @@ def _wire_paid_tier_sync(
     except Exception as e:
         logger.warning("paid-tier router mount failed: %s", e)
 
-    # Auth-event webhook receiver — generic infrastructure, no opinions.
-    # Consumer registers handlers via @on_auth_event / register_handler from
-    # their own code (typically their quota.py). The lib mounts the receiver
-    # and auto-subscribes with auth based on which event types have handlers.
-    # See ab0t_quota/auth_events.py module docstring for the consumer-side
-    # pattern.
-    # TODO(public-mesh-ga): Align setup with auth_events.py docs: either
-    # auto-register the built-in signup credit handler with tier_registry, or
-    # document that consumers must register their own handler. Backlink:
-    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+    # Auth-event webhook receiver — generic infrastructure, the lib auto-
+    # registers a default signup-credit handler so consumers get drop-in
+    # signup grants with zero custom code (T11 in ticket
+    # 20260516_auto_credit_invoice_paid_wiring).
+    #
+    # Resolution order for the auth.user.registered event:
+    #   1. If a consumer has already registered their own handler (via
+    #      @on_auth_event / register_handler from their app code), the
+    #      consumer's handler runs. The default factory still runs too —
+    #      idempotency at grant_initial_credit_for_user's Redis flag +
+    #      billing-side idempotency_key dedupes so only one grant lands.
+    #   2. Otherwise, the lib's default handler runs — reads tier_registry
+    #      for each user's tier, applies the configured credit_grant
+    #      (with trigger=signup) per the new schema. Legacy `initial_credit`
+    #      back-compat already covered by grant_initial_credit_for_user.
+    #
+    # The consumer never has to write a custom signup-credit handler. They
+    # only declare credit_grant in quota-config.json.
     webhook_secret = os.getenv("AB0T_AUTH_WEBHOOK_SECRET", "")
     if webhook_secret:
         try:
@@ -875,6 +903,56 @@ def _wire_paid_tier_sync(
             app.include_router(_ae.make_router(webhook_secret=webhook_secret),
                                prefix=route_prefix + "/quotas")
             logger.info("auth-event webhook mounted at %s/quotas/_webhooks/auth", route_prefix)
+
+            # T11 — auto-register the default signup-credit handler.
+            # Build the legacy initial_credits dict from tiers (back-compat
+            # path); also pass tier_registry so the new credit_grant schema
+            # takes precedence when configured.
+            legacy_initial_credits: dict[str, float] = {}
+            for tier_id, tier_cfg in tiers.items():
+                ic = getattr(tier_cfg, "initial_credit", None)
+                if ic is not None and ic > 0:
+                    legacy_initial_credits[tier_id] = float(ic)
+
+            billing_url = _mesh_url("billing")
+            billing_api_key = (
+                os.getenv("AB0T_MESH_BILLING_API_KEY", "")
+                or os.getenv("AB0T_MESH_API_KEY", "")
+            )
+            mesh_api_key = os.getenv("AB0T_MESH_API_KEY", "") or billing_api_key
+            auth_url_for_pin = os.getenv("AB0T_AUTH_AUTH_URL", "") or os.getenv("AUTH_SERVICE_URL", "")
+
+            default_handler = _ae._build_default_credit_grant_handler(
+                initial_credits=legacy_initial_credits,
+                tier_provider=provider,
+                redis=redis,
+                billing_url=billing_url,
+                billing_api_key=billing_api_key,
+                auth_url=auth_url_for_pin,
+                mesh_api_key=mesh_api_key,
+                pin_store=None,  # consumer can pass their own pin_store via @on_auth_event if needed
+                tier_registry=tiers,
+            )
+
+            # Sentinel attribute so we can detect/un-register the lib-owned
+            # handler later if a consumer wants to fully replace it.
+            setattr(default_handler, "_ab0t_quota_default", True)
+
+            already_registered = _ae.registered_event_types()
+            if "auth.user.registered" in already_registered:
+                # Consumer registered their own handler too — both run; the
+                # Redis flag + billing idempotency_key make this safe.
+                logger.info(
+                    "auth-event: consumer also has a handler on auth.user.registered; "
+                    "both will run, lib dedups via Redis flag + billing idempotency_key"
+                )
+
+            _ae.register_handler("auth.user.registered", default_handler)
+            logger.info(
+                "auth-event: default signup-credit handler auto-registered "
+                "(%d legacy initial_credits + tier_registry with %d tiers)",
+                len(legacy_initial_credits), len(tiers),
+            )
         except Exception as e:
             logger.warning("auth-event webhook setup failed: %s", e)
     else:

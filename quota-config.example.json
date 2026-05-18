@@ -127,7 +127,7 @@
   ],
 
   "billing_integration": {
-    "$comment": "Maps Stripe price IDs to quota tiers. When payment-service webhook fires, it calls auth-service to set the org tier.",
+    "$comment": "Maps Stripe price IDs to quota tiers (mesh resolver). Stripe events flow: Stripe Dashboard -> POST /api/webhooks/stripe (lib verifies HMAC against AB0T_QUOTA_STRIPE_WEBHOOK_SECRET) -> forwards to payment-service -> payment-service dispatches subscription/invoice events to lib handlers -> lib resolves price_id to tier_id via THIS mapping -> lib reads tier.credit_grant + applies. Library is the policy authority; payment-service is just Stripe state. See BILLING_INTEGRATION.md.",
     "stripe_price_to_tier": {
       "price_starter_monthly": "starter",
       "price_starter_annual": "starter",

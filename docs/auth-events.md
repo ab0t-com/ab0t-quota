@@ -53,6 +53,57 @@ Three pieces, two of them yours:
 
 ---
 
+## Zero-code default: signup-credit auto-registration
+
+If you call `setup_quota(..., enable_paid=True)` and any of your tiers
+declare `initial_credit` or a `credit_grant` with `trigger: "signup"`,
+the library AUTO-REGISTERS a default `auth.user.registered` handler at
+startup. **You do not have to write a handler for initial-credit grants.**
+
+The default handler:
+- Resolves the user's billing org (sticky pin via DDB)
+- Reads the tier registry the library loaded from your `quota-config.json`
+- Reads either `tier.credit_grant` (preferred) or the legacy
+  `tier.initial_credit` shim
+- Hits billing's `/billing/{org}/promotional-credit` with an
+  `idempotency_key` of `user:{user_id}:initial_credit:{tier_id}`
+- Sets a Redis dedup flag
+
+A consumer wiring is now a `quota-config.json` decision, not a Python
+write:
+
+```jsonc
+// quota-config.json
+{
+  "tiers": [{
+    "tier_id": "free",
+    "credit_grant": {
+      "trigger": "signup",
+      "amount_per_period": "5.00",
+      "lifecycle": "persistent",
+      "destination": "credit_balance"
+    }
+  }]
+}
+```
+
+```python
+# main.py — that's the whole integration
+setup_quota(app, enable_paid=True, redis=redis)
+```
+
+The library logs:
+- `auth-event: default signup-credit handler auto-registered (N legacy initial_credits + tier_registry with N tiers)` on startup
+- If you ALSO register your own handler on `auth.user.registered`,
+  both fire. The library dedups via the Redis flag + billing's
+  idempotency_key so back-to-back grants are safe.
+
+**When you'd still write a handler:** you need behaviour beyond initial
+credit (e.g., set up a Stripe customer, provision an external resource,
+fire a welcome email). The cookbook below covers that.
+
+---
+
 ## The two registration styles
 
 Both produce the same result. Use whichever fits your code shape.
@@ -203,7 +254,12 @@ only if you're not using `setup_quota` (rare).
 
 ## Cookbook
 
-### 1. Grant initial credit on signup (sandbox-platform's actual handler)
+### 1. Grant initial credit on signup — MANUAL path (only if you need custom logic)
+
+**For the common case, do nothing — the lib auto-registers this handler
+(see "Zero-code default" above).** Only follow this pattern when you
+need to do something beyond the standard credit grant — e.g. create a
+Stripe customer, provision an external resource, fire a welcome email.
 
 ```python
 from ab0t_quota.auth_events import (

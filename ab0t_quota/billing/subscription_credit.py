@@ -1,24 +1,34 @@
 """Subscription-credit grant handler.
 
-Receives `invoice.payment_succeeded` events (typically forwarded from a
-payment-service webhook) and applies the configured `credit_grant` for
-the org's current tier to the billing-service ledger.
+Receives paid-invoice events (`invoice.paid` and `invoice.payment_succeeded`)
+from the consumer's lib proxy and applies the configured `credit_grant`
+for the org's current tier to the billing-service ledger. Both event
+types are accepted because Stripe emits one or both depending on API
+version (X2 in ticket 20260518_post_upgrade_credit_and_ux_propagation).
+Idempotency on `invoice:{id}:credit_grant` prevents double-credit when
+Stripe emits both for the same invoice.
 
-Architecture (see ticket 20260516_paid_plan_balance_model_gap):
+Architecture (current — Alt B, see
+docs/WEBHOOK_AND_CREDIT_GRANT_ARCHITECTURE.md and ticket
+20260516_auto_credit_invoice_paid_wiring §8 cutover plan):
 
-    Stripe -> payment-service /webhooks/stripe
-           -> POST consumer's webhook subscriber
-           -> handle_subscription_invoice_paid()
+    Stripe -> consumer's lib proxy (e.g. sandbox.service.ab0t.com/api/webhooks/stripe)
+           -> verify_signature(AB0T_QUOTA_STRIPE_WEBHOOK_SECRET)
+           -> handle_subscription_invoice_paid()  ← THIS HANDLER, in-band
               |
               +-- extract org_id, plan_id from invoice.metadata
               +-- tier_id = resolve_plan_to_tier(plan_id, consumer_config)
               +-- tier   = TierRegistry.get(tier_id)
               +-- grant  = tier.credit_grant  (may be None)
               +-- if trigger matches: call BillingServiceClient.apply_credit_grant
+           -> forward_webhook(body, signature) -> payment-service
+              -> payment-service updates invoice/subscription DDB rows
+              -> payment-service legacy balance credit is skipped when
+                 ENABLE_LEGACY_SUBSCRIPTION_INVOICE_CREDIT=false (post-cutover)
 
 The handler is intentionally generic: it makes no assumption about the
 consumer service. The wiring that actually invokes it is consumer-
-specific (via the consumer's event subscription registration).
+specific (via the lib proxy router's dispatch table).
 
 Idempotency: the source invoice ID is used as the idempotency key, so
 Stripe webhook redelivery is naturally deduplicated by billing-service.
@@ -70,7 +80,7 @@ def _extract_invoice_metadata(invoice: dict) -> tuple[Optional[str], Optional[st
     # the invoice's line-item price/subscription ID when plan_id metadata is
     # absent; public consumers should not depend on one Stripe metadata shape.
     # Backlink:
-    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+    # audit: 2026-05-16 public-mesh-ga readiness pass
     plan_id = md.get("plan_id") or sub_md.get("plan_id")
     return org_id, plan_id
 

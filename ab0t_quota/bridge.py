@@ -158,7 +158,7 @@ class BridgeClient:
         # TODO(public-mesh-ga): Make bridge tier fallback configurable
         # fail-open/fail-closed per consumer; hardcoded "free" can silently
         # downgrade paid orgs during billing outages. Backlink:
-        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+        # audit: 2026-05-16 public-mesh-ga readiness pass
         return "free"
 
     @staticmethod
@@ -174,7 +174,7 @@ class BridgeClient:
         logger.warning("bridge_%s_error status=%d detail=%s", op, resp.status_code, detail)
         # TODO(public-mesh-ga): Replace hardcoded fail-open bridge behavior
         # with explicit per-consumer outage policy and telemetry. Backlink:
-        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+        # audit: 2026-05-16 public-mesh-ga readiness pass
         return {
             "decision": "allow",  # fail-open on bridge errors (configurable later)
             "current": 0,
@@ -190,7 +190,7 @@ def _network_error_result(resource_key: str, error: str) -> dict:
     # TODO(public-mesh-ga): Use the same explicit outage policy as _parse();
     # public mesh consumers need to opt into fail-open for billing gates.
     # Backlink:
-    # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+    # audit: 2026-05-16 public-mesh-ga readiness pass
     return {
         "decision": "allow",  # fail-open by default
         "resource_key": resource_key,
@@ -262,7 +262,7 @@ class BridgeContext:
         # TODO(public-mesh-ga): Add batch increment/decrement endpoints to
         # the public mesh quota API before bridge mode is advertised as a
         # full drop-in replacement for engine-local mode. Backlink:
-        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+        # audit: 2026-05-16 public-mesh-ga readiness pass
         logger.warning("bridge increment_bundle is not yet supported — call increment per resource")
         return {}
 
@@ -273,7 +273,7 @@ class BridgeContext:
         # TODO(public-mesh-ga): Keep this aligned with increment_bundle's
         # eventual batch endpoint so bundle checks and mutations have
         # equivalent semantics in bridge mode. Backlink:
-        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+        # audit: 2026-05-16 public-mesh-ga readiness pass
         logger.warning("bridge decrement_bundle is not yet supported — call decrement per resource")
         return {}
 
@@ -287,5 +287,5 @@ class BridgeContext:
         # TODO(public-mesh-ga): Add /quota/{service}/{org}/feature/{name}
         # to billing's public bridge API; returning False can hide paid
         # features during bridge adoption. Backlink:
-        # /home/ubuntu/infra/infra/code/resource/output/sandbox-platform/tickets/20260516_auto_credit_invoice_paid_wiring/codex_report_20260516_235326_llm_judge_public_mesh_billing_quota.md
+        # audit: 2026-05-16 public-mesh-ga readiness pass
         return False

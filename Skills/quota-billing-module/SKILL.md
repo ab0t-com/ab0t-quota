@@ -12,7 +12,7 @@ Self-contained module at `billing/output/app/modules/quota/`. Manages org tiers,
 ```
 modules/quota/
 ├── __init__.py       # Public API: quota_router, QuotaTierService, models
-├── config.py         # KNOWN_TIERS, plan→tier mapping, env-driven settings
+├── config.py         # KNOWN_TIERS (hint list — billing accepts any tier_id, see T8), plan→tier mapping, env-driven settings
 ├── models.py         # SetTierRequest, TierResponse, OverrideDetail, etc.
 ├── service.py        # QuotaTierService — business logic, cache invalidation
 ├── store.py          # DynamoDB CRUD with TransactWriteItems (atomic writes)
@@ -48,6 +48,11 @@ See [references/dynamodb-patterns.md](references/dynamodb-patterns.md) for SK pa
 - **Exceptions propagate from store** — service returns 503, not silent fallback to "free"
 - **resource_key validated** — `#` rejected to prevent SK collision
 - **limit validated** — `ge=0` in model, service rejects negative values
+- **No tier_id allowlist** (post-T8, ticket 20260516_auto_credit_invoice_paid_wiring) —
+  billing accepts ANY `tier_id` string. The library catalog publish from the
+  consumer is the real source of truth; billing logs a WARN if it sees an
+  unfamiliar tier but still writes it. Service boundary: tier policy =
+  consumer's `quota-config.json`; billing = ledger.
 
 ## Modifying This Module
 

@@ -55,7 +55,7 @@ When you wire `ab0t-quota` into your service via `setup_quota(app, ...)`:
 ## What you do
 
 - **Declare your tiers** in `quota-config.json` (see below).
-- **Wire payment-service to call the library's webhook handler** on `invoice.payment_succeeded`. (Currently this is consumer-specific; see "Required wiring" below.)
+- **Wire payment-service (or your delivery mechanism) to call the library's webhook handler** on paid-invoice events (`invoice.paid` and `invoice.payment_succeeded` — the lib accepts both since Stripe emits one or both depending on API version). See "Required wiring" below.
 - **Call the library at provisioning points.** `BudgetChecker.reserve_funds()` before, `LifecycleEmitter.resource_stopped()` after. The library handles the rest.
 
 ## What the library does NOT do
@@ -378,7 +378,7 @@ For each archetype above, here's what your service + payment-service + ab0t-quot
 
 1. **`payment-service`** must set `subscription_data.metadata = {"org_id": org_id, "plan_id": plan_id}` on Stripe Checkout sessions. (Lands in `payment/output/app/api/routes/checkout.py:~1281`.)
 
-2. **`ab0t-quota`** must receive `invoice.payment_succeeded` events. Options:
+2. **`ab0t-quota`** must receive paid-invoice events — `invoice.paid` and/or `invoice.payment_succeeded` (the lib accepts both). Options:
    - Direct HTTP POST from payment-service to a consumer endpoint (consumer registers its URL).
    - SNS event mesh (payment-service publishes; consumers subscribe).
    - (Today: this is consumer-specific wiring; not built into the library.)
@@ -447,7 +447,7 @@ This works ONLY when Phase 3.1 (commit Lua spend order) is deployed. Without Pha
 ### "Why is `subscription_credit` always 0 even though my tier has `credit_grant`?"
 
 Either:
-- The `invoice.payment_succeeded` webhook isn't reaching the library (delivery not wired).
+- The paid-invoice webhook (`invoice.paid` or `invoice.payment_succeeded`) isn't reaching the library (delivery not wired, or Stripe Dashboard endpoint not subscribed to either event type).
 - The `subscription_data.metadata` wasn't set on the Stripe Checkout (Phase 2.1 not deployed).
 - The library's webhook handler returned a non-`applied` status (check logs for `subscription_invoice_paid_skip` or `subscription_invoice_paid_failed_*`).
 - The grant landed but you're reading from a stale cache (Redis `balance:{org_id}` TTL is 60s).

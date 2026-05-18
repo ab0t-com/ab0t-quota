@@ -44,7 +44,8 @@ Payment service reads this in `core/quota.py:resolve_price_to_tier()`.
    - `customer.subscription.created`
    - `customer.subscription.updated`
    - `customer.subscription.deleted`
-   - `invoice.payment_succeeded`
+   - `invoice.paid`
+   - `invoice.payment_succeeded` (older Stripe API versions; safe to also enable — lib accepts both)
    - `invoice.payment_failed`
 4. Copy webhook signing secret to `STRIPE_WEBHOOK_SECRET` env var
 

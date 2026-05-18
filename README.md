@@ -30,8 +30,8 @@ ab0t-quota[webhooks] @ git+https://github.com/ab0t-com/ab0t-quota.git   # httpx 
 ab0t-quota[dynamo] @ git+https://github.com/ab0t-com/ab0t-quota.git     # aioboto3 for DynamoDB persistence
 ab0t-quota[all] @ git+https://github.com/ab0t-com/ab0t-quota.git        # everything
 
-# Pin to a release tag
-ab0t-quota @ git+https://github.com/ab0t-com/ab0t-quota.git@v0.1.0
+# Pin to a release tag (use the latest tag from the repo's Releases page)
+ab0t-quota @ git+https://github.com/ab0t-com/ab0t-quota.git@v0.5.1
 
 # Local development
 pip install -e ".[dev]"
