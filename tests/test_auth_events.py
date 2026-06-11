@@ -532,3 +532,219 @@ class TestSetupQuotaAutoRegistersDefaultHandler:
         for h in handlers:
             await h({"data": {"user_id": "u_test"}})
         assert "u_test" in consumer_calls
+
+
+# ---------------------------------------------------------------------------
+# @idempotent integration tests — end-to-end through the receiver
+# ---------------------------------------------------------------------------
+
+from ab0t_quota.handler_ledger import (
+    idempotent, InMemoryLedgerStore, LedgerStatus,
+)
+
+
+class TestIdempotentDispatch:
+    SECRET = "test-secret-idempotent"
+
+    def _build(self, ledger):
+        app = FastAPI()
+        app.include_router(
+            ae.make_router(webhook_secret=self.SECRET, ledger_store=ledger),
+            prefix="/api/quotas",
+        )
+        return TestClient(app)
+
+    def _sign(self, body: bytes) -> str:
+        return hmac.new(self.SECRET.encode(), body, hashlib.sha256).hexdigest()
+
+    @pytest.mark.asyncio
+    async def test_delivery_dedup_blocks_second_run(self):
+        ledger = InMemoryLedgerStore()
+        seen = []
+
+        @ae.on_auth_event("auth.user.registered")
+        @idempotent(handler="my_handler")
+        async def h(event, ctx):
+            seen.append(event["data"]["user_id"])
+
+        body = json.dumps({"event_type": "auth.user.registered",
+                            "event_id": "evt_dup",
+                            "data": {"user_id": "u1"}}).encode()
+        sig = self._sign(body)
+        client = self._build(ledger)
+        r1 = client.post("/api/quotas/_webhooks/auth", content=body,
+                         headers={"X-Event-Signature": sig, "Content-Type": "application/json"})
+        r2 = client.post("/api/quotas/_webhooks/auth", content=body,
+                         headers={"X-Event-Signature": sig, "Content-Type": "application/json"})
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert seen == ["u1"]  # second delivery short-circuited
+        row = await ledger.get_row(handler_name="my_handler", event_id="evt_dup")
+        assert row.status == LedgerStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_business_dedup_via_key(self):
+        ledger = InMemoryLedgerStore()
+        side_effects = []
+
+        @ae.on_auth_event("auth.user.registered")
+        @idempotent(handler="my_handler", key=lambda e: f"org:{e['data']['org_id']}")
+        async def h(event, ctx):
+            if await ctx.already_done():
+                return ctx.skip("already granted")
+            side_effects.append(event["data"]["user_id"])
+            await ctx.mark_done(side_effect_id="sid1")
+            return ctx.success(side_effect_id="sid1")
+
+        client = self._build(ledger)
+        # Two different users joining same org → only first should grant
+        for uid, evt_id in [("alice", "e_alice"), ("bob", "e_bob")]:
+            body = json.dumps({"event_type": "auth.user.registered",
+                                "event_id": evt_id,
+                                "data": {"user_id": uid, "org_id": "shared_org"}}).encode()
+            sig = self._sign(body)
+            r = client.post("/api/quotas/_webhooks/auth", content=body,
+                            headers={"X-Event-Signature": sig, "Content-Type": "application/json"})
+            assert r.status_code == 200
+        assert side_effects == ["alice"]  # bob skipped
+        bob_row = await ledger.get_row(handler_name="my_handler", event_id="e_bob")
+        assert bob_row.status == LedgerStatus.SKIPPED
+
+    @pytest.mark.asyncio
+    async def test_retry_on_failure_then_success(self):
+        ledger = InMemoryLedgerStore()
+        attempts = []
+
+        @ae.on_auth_event("auth.user.registered")
+        @idempotent(handler="my_handler", retry={"attempts": 3, "initial_seconds": 0.001})
+        async def h(event, ctx):
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise RuntimeError("transient")
+            return ctx.success(side_effect_id="sid")
+
+        body = json.dumps({"event_type": "auth.user.registered",
+                            "event_id": "evt_retry",
+                            "data": {"user_id": "u1"}}).encode()
+        sig = self._sign(body)
+        client = self._build(ledger)
+        r = client.post("/api/quotas/_webhooks/auth", content=body,
+                        headers={"X-Event-Signature": sig, "Content-Type": "application/json"})
+        assert r.status_code == 200
+        assert len(attempts) == 2  # first failed, second succeeded
+        row = await ledger.get_row(handler_name="my_handler", event_id="evt_retry")
+        assert row.status == LedgerStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_max_attempts_marks_failed_permanent(self):
+        ledger = InMemoryLedgerStore()
+        attempts = []
+
+        @ae.on_auth_event("auth.user.registered")
+        @idempotent(handler="my_handler", retry={"attempts": 2, "initial_seconds": 0.001})
+        async def h(event, ctx):
+            attempts.append(1)
+            raise RuntimeError("perma-fail")
+
+        body = json.dumps({"event_type": "auth.user.registered",
+                            "event_id": "evt_perma",
+                            "data": {"user_id": "u1"}}).encode()
+        sig = self._sign(body)
+        client = self._build(ledger)
+        r = client.post("/api/quotas/_webhooks/auth", content=body,
+                        headers={"X-Event-Signature": sig, "Content-Type": "application/json"})
+        assert r.status_code == 200  # receiver still returns 200
+        assert len(attempts) == 2
+        row = await ledger.get_row(handler_name="my_handler", event_id="evt_perma")
+        assert row.status == LedgerStatus.FAILED_PERMANENT
+        assert "perma-fail" in (row.error or "")
+
+    @pytest.mark.asyncio
+    async def test_plain_handler_still_works(self):
+        """v0.2.6 plain handlers (no @idempotent) keep working."""
+        seen = []
+
+        @ae.on_auth_event("auth.user.registered")
+        async def h(event):
+            seen.append(event["data"]["user_id"])
+
+        body = json.dumps({"event_type": "auth.user.registered",
+                            "event_id": "evt_plain",
+                            "data": {"user_id": "u1"}}).encode()
+        sig = self._sign(body)
+        client = self._build(InMemoryLedgerStore())
+        r = client.post("/api/quotas/_webhooks/auth", content=body,
+                        headers={"X-Event-Signature": sig, "Content-Type": "application/json"})
+        assert r.status_code == 200
+        assert seen == ["u1"]
+
+
+# ---------------------------------------------------------------------------
+# BACKWARD-COMPAT pins — v0.5.2 must not change v0.5.1's wire-level keys
+# ---------------------------------------------------------------------------
+
+from ab0t_quota.auth_events import compose_credit_dedup_key
+
+
+class TestBackwardCompat:
+    """Pins for keys that the lib produces and ships to downstream systems
+    (Redis + billing-service). Changing these without coordination would
+    cause in-flight grants to double-fire (because billing wouldn't see
+    the prior idempotency key) and would re-grant credits on container
+    restart (because the Redis dedup flag wouldn't match)."""
+
+    def test_default_redis_flag_key_unchanged(self):
+        """Same as v0.5.1: `credit_granted:user:{user_id}:{tier_id}`."""
+        key = compose_credit_dedup_key(
+            "per_user_per_tier",
+            user_id="u1", org_id="o1", tier_id="free",
+        )
+        assert key == "credit_granted:user:u1:free"
+
+    def test_org_policy_key_shape(self):
+        key = compose_credit_dedup_key(
+            "per_org_per_tier", user_id="u1", org_id="o1", tier_id="free",
+        )
+        assert key == "credit_granted:org:o1:free"
+
+    def test_user_global_policy_key_shape(self):
+        key = compose_credit_dedup_key(
+            "per_user_global", user_id="u1", org_id="o1", tier_id="free",
+        )
+        assert key == "credit_granted:user:u1"
+
+    def test_org_global_policy_key_shape(self):
+        key = compose_credit_dedup_key(
+            "per_org_global", user_id="u1", org_id="o1", tier_id="free",
+        )
+        assert key == "credit_granted:org:o1"
+
+    def test_plain_handlers_still_dispatched(self):
+        """Handlers registered without @idempotent (v0.5.1-style) must
+        keep working when the receiver has a ledger_store wired."""
+        from ab0t_quota.handler_ledger import InMemoryLedgerStore
+        seen = []
+
+        @ae.on_auth_event("auth.user.registered")
+        async def plain_handler(event):
+            seen.append(event["data"]["user_id"])
+
+        app = FastAPI()
+        app.include_router(
+            ae.make_router(webhook_secret="s", ledger_store=InMemoryLedgerStore()),
+            prefix="/api/quotas",
+        )
+        body = json.dumps({"event_type": "auth.user.registered",
+                            "event_id": "evt_plain_bc",
+                            "data": {"user_id": "u1"}}).encode()
+        sig = hmac.new(b"s", body, hashlib.sha256).hexdigest()
+        r = TestClient(app).post("/api/quotas/_webhooks/auth", content=body,
+                                  headers={"X-Event-Signature": sig,
+                                            "Content-Type": "application/json"})
+        assert r.status_code == 200
+        assert seen == ["u1"]
+
+    def test_make_router_old_signature_still_works(self):
+        """v0.5.1 callers that don't pass ledger_store must keep working."""
+        router = ae.make_router(webhook_secret="s")  # no ledger_store kwarg
+        assert router is not None

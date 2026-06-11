@@ -343,6 +343,18 @@ class CreditGrant(BaseModel):
                     "destination field. Default false (avoid surprise wipes "
                     "during voluntary upgrades).",
     )
+    # v0.2.7 — controls how the lib's @idempotent default handler keys its
+    # business dedup. Different consumers want different semantics:
+    #   per_user_per_tier (default) — anti-farming, one credit per user per tier
+    #   per_org_per_tier            — B2B "credit per company per tier"
+    #   per_user_global             — strongest: one human, one credit, ever
+    #   per_org_global              — one org, one credit, ever
+    dedup: str = Field(
+        default="per_user_per_tier",
+        pattern=r"^(per_user_per_tier|per_org_per_tier|per_user_global|per_org_global)$",
+        description="Business-dedup policy for the lib's default credit-grant handler. "
+                    "See tickets/20260428_idempotency_replay_framework/TICKET.md.",
+    )
 
     @model_validator(mode="after")
     def _validate_rollover_cap(self) -> "CreditGrant":

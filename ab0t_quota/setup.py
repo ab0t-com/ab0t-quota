@@ -900,9 +900,20 @@ def _wire_paid_tier_sync(
     if webhook_secret:
         try:
             from . import auth_events as _ae
-            app.include_router(_ae.make_router(webhook_secret=webhook_secret),
-                               prefix=route_prefix + "/quotas")
-            logger.info("auth-event webhook mounted at %s/quotas/_webhooks/auth", route_prefix)
+            from .handler_ledger import auto_select_store
+
+            # Auto-select ledger backend: DDB > Redis > InMemory.
+            # Wires observability + idempotency for @idempotent handlers.
+            ddb_for_ledger = getattr(app.state, "ddb_client", None)
+            ledger_store = auto_select_store(redis=redis, ddb_client=ddb_for_ledger)
+            app.state.quota_handler_ledger = ledger_store
+
+            app.include_router(
+                _ae.make_router(webhook_secret=webhook_secret, ledger_store=ledger_store),
+                prefix=route_prefix + "/quotas",
+            )
+            logger.info("auth-event webhook mounted at %s/quotas/_webhooks/auth (ledger=%s)",
+                        route_prefix, type(ledger_store).__name__)
 
             # T11 — auto-register the default signup-credit handler.
             # Build the legacy initial_credits dict from tiers (back-compat

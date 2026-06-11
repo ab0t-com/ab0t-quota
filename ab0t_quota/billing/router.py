@@ -271,16 +271,16 @@ def create_billing_router(
             f"{prefix}/payments/invoices/{'{invoice_id}'}/pdf",
             tags=["Payments"],
             description=(
-                "Returns a 302 redirect with a `Location` header pointing at the "
-                "signed PDF URL on the upstream payment service. Clients should "
-                "follow the redirect to download the invoice PDF."
+                "Returns JSON `{url, expires_in}` where `url` is a short-lived signed "
+                "PDF URL (S3 pre-sign, or Stripe-hosted invoice_pdf for mirrored "
+                "subscription invoices). The browser GETs the signed URL directly — "
+                "no Authorization header needed on the signed URL itself."
             ),
-            responses={302: {"description": "Redirect to signed invoice PDF URL"}},
         )
         async def get_invoice_pdf(request: Request, invoice_id: str, user=Depends(auth_reader)):
             try:
                 url = await payment.get_invoice_pdf_url(user.org_id, invoice_id)
-                return RedirectResponse(url=url)
+                return {"url": url, "expires_in": 3600}
             except PaymentServiceError as e:
                 raise HTTPException(status_code=e.status_code, detail="Payment service error")
 

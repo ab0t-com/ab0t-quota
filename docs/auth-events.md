@@ -520,3 +520,140 @@ into other services:
 
 The registry, receiver, and auto-subscribe scale to all of these without
 changes — the lib is the bus, consumers plug in.
+
+---
+
+## Idempotency, replay, and observability (v0.5.2+)
+
+For handlers that have side effects on money or persistent state, the lib
+provides three layered guarantees via the `@idempotent` decorator and a
+pluggable LedgerStore.
+
+### The decorator
+
+```python
+from ab0t_quota.auth_events import on_auth_event, compose_credit_dedup_key
+from ab0t_quota.handler_ledger import idempotent
+
+@on_auth_event("auth.user.registered")
+@idempotent(
+    handler="grant_credit_on_signup",
+    key=lambda e: compose_credit_dedup_key(
+        "per_user_per_tier",
+        user_id=e["data"]["user_id"],
+        org_id=e["data"]["org_id"],
+        tier_id="free",
+    ),
+    # retry={"attempts": 3, "backoff": "exponential"} is the default.
+    # Pass retry=False to disable.
+)
+async def grant_credit_on_signup(event, ctx):
+    if await ctx.already_done():
+        return ctx.skip("credit already granted")
+    # ...your side effect
+    await ctx.mark_done(side_effect_id="txn_abc")
+    return ctx.success(side_effect_id="txn_abc")
+```
+
+What it does:
+
+1. **Delivery dedup.** Before running, checks `(handler, event_id)` in the
+   ledger. If a prior call succeeded, returns the cached outcome — handler
+   body never runs again.
+2. **Business dedup via `key`.** The `key` lambda composes a string the
+   consumer controls. `ctx.already_done()` / `ctx.mark_done()` use it.
+   Default policies via `compose_credit_dedup_key`:
+   - `per_user_per_tier` (default) — anti-farming, one credit per user per tier
+   - `per_org_per_tier` — B2B "one credit per org per tier"
+   - `per_user_global` — one human, one credit, ever
+   - `per_org_global` — one org, one credit, ever
+3. **Auto-retry.** Default 3 attempts with exponential backoff (1s, 2s, 4s,
+   max 30s). Fails permanently after max attempts. `retry=False` opts out.
+4. **Ledger persistence.** Every outcome (success / skipped / failed /
+   failed_permanent) is recorded with the event payload, so you can replay.
+
+### Configuring dedup in `quota-config.json`
+
+The default signup-credit handler honors `credit_grant.dedup` automatically:
+
+```jsonc
+{
+  "tier_id": "free",
+  "credit_grant": {
+    "trigger": "signup",
+    "amount_per_period": "10.00",
+    "destination": "credit_balance",
+    "dedup": "per_user_per_tier"
+  }
+}
+```
+
+### Storage — auto-selected at startup
+
+| Backend | When picked | Retention |
+|---|---|---|
+| `DDBLedgerStore` | DDB available (set `app.state.ddb_client` before `setup_quota`) | 90 days |
+| `RedisLedgerStore` | Redis available | 72 hours |
+| `InMemoryLedgerStore` | Neither — logs loud warning | session only |
+
+Consumer can override: `setup_quota(app, ledger_store=MyStore())`.
+
+### Operator CLI
+
+```bash
+# What happened?
+python -m ab0t_quota events --user-id u123
+python -m ab0t_quota events --status failed --since 1h
+python -m ab0t_quota events --status failed_permanent --since 24h --format json
+
+# Run it again (from the stored event payload)
+python -m ab0t_quota replay --handler grant_credit_on_signup --event-id evt_xxx
+
+# Synthesize events for users who pre-existed the handler
+python -m ab0t_quota backfill \
+  --handler grant_credit_on_signup \
+  --user-ids u1,u2,u3 \
+  --org-id <end-users-org-id>
+
+# GDPR cascade
+python -m ab0t_quota delete-user --user-id u123 --confirm
+```
+
+Env vars the CLI reads:
+- `AB0T_QUOTA_DDB_TABLE` — DDB table name (preferred if set)
+- `QUOTA_REDIS_URL` or `REDIS_URL` — Redis URL (fallback)
+- `AB0T_AUTH_WEBHOOK_PUBLIC_URL` + `AB0T_AUTH_WEBHOOK_SECRET` — for replay/backfill
+
+### Migration from plain `@on_auth_event` (v0.5.1 and earlier)
+
+Adding `@idempotent` changes the handler signature — adds a `ctx` arg:
+
+```python
+# Before (v0.5.1):
+@on_auth_event("auth.user.registered")
+async def handler(event):
+    ...
+
+# After (v0.5.2):
+@on_auth_event("auth.user.registered")
+@idempotent(handler="my_handler")
+async def handler(event, ctx):
+    ...
+```
+
+Plain handlers (no `@idempotent`) keep working as before — opt in handler
+by handler. The lib's default signup-credit handler stays plain; only
+consumers adopting `@idempotent` see the change.
+
+### When NOT to use `@idempotent`
+
+- **High-volume events** like `auth.api_key.used` or `auth.token.refreshed`.
+  Ledger row per event would explode storage. Use a plain handler with
+  in-memory aggregation instead.
+- **Strictly one-shot effects** with their own external idempotency (e.g.
+  a Stripe call with its own `Idempotency-Key`). The `@idempotent` is
+  defense in depth; if you're confident in the downstream's dedup, you
+  can skip it.
+- **Events you want auth to retry on failure.** `@idempotent` always
+  returns 200; auth never sees the failure. If you want auth-side retry,
+  write a plain handler that re-raises on failure.

@@ -125,7 +125,7 @@ def verify_hmac(body: bytes, signature: Optional[str], secret: str) -> bool:
 # Webhook receiver
 # ---------------------------------------------------------------------------
 
-def make_router(*, webhook_secret: str) -> APIRouter:
+def make_router(*, webhook_secret: str, ledger_store: Any = None) -> APIRouter:
     """Build the webhook receiver router. Mounted by setup_quota under
     the consumer's `/api/quotas` prefix.
 
@@ -136,6 +136,9 @@ def make_router(*, webhook_secret: str) -> APIRouter:
       - 200 with `{"status": "ok", "ran": N}` after dispatching.
       - Handler exceptions are logged but never bubble out — auth needs
         a 200 to mark the event delivered, otherwise it'll retry forever.
+
+    Handlers decorated with `@idempotent` get delivery dedup + ledger
+    persistence + auto-retry. Plain handlers run as before.
     """
     router = APIRouter()
 
@@ -163,7 +166,7 @@ def make_router(*, webhook_secret: str) -> APIRouter:
         ran = 0
         for h in handlers:
             try:
-                await h(payload)
+                await _dispatch_handler(h, payload, ledger_store)
                 ran += 1
             except Exception as e:
                 logger.warning("auth-event handler %s for %s failed: %s",
@@ -171,6 +174,110 @@ def make_router(*, webhook_secret: str) -> APIRouter:
         return {"status": "ok", "ran": ran, "event_type": event_type}
 
     return router
+
+
+async def _dispatch_handler(handler, event: dict, ledger_store: Any) -> None:
+    """Dispatch one handler. Wraps with @idempotent machinery if applicable;
+    otherwise calls the handler directly (v0.2.6 behavior).
+    """
+    from .handler_ledger import (
+        is_idempotent_handler, idempotent_config, HandlerContext,
+        SkipOutcome, SuccessOutcome, LedgerStatus, InMemoryLedgerStore,
+    )
+
+    if not is_idempotent_handler(handler):
+        # Plain handler — call directly (v0.2.6 compatibility)
+        await handler(event)
+        return
+
+    cfg = idempotent_config(handler)
+    store = ledger_store or InMemoryLedgerStore()
+    handler_name = cfg["handler_name"]
+    event_id = event.get("event_id") or event.get("id") or _content_hash(event)
+    event_type = event.get("event_type") or event.get("type") or ""
+    user_id = (event.get("data") or {}).get("user_id") or event.get("user_id")
+    org_id = (event.get("data") or {}).get("org_id") or event.get("org_id")
+
+    # Delivery dedup — check if we've already processed this event
+    attempt = await store.record_attempt(
+        handler_name=handler_name, event_id=event_id, event_type=event_type,
+        event_payload=event, user_id=user_id, org_id=org_id,
+        lease_seconds=cfg.get("lease_seconds", 60),
+    )
+    if not attempt.proceed:
+        logger.info("handler %s already processed event %s (status=%s) — skipping",
+                    handler_name, event_id, attempt.cached_row.status.value if attempt.cached_row else "?")
+        return
+
+    # Build context with the business dedup key
+    dedup_key = None
+    key_fn = cfg.get("key_fn")
+    if key_fn is not None:
+        try:
+            dedup_key = key_fn(event)
+        except Exception as e:
+            logger.warning("handler %s: key function raised %s; running without business dedup",
+                           handler_name, e)
+    ctx = HandlerContext(handler_name, event_id, event_type, event, store, _dedup_key=dedup_key)
+
+    # Run with retry
+    await _run_with_retry(handler, event, ctx, cfg, store, handler_name, event_id)
+
+
+async def _run_with_retry(handler, event, ctx, cfg, store, handler_name, event_id) -> None:
+    """Execute handler with retry policy. Records final outcome to ledger."""
+    from .handler_ledger import SkipOutcome, SuccessOutcome, LedgerStatus
+
+    retry = cfg.get("retry")
+    max_attempts = retry["attempts"] if retry else 1
+    initial = retry["initial_seconds"] if retry else 1.0
+    max_delay = retry["max_seconds"] if retry else 30.0
+    last_error: Optional[str] = None
+
+    for attempt_num in range(1, max_attempts + 1):
+        try:
+            outcome = await handler(event, ctx)
+            if isinstance(outcome, SkipOutcome):
+                await store.record_outcome(
+                    handler_name=handler_name, event_id=event_id,
+                    status=LedgerStatus.SKIPPED, reason=outcome.reason,
+                    attempts=attempt_num,
+                )
+            elif isinstance(outcome, SuccessOutcome):
+                await store.record_outcome(
+                    handler_name=handler_name, event_id=event_id,
+                    status=LedgerStatus.SUCCESS, side_effect_id=outcome.side_effect_id,
+                    attempts=attempt_num,
+                )
+            else:
+                # Handler returned nothing → treat as success without side_effect_id
+                await store.record_outcome(
+                    handler_name=handler_name, event_id=event_id,
+                    status=LedgerStatus.SUCCESS, attempts=attempt_num,
+                )
+            return  # success, exit retry loop
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            logger.warning("handler %s attempt %d/%d failed: %s",
+                           handler_name, attempt_num, max_attempts, last_error)
+            if attempt_num < max_attempts:
+                delay = min(initial * (2 ** (attempt_num - 1)), max_delay)
+                await asyncio.sleep(delay)
+                # Re-record_attempt to bump the lease (in case of long retries)
+                # but DON'T short-circuit on cached row — we're inside the retry loop
+                continue
+
+    # All attempts failed
+    await store.record_outcome(
+        handler_name=handler_name, event_id=event_id,
+        status=LedgerStatus.FAILED_PERMANENT, error=last_error,
+        attempts=max_attempts,
+    )
+
+
+def _content_hash(event: dict) -> str:
+    """Stable hash of event payload for events without an event_id."""
+    return hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest()[:32]
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +459,34 @@ async def resolve_billing_org(
     return resolved
 
 
+def compose_credit_dedup_key(
+    policy: str,
+    *,
+    user_id: str,
+    org_id: str,
+    tier_id: str,
+    prefix: str = "credit_granted",
+) -> str:
+    """Build a business-dedup key for credit grants per the policy.
+
+    Used by the lib's default handler and exposed for consumer custom
+    handlers that want to share the same dedup semantics. Policies:
+
+      per_user_per_tier (default) — anti-farming, one credit per (user, tier)
+      per_org_per_tier            — B2B "one credit per (org, tier)"
+      per_user_global             — one human, one credit, ever
+      per_org_global              — one org, one credit, ever
+    """
+    if policy == "per_org_per_tier":
+        return f"{prefix}:org:{org_id}:{tier_id}"
+    if policy == "per_user_global":
+        return f"{prefix}:user:{user_id}"
+    if policy == "per_org_global":
+        return f"{prefix}:org:{org_id}"
+    # default + explicit per_user_per_tier
+    return f"{prefix}:user:{user_id}:{tier_id}"
+
+
 async def grant_initial_credit_for_user(
     user_id: str,
     org_id: str,
@@ -415,14 +550,32 @@ async def grant_initial_credit_for_user(
     if not amount:
         return
 
-    flag_key = f"credit_granted:user:{user_id}:{tier_id}"
+    # v0.5.2 — dedup key composition honors tier.credit_grant.dedup field
+    # if the new schema is in use. Legacy path keeps per_user_per_tier.
+    dedup_policy = "per_user_per_tier"
+    if tier_grant is not None:
+        dedup_policy = getattr(tier_grant, "dedup", "per_user_per_tier")
+    flag_key = compose_credit_dedup_key(dedup_policy, user_id=user_id, org_id=org_id, tier_id=tier_id)
     try:
         if await redis.get(flag_key):
             return
     except Exception:
         pass  # rely on billing's own idempotency if redis check fails
 
-    idempotency_key = f"user:{user_id}:initial_credit:{tier_id}"
+    # BACKWARD-COMPAT (v0.5.1 and earlier): billing's idempotency_key was
+    # always `user:{user_id}:initial_credit:{tier_id}`. Keep that shape for
+    # the default policy so in-flight grants stay aligned with billing's
+    # idempotency records. Only diverge when a non-default policy is set.
+    if dedup_policy == "per_user_per_tier":
+        idempotency_key = f"user:{user_id}:initial_credit:{tier_id}"
+    elif dedup_policy == "per_org_per_tier":
+        idempotency_key = f"org:{org_id}:initial_credit:{tier_id}"
+    elif dedup_policy == "per_user_global":
+        idempotency_key = f"user:{user_id}:initial_credit"
+    elif dedup_policy == "per_org_global":
+        idempotency_key = f"org:{org_id}:initial_credit"
+    else:
+        idempotency_key = f"user:{user_id}:initial_credit:{tier_id}"  # safe fallback
 
     # Choose the billing-service endpoint based on destination. The legacy
     # `/promotional-credit` endpoint always writes to credit_balance; the
