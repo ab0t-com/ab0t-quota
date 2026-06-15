@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # =========================================================================
@@ -130,12 +130,77 @@ class TierChangeResponse(BaseModel):
 
 
 class PromotionalCreditResponse(BaseModel):
+    """Client model for POST /billing/{org}/promotional-credit.
+
+    Billing's actual response model is `UpdateBalanceResponse`
+    (billing/output/app/models/billing.py:646), whose money fields are
+    `Decimal`. FastAPI serializes Decimal to a JSON *number* (e.g. 5.0), so
+    the wire shape for old_balance/new_balance/available_balance is numeric,
+    not a string. Pydantic v2 will NOT coerce a float into a `str` field
+    (raises ValidationError), so we keep the decimal-as-string external
+    contract for downstream consumers but accept the numeric wire form via a
+    before-validator. extra="allow" already passes billing's additional
+    fields (amount, operation, ...) through untouched."""
     org_id: str = Field(..., description="Organization ID")
     old_balance: str = Field(default="0.00", description="Credit balance before")
     new_balance: str = Field(default="0.00", description="Credit balance after")
     available_balance: str = Field(default="0.00", description="Total available balance")
     payment_id: str = Field(default="", description="Idempotent reference (promo:{key})")
     model_config = {"extra": "allow"}
+
+    @field_validator("old_balance", "new_balance", "available_balance", mode="before")
+    @classmethod
+    def _money_to_str(cls, v):
+        # Billing emits these as JSON numbers (Decimal -> float). Normalise to
+        # the decimal-as-string contract; leave strings/None untouched.
+        if v is None:
+            return v
+        if isinstance(v, (int, float)):
+            return str(v)
+        return v
+
+
+# =========================================================================
+# Billing Service REQUEST models  (mirror billing/output/app/models/billing.py)
+# =========================================================================
+
+class UsageMetadata(BaseModel):
+    """Open analytics channel for usage rows. Holds per-event dimensions
+    (action, resource id, instance_type, tier, ...). NEVER secrets/tokens."""
+    action: Optional[str] = None
+    sandbox_id: Optional[str] = None
+    container_id: Optional[str] = None
+    allocation_id: Optional[str] = None
+    instance_type: Optional[str] = None
+    instance_tier: Optional[str] = None
+    container_type: Optional[str] = None
+    hourly_cost: Optional[str] = None
+    from_pool: Optional[bool] = None
+    model_config = {"extra": "forbid"}
+
+
+class RecordUsageRequest(BaseModel):
+    """Typed request for POST /billing/usage/{org_id}/. Mirrors billing's
+    canonical RecordUsageRequest. resource_type is OPEN (public mesh).
+    NOTE: billing's model is extra="ignore" — unknown TOP-LEVEL fields are
+    DROPPED server-side. The only open channel that propagates is `metadata`.
+    Omitting cost/platform_fee routes the row to billing's PRICED branch
+    (MINIMUM_USAGE_COST + balance debit); for metering use record_resource_usage."""
+    org_id: str
+    user_id: str
+    tool_id: str
+    session_id: str
+    request_id: Optional[str] = None
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    compute_time: float = Field(default=0, ge=0)
+    resource_type: str = "cpu"
+    reservation_id: Optional[str] = None
+    cost: Optional[str] = None
+    platform_fee: Optional[str] = None
+    timestamp: Optional[str] = None
+    metadata: dict = Field(default_factory=dict)
+    model_config = {"extra": "forbid"}
 
 
 # =========================================================================

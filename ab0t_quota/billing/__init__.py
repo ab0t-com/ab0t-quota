@@ -22,6 +22,7 @@ Requires: pip install ab0t-quota[billing]
 from __future__ import annotations
 
 from .clients import PaymentServiceClient, PaymentServiceError, BillingServiceClient, BillingServiceError
+from .models import RecordUsageRequest, UsageMetadata
 from .lifecycle import LifecycleEmitter
 from .budget import BudgetChecker
 from .heartbeat import HeartbeatMonitor
@@ -50,6 +51,8 @@ __all__ = [
     "PaymentServiceError",
     "BillingServiceClient",
     "BillingServiceError",
+    "RecordUsageRequest",
+    "UsageMetadata",
     "LifecycleEmitter",
     "BudgetChecker",
     "HeartbeatMonitor",

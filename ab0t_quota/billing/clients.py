@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Optional
+from uuid import uuid4
 
 import httpx
 
 from .models import (
+    RecordUsageRequest,
+    UsageMetadata,
     BillingBalanceResponse,
     BillingTransactionsResponse,
     BillingUsageRecordsResponse,
@@ -329,25 +332,78 @@ class BillingServiceClient:
         data = await self._request("PUT", f"/billing/{org_id}/tier", json={"tier_id": tier_id, "reason": reason})
         return TierChangeResponse.model_validate(data)
 
-    async def record_usage(self, payload: dict) -> dict:
-        """Record a usage event in billing. Caller-supplied payload must
-        include `org_id`; the org_id from the payload is used in the URL
-        so callers don't have to pass it twice.
+    async def record_usage(self, payload: "RecordUsageRequest | dict") -> dict:
+        """Record a usage event in billing. Accepts a typed RecordUsageRequest
+        (the typed path) or a raw dict (the legacy back-compat path). org_id is
+        read from the body and used in the URL so callers don't pass it twice.
 
         Billing's contract: POST /billing/usage/{org_id}/ with body =
-        RecordUsageRequest (org_id, user_id, resource_type, action, ...
-        plus arbitrary extras).
+        RecordUsageRequest (org_id, user_id, tool_id, session_id, request_id,
+        resource_type, reservation_id, cost, platform_fee, metadata). NOTE:
+        billing has NO top-level `action` field — `action` lives in metadata,
+        and billing IGNORES unknown top-level fields (metadata is the only
+        propagating open channel). Omitting cost/platform_fee is the PRICED
+        path (MINIMUM_USAGE_COST + balance debit); for metering rows use
+        record_resource_usage which forces cost="0"/platform_fee="0".
+
+        A RecordUsageRequest is dumped with exclude_none=True. A raw dict is
+        passed through UNCHANGED (legacy back-compat — deprecated; migrate to
+        the typed path / record_resource_usage). Legacy dicts are NOT validated
+        through the forbid model so existing callers that send extra top-level
+        keys do not start failing.
         """
-        org_id = payload.get("org_id")
+        if isinstance(payload, RecordUsageRequest):
+            body = payload.model_dump(exclude_none=True)
+        else:
+            body = payload
+        org_id = body.get("org_id")
         if not org_id:
             raise BillingServiceError(400, "record_usage payload missing org_id")
         try:
-            return await self._request("POST", f"/billing/usage/{org_id}/", json=payload)
+            return await self._request("POST", f"/billing/usage/{org_id}/", json=body)
         except BillingServiceError:
             # Best-effort: usage recording failures must not crash the
             # caller's primary path. Log + return.
             logger.warning("record_usage failed for org=%s", org_id)
             return {}
+
+    async def record_resource_usage(
+        self, org_id: str, user_id: str, *,
+        resource_type: str = "compute",
+        session_id: str = "",
+        reservation_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        tool_id: str = "sandbox-platform",
+        metadata: Optional[dict] = None,
+        cost: str = "0",
+        platform_fee: str = "0",
+        compute_time: float = 0.0,
+    ) -> dict:
+        """Record a metering/analytics usage row for an infra resource.
+
+        This is the METERING path, NOT the money path. The actual charge is the
+        reserve -> commit proration done by billing's lifecycle consumer at
+        stop/delete. To avoid double-charging / cost fabrication, this row MUST
+        send cost="0" + platform_fee="0" + reservation_id (see ticket
+        20260615_inter_service_contract_drift, WORKFLOW_FINDINGS section 2).
+        These defaults are baked in here so a metering caller can never enter
+        billing's priced branch (MINIMUM_USAGE_COST floor + balance debit).
+
+        resource_type is an OPEN string (public mesh). action + descriptive
+        dimensions go in the metadata channel via UsageMetadata; never put a
+        session token in session_id. Best-effort: returns {} on billing error.
+        """
+        req = RecordUsageRequest(
+            org_id=org_id, user_id=user_id, tool_id=tool_id,
+            session_id=session_id,
+            request_id=request_id or f"sbx-{uuid4().hex[:12]}",
+            resource_type=resource_type,
+            reservation_id=reservation_id,
+            cost=cost, platform_fee=platform_fee,
+            compute_time=compute_time,
+            metadata=(metadata if isinstance(metadata, dict) else {}),
+        )
+        return await self.record_usage(req)
 
     async def apply_promotional_credit(
         self, org_id: str, amount: float,
@@ -442,9 +498,18 @@ class BillingServiceClient:
     async def reserve_funds(
         self, org_id: str, user_id: str, estimated_cost: str,
         tool_id: str = "default", session_id: str = "",
-        operation_type: str = "compute", metadata: Optional[dict] = None,
+        operation_type: str = "api_call", metadata: Optional[dict] = None,
     ) -> Optional[str]:
-        """Reserve funds before provisioning. Returns reservation_id or None on 402."""
+        """Reserve funds before provisioning. Returns reservation_id or None on 402.
+
+        operation_type default aligns with billing's ReservationRequest default
+        (billing/output/app/models/billing.py:218 -> "api_call"). The client
+        always sends operation_type on the wire, so billing never applies its
+        own default; matching the defaults keeps callers that rely on the
+        default sending the value billing's contract would have chosen (it also
+        feeds billing's fallback idempotency fingerprint). Pass an explicit
+        value (e.g. the resource_type) to categorise the reservation.
+        """
         try:
             data = await self._request("POST", f"/billing/{org_id}/reserve", json={
                 "org_id": org_id, "user_id": user_id, "tool_id": tool_id,
