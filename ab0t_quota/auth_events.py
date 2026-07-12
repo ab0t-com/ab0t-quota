@@ -64,6 +64,36 @@ SUBSCRIPTION_NAME = "ab0t-quota-credit-grant"
 Handler = Callable[[dict], Awaitable[None]]
 _HANDLERS: dict[str, list[Handler]] = {}
 
+# Shared fallback ledger store (QC-05). When a consumer mounts make_router with
+# no ledger_store, dispatch must NOT mint a fresh InMemoryLedgerStore per call
+# (which makes delivery dedup a silent no-op). It gets ONE process-wide store and
+# a loud one-time warning instead.
+_fallback_ledger_store: Any = None
+_fallback_ledger_warned: bool = False
+
+
+def _get_fallback_ledger_store() -> Any:
+    global _fallback_ledger_store, _fallback_ledger_warned
+    from .handler_ledger import InMemoryLedgerStore
+    if _fallback_ledger_store is None:
+        _fallback_ledger_store = InMemoryLedgerStore()
+    if not _fallback_ledger_warned:
+        logger.warning(
+            "auth-event dispatch has NO persistent ledger store — falling back to a "
+            "SHARED in-process InMemoryLedgerStore. Delivery dedup / retry / replay "
+            "work within this process only and are LOST on restart or across replicas. "
+            "Pass ledger_store=... (setup_quota wires one automatically) to fix. (QC-05)"
+        )
+        _fallback_ledger_warned = True
+    return _fallback_ledger_store
+
+
+def _reset_fallback_ledger_store() -> None:
+    """Test hook: drop the shared fallback so a test starts from a clean slate."""
+    global _fallback_ledger_store, _fallback_ledger_warned
+    _fallback_ledger_store = None
+    _fallback_ledger_warned = False
+
 
 def register_handler(event_type: str, handler: Handler) -> Handler:
     """Register a coroutine handler for an auth event type.
@@ -191,7 +221,9 @@ async def _dispatch_handler(handler, event: dict, ledger_store: Any) -> None:
         return
 
     cfg = idempotent_config(handler)
-    store = ledger_store or InMemoryLedgerStore()
+    # QC-05: never mint a per-dispatch InMemoryLedgerStore — that makes delivery
+    # dedup a silent no-op. Use the shared, loudly-warned fallback instead.
+    store = ledger_store or _get_fallback_ledger_store()
     handler_name = cfg["handler_name"]
     event_id = event.get("event_id") or event.get("id") or _content_hash(event)
     event_type = event.get("event_type") or event.get("type") or ""
@@ -273,6 +305,45 @@ async def _run_with_retry(handler, event, ctx, cfg, store, handler_name, event_i
         status=LedgerStatus.FAILED_PERMANENT, error=last_error,
         attempts=max_attempts,
     )
+
+
+async def redispatch_stale_row(row, ledger_store) -> None:
+    """D1 / QC-02 — re-drive a RECLAIMED stale-lease row (a handler that crashed
+    mid-delivery). The StaleLeaseSweeper's ``_drain_stale`` has ALREADY atomically
+    re-claimed the lease (a fresh ``record_attempt``), so this does NOT record a
+    new attempt — it reconstructs the handler context and re-runs the business
+    handler, recording the final outcome via ``_run_with_retry``.
+
+    Re-running is SAFE by construction: an ``@idempotent`` handler's business dedup
+    (``already_done``/``mark_done`` via ``key_fn``) makes a completed grant a no-op
+    on replay, so a crash BEFORE the grant recovers it and a crash AFTER (but before
+    the outcome was recorded) does not double-grant. If no handler is registered for
+    the row, it is logged LOUD and left in_progress (the operator must register it —
+    silently dropping it would re-hide the guarantee)."""
+    from .handler_ledger import is_idempotent_handler, idempotent_config, HandlerContext
+    event = row.event_payload or {}
+    for h in _HANDLERS.get(row.event_type, []):
+        if not is_idempotent_handler(h):
+            continue
+        cfg = idempotent_config(h)
+        if cfg.get("handler_name") != row.handler_name:
+            continue
+        dedup_key = None
+        key_fn = cfg.get("key_fn")
+        if key_fn is not None:
+            try:
+                dedup_key = key_fn(event)
+            except Exception as e:
+                logger.warning("stale redispatch %s: key fn raised %s; running without "
+                               "business dedup", row.handler_name, e)
+        ctx = HandlerContext(row.handler_name, row.event_id, row.event_type, event,
+                             ledger_store, _dedup_key=dedup_key)
+        await _run_with_retry(h, event, ctx, cfg, ledger_store, row.handler_name, row.event_id)
+        return
+    logger.error("stale_lease_redispatch: NO registered handler '%s' for event_type '%s' — "
+                 "cannot recover stranded row event_id=%s (it stays in_progress). Register "
+                 "the handler, or the grant stays stranded (QC-02).",
+                 row.handler_name, row.event_type, row.event_id)
 
 
 def _content_hash(event: dict) -> str:
@@ -497,6 +568,7 @@ async def grant_initial_credit_for_user(
     billing_url: str,
     billing_api_key: str,
     tier_registry: Optional[dict[str, Any]] = None,
+    ledger_store: Any = None,
 ) -> None:
     """Grant the configured signup credit for the user's tier, idempotently.
 
@@ -577,6 +649,24 @@ async def grant_initial_credit_for_user(
     else:
         idempotency_key = f"user:{user_id}:initial_credit:{tier_id}"  # safe fallback
 
+    # Durable dedup via the @idempotent ledger (D-13 / R2). The Redis flag above
+    # is a fast path only; it is volatile (flush / TTL / failover). The ledger's
+    # business-dedup rows have NO TTL, so a redelivery at ANY latency — past the
+    # 30-day flag, past billing's 24h window, after a Redis loss — is a no-op
+    # here instead of a double credit. Uses the shared fallback store when the
+    # caller supplies none (P1.8), so the durable check always runs.
+    store = ledger_store or _get_fallback_ledger_store()
+    try:
+        if await store.already_done(dedup_key=idempotency_key):
+            logger.info("credit grant already recorded (durable ledger) user=%s org=%s key=%s",
+                        user_id, org_id, idempotency_key)
+            return
+    except Exception as e:
+        # A ledger read error must not fail OPEN into a double grant silently;
+        # log and fall through — billing's own idempotency + the Redis flag are
+        # the remaining backstops.
+        logger.warning("credit grant durable dedup check failed user=%s err=%s", user_id, e)
+
     # Choose the billing-service endpoint based on destination. The legacy
     # `/promotional-credit` endpoint always writes to credit_balance; the
     # new `/apply-credit-grant` endpoint honors the destination + lifecycle.
@@ -614,14 +704,40 @@ async def grant_initial_credit_for_user(
                 headers={"X-API-Key": billing_api_key, "Content-Type": "application/json"},
                 json=body,
             )
-            if resp.status_code in (200, 400):
+            if resp.status_code in (200, 201):
+                # Mark granted. For "one credit EVER" (*_global) policies the
+                # guard must be DURABLE — a 30-day TTL would let a later
+                # redelivery re-grant after the flag expires (QC-04 / D-13).
                 try:
-                    await redis.set(flag_key, "1", ex=86400 * 30)
+                    if dedup_policy in ("per_user_global", "per_org_global"):
+                        await redis.set(flag_key, "1")            # no expiry
+                    else:
+                        await redis.set(flag_key, "1", ex=86400 * 30)
                 except Exception:
                     pass
+                # Durable, no-TTL record in the ledger (D-13 / R2) so a later
+                # redelivery is deduped even after the Redis flag is gone.
+                try:
+                    await store.mark_done(
+                        dedup_key=idempotency_key,
+                        source_handler="grant_initial_credit",
+                        source_event_id=idempotency_key,
+                    )
+                except Exception as e:
+                    logger.warning("credit grant durable dedup mark failed user=%s err=%s", user_id, e)
                 logger.info(
                     "credit granted user=%s org=%s tier=%s amount=%s destination=%s",
                     user_id, org_id, tier_id, amount, destination,
+                )
+            elif resp.status_code == 400:
+                # D-13 / QC-04: a 400 is a validation / permanent-request failure,
+                # NOT a success. Do NOT set the dedup flag — doing so permanently
+                # suppresses a corrected redelivery. Log loudly; this is a
+                # request/config bug to fix, then redeliver.
+                logger.error(
+                    "credit grant REJECTED (400) user=%s org=%s tier=%s body=%s — "
+                    "grant NOT recorded; fix the request/config and redeliver",
+                    user_id, org_id, tier_id, resp.text[:200],
                 )
             else:
                 logger.warning("credit grant unexpected status=%s body=%s",

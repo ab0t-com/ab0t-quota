@@ -6,7 +6,23 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from ..models.core import ResetPeriod
-from .base import Counter
+from .base import Counter, finite_magnitude
+
+_IDEM_TTL = 86400
+
+# Atomic claim + INCRBYFLOAT + EXPIRE (QI-01 for the accumulator).
+#   KEYS[1]=idem, KEYS[2]=acc
+#   ARGV[1]=delta, ARGV[2]=idem_ttl, ARGV[3]=has_idem, ARGV[4]=period_ttl (0=none)
+_ACC_INCR = """
+if ARGV[3] == '1' then
+  if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
+    local c = redis.call('GET', KEYS[2]); if c then return c else return '0' end
+  end
+end
+local v = redis.call('INCRBYFLOAT', KEYS[2], ARGV[1])
+if tonumber(ARGV[4]) > 0 then redis.call('EXPIRE', KEYS[2], ARGV[4]) end
+return v
+"""
 
 
 class AccumulatorCounter(Counter):
@@ -58,13 +74,26 @@ class AccumulatorCounter(Counter):
         return float(val) if val else 0.0
 
     async def increment(self, delta: float, idempotency_key: Optional[str] = None) -> float:
-        if idempotency_key and not await self._claim_idempotency(idempotency_key):
-            return await self.get()
-        new_val = await self._redis.incrbyfloat(self._redis_key, delta)
-        ttl = self._period_ttl_seconds()
-        if ttl > 0:
-            await self._redis.expire(self._redis_key, ttl)
-        return float(new_val)
+        """Claim the idempotency key, add to the period total, and (re)set the
+        period expiry — all in one atomic Lua script (QI-01). A crash can no
+        longer claim the key without applying the increment.
+
+        W-T3/ET-02 (D-31): the delta is a MAGNITUDE (|delta|), validated
+        finite BEFORE the Lua. Pre-fix, increment(-4) silently ERASED 4 units
+        of period spend — on the counter class whose own decrement() raises
+        "cannot be decremented". A sign flip must never invert the op."""
+        delta = finite_magnitude(delta)
+        has_idem = "1" if idempotency_key else "0"
+        idem_key = (
+            f"{self._key_prefix}:idem:{idempotency_key}" if idempotency_key
+            else f"{self._key_prefix}:idem:__unused__"
+        )
+        result = await self._redis.eval(
+            _ACC_INCR, 2,
+            idem_key, self._redis_key,
+            delta, _IDEM_TTL, has_idem, self._period_ttl_seconds(),
+        )
+        return float(result)
 
     async def decrement(self, delta: float, idempotency_key: Optional[str] = None) -> float:
         raise TypeError("Accumulator counters cannot be decremented — they reset on period boundary")

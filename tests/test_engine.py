@@ -463,13 +463,19 @@ class TestResourceBundles:
         assert "thing.a" not in result.denied_resources  # only b is at limit
 
     @pytest.mark.asyncio
-    async def test_unknown_bundle_is_no_op_allow(self, redis):
-        """Library doesn't know consumer-specific bundle names; unknown → allow."""
+    async def test_unknown_bundle_denies_in_enforce_mode(self, redis):
+        """CONTRACT CHANGED by DECISIONS D-14 (ticket 20260709): an undeclared
+        bundle name is a config error (usually a typo), NOT a free pass. In
+        enforce mode (default enforcement) it must DENY and log loudly, so a typo
+        surfaces in seconds instead of silently disabling enforcement. (The prior
+        `test_unknown_bundle_is_no_op_allow` asserted the old fail-open behaviour
+        this decision overturns.) Shadow mode / unknown_bundle=allow_warn relaxes
+        it to allow+warn — covered in the ticket's config-knob suite."""
         engine = self._engine_with_bundles(redis)
         result = await engine.check_for_bundle("org-1", "definitely-not-declared")
-        assert result.allowed is True
+        assert result.allowed is False
         assert result.results == []
-        assert result.denied_resources == []
+        assert result.denied_resources == ["definitely-not-declared"]
 
     @pytest.mark.asyncio
     async def test_increment_for_bundle_bumps_all(self, redis):

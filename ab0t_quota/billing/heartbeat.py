@@ -1,27 +1,37 @@
 """Generic heartbeat monitor for resource health tracking.
 
-Detects resources that stopped sending heartbeats (crash, network issue)
-and emits synthetic lifecycle events for billing proration.
+.. deprecated::
+    **DEPRECATED / SUPERSEDED (D-67, ticket 20260709 — QB-04).** Use the
+    ``observed_usage_provider`` seam + the library reconciler (D-33) instead.
 
-Usage:
-    from ab0t_quota.billing.heartbeat import HeartbeatMonitor
+    Heartbeats are a consumer-PUSHED liveness model: the consumer must call
+    ``record()`` on every tick, and a *crashed* process cannot push its own "I'm
+    dead" heartbeat. The ``observed_usage_provider`` is a provider-PULLED model —
+    the library asks the consumer's product store "what is actually live?" — which
+    reads the world regardless of any process crashing, and is the authoritative
+    existence signal under D-33. ``engine.stale_open_activations`` (surfaced from
+    the reconciler pass) is the "open too long" alarm. Together they subsume this
+    monitor's job with a stronger guarantee.
 
+    This monitor is now **disabled by default** (``heartbeat.enabled`` in the
+    config; default ``false``) so no deployment carries an unfed, dormant loop that
+    creates false confidence. If a consumer explicitly enables it, it becomes a
+    REQUIRED, visible loop (D-66) and a *configured-but-unfed* monitor degrades
+    ``/quota/health`` — "you turned it on and never fed it" is loud, not silent.
+    It is NOT removed (D-65: public API on a shipped library; removal needs owner
+    sign-off).
+
+Usage (deprecated — prefer observed_usage_provider):
     monitor = HeartbeatMonitor(redis=redis_client, emitter=lifecycle_emitter)
     asyncio.create_task(monitor.start())
-
-    # Record heartbeats from your cost tracker:
-    await monitor.record("resource_123", {
-        "org_id": "org_1", "user_id": "user_1",
-        "reservation_id": "res_1", "hourly_rate": "0.10",
-        "allocation_fee": "0.01", "started_at": "2026-04-02T10:00:00Z",
-        "resource_type": "browser",
-    })
+    await monitor.record("resource_123", {...})
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import warnings
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -50,6 +60,16 @@ class HeartbeatMonitor:
         key_prefix: str = "heartbeat:",
         key_ttl_seconds: int = 1800,
     ):
+        warnings.warn(
+            "HeartbeatMonitor is DEPRECATED and superseded by the "
+            "observed_usage_provider seam + the library reconciler (D-33): "
+            "provider-PULLED existence truth is more reliable than consumer-PUSHED "
+            "heartbeats (a crashed process cannot heartbeat). Use "
+            "setup_quota(observed_usage_provider=...) plus stale_open_activations "
+            "for the 'open too long' alarm. Disabled by default (heartbeat.enabled); "
+            "removal pending owner sign-off (D-65).",
+            DeprecationWarning, stacklevel=2,
+        )
         self.redis = redis
         self.emitter = emitter
         self.stale_threshold = stale_threshold_seconds
@@ -57,6 +77,10 @@ class HeartbeatMonitor:
         self.prefix = key_prefix
         self.ttl = key_ttl_seconds
         self._running = False
+        # D-67 refuse-gate: track whether a heartbeat was EVER recorded. A monitor
+        # that a consumer opted into but never feeds is a misconfiguration (crashes
+        # go undetected → usage unbilled), surfaced by monitor_liveness().
+        self._ever_fed = False
 
     async def start(self):
         """Start the monitor loop. Run as asyncio.create_task()."""
@@ -75,8 +99,20 @@ class HeartbeatMonitor:
     def stop(self):
         self._running = False
 
+    def monitor_liveness(self) -> tuple:
+        """D-67 refuse-gate. A monitor a consumer OPTED INTO but never fed is a
+        misconfiguration: crashes go undetected → runtime never settled. Returns
+        (healthy, detail). Healthy once a heartbeat has been recorded; unhealthy
+        while it has never been fed (the loud 'configured but unfed' state). The
+        default path never constructs the monitor, so this never fires there."""
+        if self._ever_fed:
+            return True, "on (receiving heartbeats)"
+        return False, ("configured but UNFED — no heartbeats ever recorded "
+                       "(deprecated; prefer observed_usage_provider, D-67)")
+
     async def record(self, resource_id: str, data: dict):
         """Record a heartbeat. Called by cost tracker or health check."""
+        self._ever_fed = True
         key = f"{self.prefix}{resource_id}"
         mapping = {
             "resource_id": resource_id,

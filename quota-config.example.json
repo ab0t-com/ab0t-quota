@@ -8,7 +8,13 @@
     "dynamodb_table": "ab0t_quota_state",
     "dynamodb_region": "us-east-1",
     "persistence_enabled": true,
-    "persistence_sync_interval_seconds": 300
+    "persistence_sync_interval_seconds": 300,
+    "_comment_redis_cluster_confirmed_disabled": "D-71: ab0t-quota requires a NON-CLUSTERED Redis (the atomic counter's multi-key Lua scripts CROSSSLOT on a cluster). The topology is machine-checked at startup via `INFO cluster`; a cluster REFUSES to start. Set this to true ONLY if your Redis cannot report its topology (some managed Redis trim INFO / disable CLUSTER) AND you know it is not clustered — an operator assertion on the record. It never overrides a positive cluster_enabled:1.",
+    "redis_cluster_confirmed_disabled": false,
+    "_comment_redis_durability_confirmed": "D-72: the COUNTER is the admission gate, not a cache. An `allkeys-*` maxmemory-policy lets Redis EVICT a live gauge — the counter then reads zero for a resource that is still running and the library silently over-admits. The policy is machine-checked at startup via CONFIG GET; an evicting Redis REFUSES to start. Set this to true ONLY if your Redis cannot report its CONFIG (some managed Redis disable it) AND you know it does not evict — an operator assertion on the record. It never overrides an allkeys-* policy the server actually reported.",
+    "redis_durability_confirmed": false,
+    "_comment_ddb_pitr_confirmed": "D-76: the activation ledger and the billing outbox live in DynamoDB — state the library cannot reconstruct. At startup (and on every reconcile pass, D-75) the table is verified: ACTIVE, every GSI ACTIVE, TTL enabled on the `ttl` attribute the library writes, and PITR enabled. Set this to true ONLY if your control plane cannot report PITR (DynamoDB Local answers UnknownOperationException) AND you know backups are on — an operator assertion on the record.",
+    "ddb_pitr_confirmed": false
   },
 
   "tier_provider": {

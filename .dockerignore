@@ -46,3 +46,7 @@ htmlcov/
 .coverage
 coverage.xml
 security_scan_*.md
+
+# Local Claude Code config — keep in git, never ship in the image
+**/.claude
+**/settings.local.json

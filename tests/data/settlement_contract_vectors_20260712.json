@@ -1,0 +1,245 @@
+{
+  "contract": "POST /billing/{org_id}/settle \u2014 the caller sends the INPUTS; billing prices them",
+  "law_owner": "billing/output/app/core/proration.py::price_usage",
+  "request_model": "billing/output/app/models/billing.py::SettleActivationRequest",
+  "derived_by": "EXECUTING billing's real model + real law (not transcribed from them)",
+  "conformance_id": "ST-SETTLE-1",
+  "ticket": "20260712_revenue_chain_integrity (B-D13)",
+  "runtimes": [
+    "python",
+    "go"
+  ],
+  "caveat": "A TRIPWIRE, NOT A CERTIFIER. It proves Go builds the body billing accepts and records what billing charges for it. It does NOT prove Go can talk to the real billing service \u2014 a Go<->real-billing test remains OWED (B-D1).",
+  "notes": [
+    "expected_request_body OMITS a money key the event has no value for \u2014 it is never null (B-D14: an always-present key whose value is sometimes null is a landmine for any `.get(k, default)` on the other side).",
+    "A rate-less event prices its RUNTIME at ZERO and billing ALERTS. Neither runtime invents a rate \u2014 a fabricated price is worse than no price (D-36).",
+    "B-D16: the vectors deliberately include the sub-minute floor and the rounding boundary. Whole-hour lifetimes are where a wrong law HIDES."
+  ],
+  "vectors": [
+    {
+      "id": "sub_minute_floor",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T12:00:30+00:00",
+        "hourly_rate": "1.00",
+        "allocation_fee": "0",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T12:00:30+00:00",
+        "hourly_rate": "1.00",
+        "allocation_fee": "0"
+      },
+      "billing_priced_cost": "0.016667"
+    },
+    {
+      "id": "one_second",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T12:00:01+00:00",
+        "hourly_rate": "3.60",
+        "allocation_fee": "0",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T12:00:01+00:00",
+        "hourly_rate": "3.60",
+        "allocation_fee": "0"
+      },
+      "billing_priced_cost": "0.060000"
+    },
+    {
+      "id": "rounds_UP_not_down",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:01+00:00",
+        "hourly_rate": "0.0208",
+        "allocation_fee": "0",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:01+00:00",
+        "hourly_rate": "0.0208",
+        "allocation_fee": "0"
+      },
+      "billing_priced_cost": "0.020806"
+    },
+    {
+      "id": "exactly_one_minute",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T12:01:00+00:00",
+        "hourly_rate": "1.00",
+        "allocation_fee": "0",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T12:01:00+00:00",
+        "hourly_rate": "1.00",
+        "allocation_fee": "0"
+      },
+      "billing_priced_cost": "0.016667"
+    },
+    {
+      "id": "whole_hour",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:00+00:00",
+        "hourly_rate": "1.00",
+        "allocation_fee": "0",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:00+00:00",
+        "hourly_rate": "1.00",
+        "allocation_fee": "0"
+      },
+      "billing_priced_cost": "1.000000"
+    },
+    {
+      "id": "fractional_hour",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:10:37+00:00",
+        "hourly_rate": "0.137",
+        "allocation_fee": "0",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:10:37+00:00",
+        "hourly_rate": "0.137",
+        "allocation_fee": "0"
+      },
+      "billing_priced_cost": "0.161242"
+    },
+    {
+      "id": "with_allocation_fee",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T14:00:00+00:00",
+        "hourly_rate": "0.50",
+        "allocation_fee": "0.25",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T14:00:00+00:00",
+        "hourly_rate": "0.50",
+        "allocation_fee": "0.25"
+      },
+      "billing_priced_cost": "1.250000"
+    },
+    {
+      "id": "NO_RATE_fee_only",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:00+00:00",
+        "hourly_rate": null,
+        "allocation_fee": "1.00",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:00+00:00",
+        "allocation_fee": "1.00"
+      },
+      "billing_priced_cost": "1.000000"
+    },
+    {
+      "id": "NO_RATE_NO_FEE",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:00+00:00",
+        "hourly_rate": null,
+        "allocation_fee": null,
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:00+00:00"
+      },
+      "billing_priced_cost": "0.000000"
+    },
+    {
+      "id": "zero_rate_explicit",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:00+00:00",
+        "hourly_rate": "0",
+        "allocation_fee": "0",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-01T13:00:00+00:00",
+        "hourly_rate": "0",
+        "allocation_fee": "0"
+      },
+      "billing_priced_cost": "0.000000"
+    },
+    {
+      "id": "long_running_desktop",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-10T12:00:00+00:00",
+        "hourly_rate": "0.0416",
+        "allocation_fee": "0",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-10T12:00:00+00:00",
+        "hourly_rate": "0.0416",
+        "allocation_fee": "0"
+      },
+      "billing_priced_cost": "8.985600"
+    },
+    {
+      "id": "tiny_rate_long_run",
+      "event": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-02T12:00:00+00:00",
+        "hourly_rate": "0.0001",
+        "allocation_fee": "0",
+        "org_id": "org-1",
+        "resource_id": "sbx-1",
+        "reservation_id": "res-1"
+      },
+      "expected_request_body": {
+        "started_at": "2026-07-01T12:00:00+00:00",
+        "stopped_at": "2026-07-02T12:00:00+00:00",
+        "hourly_rate": "0.0001",
+        "allocation_fee": "0"
+      },
+      "billing_priced_cost": "0.002400"
+    }
+  ]
+}

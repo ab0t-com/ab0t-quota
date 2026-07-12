@@ -21,7 +21,9 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .models.core import TierConfig, TierLimits, ResourceDef, CounterType, ResetPeriod
+from .models.core import (
+    TierConfig, TierLimits, ResourceDef, CounterType, ResetPeriod, EnforcementConfig,
+)
 from .tiers import DEFAULT_TIERS
 
 logger = logging.getLogger("ab0t_quota.config")
@@ -209,7 +211,38 @@ def load_resource_bundles(config: Optional[dict] = None) -> dict[str, list[str]]
         if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
             logger.warning("resource_bundles.%s must be a list of strings — skipping", name)
             continue
+        # D-45 / D-41: a bundle naming the same resource twice would over-spend it in
+        # one acquire (counter past its limit; ledger records one unit). A bundle is a
+        # SET of resources; a duplicate is a config error the code cannot honour, so it
+        # is REJECTED at load, not silently interpreted. (Runtime dedup in the engine's
+        # _gauge_specs is the belt-and-braces for a hand-built bundle.)
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                f"resource_bundles.{name} lists a duplicate resource_key; a bundle "
+                f"must name each resource at most once (D-45)")
         bundles[name] = list(keys)
 
     logger.info("Loaded %d resource bundles from config", len(bundles))
     return bundles
+
+
+def load_enforcement(config: Optional[dict] = None) -> EnforcementConfig:
+    """Load the enforcement block from config into an EnforcementConfig.
+
+    Mirrors the Go runtime's `Cfg.Enforcement`. Unknown keys are ignored;
+    missing keys take their documented defaults (enabled=True, shadow_mode=False,
+    global_kill_switch=False, unknown_bundle='deny'). This is the seam that
+    carries the three documented knobs from `quota-config.json` into the engine
+    (previously they were read and only logged — QP-01).
+    """
+    raw = (config or {}).get("enforcement", {}) or {}
+    if not isinstance(raw, dict):
+        logger.warning("enforcement must be an object, got %s — using defaults", type(raw).__name__)
+        raw = {}
+    allowed = {"enabled", "shadow_mode", "global_kill_switch", "unknown_bundle"}
+    filtered = {k: v for k, v in raw.items() if k in allowed}
+    try:
+        return EnforcementConfig(**filtered)
+    except Exception as e:  # pragma: no cover - defensive: bad config never crashes startup
+        logger.warning("invalid enforcement config (%s) — using defaults", e)
+        return EnforcementConfig()

@@ -180,10 +180,13 @@ class TestSetupQuotaEndToEnd:
             r = client.get("/api/quotas/check-bundle/default", headers={"X-Org-ID": "org-1"})
             assert r.status_code == 200
             assert r.json()["allowed"] is True
+            # DECISIONS D-14 (ticket 20260709): an undeclared bundle is a config
+            # error, not a free pass. In enforce mode (default) it now DENIES +
+            # logs loudly, instead of silently allowing. (Was `allowed is True`.)
             r2 = client.get("/api/quotas/check-bundle/something-not-declared",
                             headers={"X-Org-ID": "org-1"})
             assert r2.status_code == 200
-            assert r2.json()["allowed"] is True
+            assert r2.json()["allowed"] is False
 
     def test_rate_limit_middleware_enforces_after_n_requests(self, fake_redis, config_file):
         """api.requests_per_hour=3; 4th request should 429."""

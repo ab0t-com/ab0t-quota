@@ -46,8 +46,25 @@ class FakeRedis:
     async def get(self, k):
         v = self._kv.get(k)
         return v.encode() if isinstance(v, str) else v
-    async def set(self, k, v, ex=None):
+    async def set(self, k, v, ex=None, nx=None):
+        # nx support (additive): atomic claim — return None if key already exists.
+        if nx and k in self._kv:
+            return None
         self._kv[k] = v if isinstance(v, str) else v.decode()
+        return True
+    async def eval(self, script, numkeys, *args):
+        # Additive: supports the ledger's stale-reclaim CAS only — compare
+        # KEYS[1] to ARGV[1] and SET to ARGV[2] (EX ARGV[3]) iff equal.
+        keys = args[:numkeys]
+        argv = args[numkeys:]
+        stored = self._kv.get(keys[0])
+        stored_b = stored.encode() if isinstance(stored, str) else stored
+        expected = argv[0].encode() if isinstance(argv[0], str) else argv[0]
+        if stored_b == expected:
+            new = argv[1]
+            self._kv[keys[0]] = new if isinstance(new, str) else new.decode()
+            return 1
+        return 0
     async def exists(self, k):
         return 1 if k in self._kv else 0
     async def delete(self, k):
@@ -79,15 +96,27 @@ class FakeRedis:
 # Fake DDB (no boto/moto dep)
 # ---------------------------------------------------------------------------
 
+class ConditionalCheckFailedException(Exception):
+    """Stub analog of DynamoDB's conditional-write failure. The production
+    detector (`handler_ledger._is_conditional_check_failed`) matches it by
+    class name, mirroring botocore's ConditionalCheckFailedException."""
+
+
 class FakeDDB:
     """Minimal async DDB stub: put_item/get_item/update_item/delete_item/query.
     Supports our 2 GSIs (gsi1, gsi2) via in-memory secondary indexes."""
     def __init__(self):
         self._items: dict[tuple, dict] = {}  # (PK, SK) -> item
 
-    async def put_item(self, *, TableName, Item):
+    async def put_item(self, *, TableName, Item, ConditionExpression=None,
+                       ExpressionAttributeValues=None):
         pk = Item["PK"]["S"]
         sk = Item["SK"]["S"]
+        # ConditionExpression support (additive): honor attribute_not_exists(PK)
+        # so the atomic conditional-create claim (QC-01) is exercised.
+        if ConditionExpression and "attribute_not_exists(PK)" in ConditionExpression:
+            if (pk, sk) in self._items:
+                raise ConditionalCheckFailedException(pk)
         self._items[(pk, sk)] = Item
 
     async def get_item(self, *, TableName, Key):

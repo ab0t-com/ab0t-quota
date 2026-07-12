@@ -10,6 +10,7 @@ Return types match the models in billing/models.py exactly.
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -404,6 +405,90 @@ class BillingServiceClient:
             metadata=(metadata if isinstance(metadata, dict) else {}),
         )
         return await self.record_usage(req)
+
+    async def settle_activation(
+        self, org_id: str, *,
+        settlement_key: str,
+        observation: "SettlementObservation",
+        reservation_id: Optional[str] = None,
+        usage_record_id: Optional[str] = None,
+    ) -> dict:
+        """Settle usage that can no longer be committed. **D-12 — the revenue-loss close.**
+
+        `POST /billing/{org_id}/settle`. Billing's `/commit` is state-guarded on a LIVE Redis
+        reservation hash: past the reservation window it 404s and the revenue is **lost
+        forever**. This endpoint is the durable, activation-scoped path — it needs no live
+        hash, so a settlement arriving arbitrarily late still lands, in the correct
+        three-bucket spend order.
+
+        Ticket: billing/output/tickets/20260712_revenue_chain_integrity (billing's half:
+        TASK B-1 / W-D12). This method is the CALLER — without it, billing's settlement
+        endpoint is a mechanism nobody invokes, and the money is still gone (D-64).
+
+        ⚠️ `settlement_key` is the ONLY thing standing between a retry and a double-charge.
+        Billing dedups it with a **DynamoDB conditional write that has NO TTL** — the dedup is
+        durable and *eternal*, which is precisely the point (a 24h Redis window cannot dedup a
+        settlement that arrives on day 3). Two consequences, both load-bearing:
+
+          1. **Reusing a key across two genuinely different settlements silently refuses the
+             second.** Uniqueness is a contract, not a nicety.
+          2. **Pass `reservation_id`** — the same key billing's OWN SQS lifecycle consumer
+             uses (`lifecycle_consumer.py:425`: `settlement_key=reservation_id`). This is what
+             makes the two settlement paths dedup **against each other**: if this library
+             settles an event and the SNS copy of that same event is later delivered to
+             billing's consumer, billing's DynamoDB condition refuses the second. Keying on
+             anything else (e.g. `activation_id`) would open a **double-charge** — two keys,
+             one usage, two debits.
+
+        ⚠️ **THIS SENDS THE INPUTS, NOT A COST (B-D13).**
+        ----------------------------------------------------
+        We send what we **OBSERVED** — when it started, when it stopped, the rate we were
+        quoted — and **billing computes what it costs** with the one law it owns
+        (`app/core/proration.py::price_usage`).
+
+        This method used to send a pre-computed `actual_cost`, and that single field pushed the
+        cost law across the mesh boundary: this library carried a **port of billing's
+        proration**, as did the Go library. Three implementations of one money law
+        (**D-35**). They were guarded by a frozen vector table — but *a copy kept in sync is
+        still a copy*, and it stays equal only until the day it doesn't, silently.
+
+          **A caller that cannot compute a cost cannot compute it wrong.**
+
+        The library's proration is **archived**, not synchronised (`ab0t_quota/.archive/`).
+        **Do not reintroduce arithmetic here.** In particular: if `hourly_rate` is missing, do
+        NOT invent one. Billing prices a rate-less runtime at **ZERO and ALERTS**
+        (`settle_missing_hourly_rate`) — a fabricated price is worse than no price, and that
+        policy lives in exactly one place. We do not duplicate it and we do not compete with it.
+
+        Idempotent. A replay returns HTTP 200 with `replayed=true` and the ORIGINAL payload;
+        no money moves.
+
+        Raises `BillingServiceError`. The status codes are billing's real contract, read from
+        its handler (`app/api/billing.py` → `app/core/reservation.py::settle_activation`):
+          * **409** — "not eligible for settlement": `/commit` already took this money, or the
+            reservation is still live and `/commit` should be used. **The books are correct.**
+            This is NOT an error and NOT a revenue loss — the caller must treat it as success.
+          * **400** — invalid lifetime (`stopped_at < started_at`) or a negative computed cost
+            (reachable only via a negative rate/fee — a caller sending garbage).
+          * **404** — no billing account for this org.
+          * **5xx / 503 / 504** — transient. The settlement did **not** land, or landed and the
+            response was lost. **Retry** — never void, never assume. The durable key makes the
+            retry safe in both readings.
+        """
+        body = {
+            "settlement_key": settlement_key,
+            **observation.to_settlement_payload(),
+        }
+        # B-D14, not recreated: send absence as ABSENCE. `to_settlement_payload()` OMITS a money
+        # key it has no value for rather than sending an explicit `null` — because the bug we
+        # just killed was an always-present key whose value was sometimes `None`, against a
+        # `.get(k, default)` on the other side that only defaults on an ABSENT key.
+        if reservation_id is not None:
+            body["reservation_id"] = reservation_id
+        if usage_record_id is not None:
+            body["usage_record_id"] = usage_record_id
+
+        return await self._request("POST", f"/billing/{org_id}/settle", json=body)
 
     async def apply_promotional_credit(
         self, org_id: str, amount: float,

@@ -210,23 +210,69 @@ class QuotaStore:
     # Seed Redis from DynamoDB (startup recovery)
     # ------------------------------------------------------------------
 
-    async def seed_redis(self, redis, registry) -> int:
-        """On startup, restore Redis counters from DynamoDB snapshots.
+    async def seed_redis(self, redis, registry, activation_store=None) -> int:
+        """On startup, restore Redis counters from DynamoDB.
 
-        Uses GSI1 (GSI1PK=COUNTER) to query all counter snapshots without
-        scanning the entire table.
+        Uses GSI1 (GSI1PK=COUNTER) to enumerate the (org, resource) pairs to
+        restore without scanning the whole table.
+
+        SNAPSHOT v2 (P2.5, DECISIONS D-10) — when `activation_store` is provided,
+        a GAUGE is restored from the ACTIVATION LEDGER (`Σ open activations`), NOT
+        from the raw counter snapshot: the counter is a *cache of the ledger*, so a
+        wipe + seed can never resurrect a value the open activations don't justify
+        (retires QI-07 in the seed path). Per-user partitions are DERIVED from the
+        ledger, not stored.
+
+        E3: enumeration is LEDGER-authoritative for gauges. We converge EVERY
+        (org, resource) with open activations (from the ledger's open index) AND
+        every gauge that has a snapshot row (to clear drift down to Σ open, which
+        may be 0). A gauge with open activations but NO snapshot row is therefore
+        restored (previously it seeded to 0 = undercount). ACCUMULATORS
+        (money/usage) are not ledger-derived, so they restore from their snapshot.
+        Without an `activation_store` the legacy raw-snapshot restore is used.
 
         Returns number of counters restored.
         """
         from .counters.factory import create_counter
+        from .models.core import CounterType
 
         restored = 0
+        seen_gauges: set = set()
+
+        async def _converge(org_id: str, resource_key: str, snapshot_value=None) -> bool:
+            if (org_id, resource_key) in seen_gauges:
+                return False
+            resource_def = registry.get(resource_key)
+            if not resource_def or resource_def.counter_type != CounterType.GAUGE:
+                return False
+            from .activations import converge_gauge
+            counter = create_counter(redis, org_id, resource_def)
+            v, src = await converge_gauge(
+                activation_store=activation_store, org_id=org_id,
+                resource_key=resource_key, counter=counter,
+            )
+            seen_gauges.add((org_id, resource_key))
+            logger.info(
+                "Restored gauge %s for org %s from ledger: %s (snapshot said %s; "
+                "source=%s — snapshot cannot resurrect unjustified drift, D-10/QI-07)",
+                resource_key, org_id, v, snapshot_value, src,
+            )
+            return True
+
+        # (1) LEDGER-authoritative enumeration: every gauge with open activations,
+        # even ones with no snapshot row (E3 — the previous undercount).
+        if activation_store is not None:
+            for (org_id, resource_key) in await activation_store.open_gauge_targets():
+                if await _converge(org_id, resource_key):
+                    restored += 1
+
+        # (2) Snapshot rows: accumulators restore from snapshot; gauges converge
+        # (clearing drift to Σ open, possibly 0) unless already done in (1).
         query_kwargs = {
             "IndexName": "GSI1",
             "KeyConditionExpression": "GSI1PK = :pk",
             "ExpressionAttributeValues": {":pk": "COUNTER"},
         }
-
         while True:
             response = await self._table.query(**query_kwargs)
             for item in response.get("Items", []):
@@ -235,15 +281,22 @@ class QuotaStore:
                 value = float(item["value"])
 
                 resource_def = registry.get(resource_key)
-                if resource_def:
-                    counter = create_counter(redis, org_id, resource_def)
-                    current = await counter.get()
-                    if current == 0 and value > 0:
-                        await counter.reset(value)
-                        restored += 1
-                        logger.info("Restored counter %s for org %s: %s", resource_key, org_id, value)
+                if not resource_def:
+                    continue
 
-            # Handle pagination
+                if (resource_def.counter_type == CounterType.GAUGE
+                        and activation_store is not None):
+                    if await _converge(org_id, resource_key, snapshot_value=value):
+                        restored += 1
+                    continue
+
+                counter = create_counter(redis, org_id, resource_def)
+                current = await counter.get()
+                if current == 0 and value > 0:
+                    await counter.reset(value)
+                    restored += 1
+                    logger.info("Restored counter %s for org %s: %s", resource_key, org_id, value)
+
             last_key = response.get("LastEvaluatedKey")
             if not last_key:
                 break
@@ -296,16 +349,27 @@ class QuotaStore:
     async def _sync_loop(self, redis, registry, interval_seconds: int):
         """Run snapshot passes forever, sleeping `interval_seconds` between passes."""
         import asyncio
+        fail_streak = 0
         while True:
             try:
                 await asyncio.sleep(interval_seconds)
                 snapshotted = await self.snapshot_all(redis, registry)
+                fail_streak = 0
                 if snapshotted:
                     logger.debug("snapshot_pass_complete count=%d", snapshotted)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning("snapshot_pass_error: %s", e)
+                fail_streak += 1
+                # D-50 rule 2: a loop that keeps failing must become LOUD — a
+                # repeating WARNING nobody reads is a dead worker inside a healthy
+                # process (recovery-cache staleness accrues silently otherwise).
+                if fail_streak >= 3:
+                    logger.error("snapshot_worker_UNHEALTHY: %s (fail_streak=%d) — Redis "
+                                 "counters are NOT being snapshotted; recovery on restart "
+                                 "will be stale.", e, fail_streak)
+                else:
+                    logger.warning("snapshot_pass_error: %s", e)
                 # Don't tight-loop on persistent failure
                 await asyncio.sleep(min(interval_seconds, 30))
 
@@ -366,8 +430,12 @@ class QuotaStore:
                     self._last_snapshot[cache_key] = value
                     written += 1
                 except Exception as e:
-                    logger.warning(
-                        "snapshot_counter_failed org=%s resource=%s error=%s",
+                    # Not silent: a dropped snapshot write leaves the recovery cache
+                    # STALE — a later seed restores an older value (gauges reconverge
+                    # from the ledger anyway; accumulators would be stale). Log loudly.
+                    logger.error(
+                        "snapshot_counter_failed org=%s resource=%s error=%s — recovery "
+                        "cache is now STALE for this counter until the next successful pass.",
                         org_id, resource_key, e,
                     )
 

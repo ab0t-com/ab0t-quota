@@ -158,6 +158,162 @@ def _hash_key(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+async def _drain_stale(store, handler, now, limit: int = 100) -> int:
+    """Shared stale-lease drain (QC-02/QC-03). Finds IN_PROGRESS rows whose lease
+    has expired — a crashed worker that never wrote an outcome — atomically
+    re-claims each (so two concurrent drainers can't double-process), and hands
+    it to `handler(row)` for reprocessing. Returns the number reprocessed.
+
+    Without this, a delivery whose first attempt crashed while auth had already
+    been 200'd (redelivery skipped under the live lease) is stranded in_progress
+    forever, invisible to `--status failed`. This is the drain that recovers it.
+    """
+    now = now or datetime.now(timezone.utc)
+    reprocessed = 0
+    rows = await store.query_by_status(LedgerStatus.IN_PROGRESS, limit=limit)
+    for row in rows:
+        if not row.lease_expires_at:
+            continue
+        try:
+            expired = datetime.fromisoformat(row.lease_expires_at) <= now
+        except (TypeError, ValueError):
+            continue
+        if not expired:
+            continue
+        # Atomic re-claim: only one drainer wins a fresh lease; others skip.
+        res = await store.record_attempt(
+            handler_name=row.handler_name,
+            event_id=row.event_id,
+            event_type=row.event_type,
+            event_payload=row.event_payload or {},
+            user_id=row.user_id,
+            org_id=row.org_id,
+        )
+        if res.proceed:
+            await handler(row)
+            reprocessed += 1
+    return reprocessed
+
+
+class StaleLeaseSweeper:
+    """D-50 / QC-02 — a library-owned periodic sweeper that RECLAIMS stranded
+    in_progress ledger rows (a handler that crashed mid-delivery) and re-drives
+    them via an injected ``redispatch`` callable.
+
+    Why this exists: ``drain_stale_leases`` was implemented three times and its
+    only caller was a test — a DISCONNECTED GUARANTEE. With no scheduler, a crashed
+    handler stranded its row forever: auth already got its 200, the live lease
+    blocked redelivery, and the status stayed ``in_progress`` (invisible to
+    ``events --status failed``). For a credit-grant handler that means the grant is
+    stranded permanently. This runs the drain on a real periodic loop under the
+    D-50 contract: loud on sustained failure, liveness surfaced, money-critical
+    (a dead sweeper fails ``/quota/health``).
+
+    Generic: it takes a store + a ``redispatch(row)`` callable, so it carries no
+    auth_events dependency (setup injects the re-dispatcher)."""
+
+    _UNHEALTHY_STREAK = 3
+
+    def __init__(self, store, redispatch, *, interval_seconds: float = 300.0, limit: int = 100):
+        self._store = store
+        self._redispatch = redispatch          # async fn(row) -> None
+        self._interval = interval_seconds
+        self._limit = limit
+        self._task = None
+        self._fail_streak = 0
+        self._ever_started = False
+
+    @staticmethod
+    def _kill_switched() -> bool:
+        import os
+        return os.getenv("AB0T_QUOTA_STALE_LEASE_SWEEP_ENABLED", "true").strip().lower() in (
+            "false", "0", "no", "off")
+
+    async def sweep_once(self) -> int:
+        """One sweep pass — reclaim + re-drive every expired-lease row. Exposed for
+        a manual cron or a test; the background loop calls it."""
+        return await self._store.drain_stale_leases(handler=self._redispatch, limit=self._limit)
+
+    def start(self, interval_seconds: Optional[float] = None):
+        import asyncio
+        if self._task is not None and not self._task.done():
+            return self._task
+        self._ever_started = True
+        interval = interval_seconds if interval_seconds is not None else self._interval
+        self._task = asyncio.create_task(self._loop(interval), name="ab0t_quota_stale_lease_sweeper")
+        logger.info("stale_lease_sweeper_started interval=%ss", interval)
+        return self._task
+
+    async def stop(self):
+        import asyncio
+        task = self._task
+        self._task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        logger.info("stale_lease_sweeper_stopped")
+
+    async def _loop(self, interval: float):
+        import asyncio
+        self._fail_streak = 0
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if self._kill_switched():
+                    continue
+                n = await self.sweep_once()
+                self._fail_streak = 0
+                if n:
+                    logger.info("stale_lease_sweep reprocessed=%d", n)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._fail_streak = min(self._fail_streak + 1, 5)
+                # D-50 rule 2: a sweeper backing off forever is a dead worker —
+                # stranded grants pile up silently. Be LOUD at the unhealthy streak.
+                if self._fail_streak >= self._UNHEALTHY_STREAK:
+                    logger.error("stale_lease_sweeper_UNHEALTHY: %s (fail_streak=%d) — stranded "
+                                 "handler rows (e.g. credit grants) are NOT being recovered "
+                                 "(QC-02). This must reach a human.", e, self._fail_streak)
+                else:
+                    logger.warning("stale_lease_sweep_error: %s (backoff x%d)", e, self._fail_streak)
+                await asyncio.sleep(min(interval * self._fail_streak, 120))
+
+    def loop_liveness(self) -> tuple:
+        """D-50 liveness. Healthy when not managed here (manual sweep) or running
+        below the unhealthy streak; unhealthy when a started sweeper died/stopped
+        or is permanently backing off."""
+        if not self._ever_started:
+            return True, "stale-lease sweeper not managed here (manual sweep)"
+        task = self._task
+        if task is None or task.done():
+            return False, "stale-lease sweeper was started but is no longer running"
+        if self._fail_streak >= self._UNHEALTHY_STREAK:
+            return False, (f"stale-lease sweeper backing off (fail_streak={self._fail_streak}) — "
+                           f"stranded grants not recovered")
+        return True, "on"
+
+
+def _is_conditional_check_failed(exc: Exception) -> bool:
+    """Portable detector for a DynamoDB conditional-put failure across the real
+    boto client (botocore ClientError with code ConditionalCheckFailedException)
+    and the in-test FakeDDB stub (an exception whose class name carries it)."""
+    if type(exc).__name__ == "ConditionalCheckFailedException":
+        return True
+    if "ConditionalCheckFailed" in type(exc).__name__:
+        return True
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = response.get("Error", {}).get("Code")
+        if code == "ConditionalCheckFailedException":
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # In-memory implementation (tests + degraded mode)
 # ---------------------------------------------------------------------------
@@ -256,6 +412,9 @@ class InMemoryLedgerStore:
             del self._rows[k]
         return len(keys)
 
+    async def drain_stale_leases(self, *, handler, now=None, limit: int = 100) -> int:
+        return await _drain_stale(self, handler, now, limit)
+
 
 # ---------------------------------------------------------------------------
 # Redis implementation (default for bridge mode, default when DDB absent)
@@ -275,6 +434,17 @@ class RedisLedgerStore:
 
     ROW_TTL_SECONDS = 72 * 3600
 
+    # Compare-and-swap for the stale-lease RECLAIM path (QC-01 / R3): overwrite
+    # the row ONLY if it still holds exactly the stale value we read. Two drains
+    # racing to reclaim the same stale lease: the first CAS matches and wins; the
+    # second sees the winner's new row and returns 0 (→ caller re-reads, sees a
+    # live lease, skips). Returns 1 on success, 0 on loss.
+    _CAS_RECLAIM = (
+        "if redis.call('GET', KEYS[1]) == ARGV[1] then "
+        "redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]); return 1 "
+        "else return 0 end"
+    )
+
     def __init__(self, redis, *, key_prefix: str = "ledger") -> None:
         self.redis = redis
         self.prefix = key_prefix
@@ -291,23 +461,10 @@ class RedisLedgerStore:
     def _dedup_key(self, raw: str) -> str:
         return f"{self.prefix}:bizdedup:{_hash_key(raw)}"
 
-    async def record_attempt(self, **kwargs) -> AttemptResult:
-        row_key = self._row_key(kwargs["handler_name"], kwargs["event_id"])
-        existing_raw = await self.redis.get(row_key)
-        if existing_raw is not None:
-            existing = LedgerRow.from_dict(json.loads(existing_raw))
-            if existing.status in (LedgerStatus.SUCCESS, LedgerStatus.SKIPPED, LedgerStatus.FAILED_PERMANENT):
-                return AttemptResult(proceed=False, cached_row=existing)
-            if existing.status == LedgerStatus.IN_PROGRESS and existing.lease_expires_at:
-                if datetime.fromisoformat(existing.lease_expires_at) > datetime.now(timezone.utc):
-                    return AttemptResult(proceed=False, cached_row=existing)
-            attempts = (existing.attempts or 0) + 1
-        else:
-            attempts = 1
-
+    def _build_row(self, kwargs, attempts: int) -> "LedgerRow":
         from datetime import timedelta
         lease_exp = (datetime.now(timezone.utc) + timedelta(seconds=kwargs.get("lease_seconds", 60))).isoformat()
-        row = LedgerRow(
+        return LedgerRow(
             handler_name=kwargs["handler_name"],
             event_id=kwargs["event_id"],
             event_type=kwargs["event_type"],
@@ -319,14 +476,73 @@ class RedisLedgerStore:
             lease_expires_at=lease_exp,
             event_payload=kwargs["event_payload"],
         )
-        await self.redis.set(row_key, json.dumps(row.to_dict()), ex=self.ROW_TTL_SECONDS)
+
+    async def _index_in_progress(self, row: "LedgerRow", row_key: str) -> None:
         score = time.time()
         if row.user_id:
             await self.redis.zadd(self._user_key(row.user_id), {row_key: score})
             await self.redis.expire(self._user_key(row.user_id), self.ROW_TTL_SECONDS)
         await self.redis.zadd(self._status_key(LedgerStatus.IN_PROGRESS), {row_key: score})
         await self.redis.expire(self._status_key(LedgerStatus.IN_PROGRESS), self.ROW_TTL_SECONDS)
-        return AttemptResult(proceed=True)
+
+    @staticmethod
+    def _decide_existing(existing: "LedgerRow") -> Optional[AttemptResult]:
+        """Return a short-circuit AttemptResult for an existing row, or None if
+        the caller may (re)claim it (stale in_progress / failed-retryable)."""
+        if existing.status in (LedgerStatus.SUCCESS, LedgerStatus.SKIPPED, LedgerStatus.FAILED_PERMANENT):
+            return AttemptResult(proceed=False, cached_row=existing)
+        if existing.status == LedgerStatus.IN_PROGRESS and existing.lease_expires_at:
+            if datetime.fromisoformat(existing.lease_expires_at) > datetime.now(timezone.utc):
+                return AttemptResult(proceed=False, cached_row=existing)
+        return None
+
+    async def record_attempt(self, **kwargs) -> AttemptResult:
+        """Atomic claim (QC-01). The create case — the race where two concurrent
+        deliveries both read no row and both proceed — is closed with an atomic
+        `SET NX`: exactly one creator wins the key; the loser re-reads and sees
+        the winner's live-lease row (proceed=False). Existing rows keep the
+        state-machine semantics (terminal → cached; live lease → conflict; stale
+        / failed-retryable → re-claim)."""
+        row_key = self._row_key(kwargs["handler_name"], kwargs["event_id"])
+        existing_raw = await self.redis.get(row_key)
+
+        if existing_raw is None:
+            # --- create race: atomic claim. Only one of N concurrent creators wins.
+            row = self._build_row(kwargs, attempts=1)
+            claimed = await self.redis.set(
+                row_key, json.dumps(row.to_dict()), ex=self.ROW_TTL_SECONDS, nx=True,
+            )
+            if claimed:
+                await self._index_in_progress(row, row_key)
+                return AttemptResult(proceed=True)
+            # Lost the create race — fall through to read the winner's row.
+            existing_raw = await self.redis.get(row_key)
+            if existing_raw is None:
+                # Evicted in the tiny window; the safe answer is "someone else has it".
+                return AttemptResult(proceed=False, cached_row=None)
+
+        existing = LedgerRow.from_dict(json.loads(existing_raw))
+        short = self._decide_existing(existing)
+        if short is not None:
+            return short
+
+        # Stale in_progress or failed-retryable → re-claim via COMPARE-AND-SWAP
+        # (R3): overwrite only if the row still holds the stale value we read, so
+        # two concurrent drains can't both reclaim the same lease.
+        row = self._build_row(kwargs, attempts=(existing.attempts or 0) + 1)
+        won = await self.redis.eval(
+            self._CAS_RECLAIM, 1,
+            row_key, existing_raw, json.dumps(row.to_dict()), self.ROW_TTL_SECONDS,
+        )
+        if won in (1, b"1", "1", True):
+            await self._index_in_progress(row, row_key)
+            return AttemptResult(proceed=True)
+        # Lost the reclaim race — re-read and defer to the winner's row.
+        existing_raw = await self.redis.get(row_key)
+        if existing_raw is None:
+            return AttemptResult(proceed=False, cached_row=None)
+        existing = LedgerRow.from_dict(json.loads(existing_raw))
+        return self._decide_existing(existing) or AttemptResult(proceed=False, cached_row=existing)
 
     async def record_outcome(self, **kwargs) -> None:
         row_key = self._row_key(kwargs["handler_name"], kwargs["event_id"])
@@ -402,6 +618,9 @@ class RedisLedgerStore:
         await self.redis.delete(user_idx)
         return count
 
+    async def drain_stale_leases(self, *, handler, now=None, limit: int = 100) -> int:
+        return await _drain_stale(self, handler, now, limit)
+
 
 # ---------------------------------------------------------------------------
 # DDB implementation (default for mesh services)
@@ -423,6 +642,69 @@ class DDBLedgerStore:
         self.ddb = ddb_client
         self.table = table_name
 
+    async def ensure_table(self, *, active_timeout_s: float = 60.0) -> None:
+        """D-82 — CREATE the table if absent (idempotent), then WAIT for it to be ACTIVE.
+
+        This store previously ASSUMED its table existed. The outbox and the activation store
+        both provision theirs; the handler ledger did neither, so a client who wired it hit a
+        `ResourceNotFoundException` at their FIRST auth webhook — in production. It was
+        invisible for the most instructive reason (D-78): *a fake never notices, because a
+        fake creates nothing.*
+
+        Also enables TTL on `ttl` — the attribute this store actually writes — so the D-76
+        preflight (which FAILS a table whose TTL points anywhere else) passes on a table we
+        provisioned ourselves.
+        """
+        import asyncio
+        import time as _t
+
+        try:
+            await self.ddb.describe_table(TableName=self.table)
+        except Exception as e:
+            not_found = getattr(getattr(self.ddb, "exceptions", None),
+                                "ResourceNotFoundException", ())
+            if not (isinstance(e, not_found) or "ResourceNotFound" in type(e).__name__):
+                raise  # a real error (perms, endpoint) — don't mask it
+            await self.ddb.create_table(
+                TableName=self.table,
+                KeySchema=[
+                    {"AttributeName": "PK", "KeyType": "HASH"},
+                    {"AttributeName": "SK", "KeyType": "RANGE"},
+                ],
+                AttributeDefinitions=[
+                    {"AttributeName": "PK", "AttributeType": "S"},
+                    {"AttributeName": "SK", "AttributeType": "S"},
+                ],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            logger.info("created handler-ledger table %s", self.table)
+
+        deadline = _t.monotonic() + active_timeout_s
+        while True:
+            desc = await self.ddb.describe_table(TableName=self.table)
+            if desc.get("Table", {}).get("TableStatus") == "ACTIVE":
+                break
+            if _t.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"handler-ledger table {self.table} did not become ACTIVE within "
+                    f"{active_timeout_s}s — refusing to run the idempotency ledger against a "
+                    f"table that is not ready (D-82)")
+            await asyncio.sleep(0.5)
+
+        # TTL on the attribute this store writes (`ttl`). Best-effort: a client whose IAM
+        # forbids UpdateTimeToLive still gets a working ledger — the D-76 preflight will WARN
+        # that rows never reap (growth/cost), which is not a correctness leak.
+        try:
+            cur = await self.ddb.describe_time_to_live(TableName=self.table)
+            if cur.get("TimeToLiveDescription", {}).get("TimeToLiveStatus") not in (
+                    "ENABLED", "ENABLING"):
+                await self.ddb.update_time_to_live(
+                    TableName=self.table,
+                    TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"})
+        except Exception as e:
+            logger.warning("handler-ledger TTL not enabled on %s (%s) — released rows will not "
+                           "reap; nothing is lost (D-76 will WARN)", self.table, e)
+
     def _pk(self, handler: str, event_id: str) -> str:
         return f"HANDLER#{handler}#{event_id}"
 
@@ -437,19 +719,7 @@ class DDBLedgerStore:
     def _num(v: Optional[float]) -> dict:
         return {"N": str(v)} if v is not None else {"NULL": True}
 
-    async def record_attempt(self, **kwargs) -> AttemptResult:
-        # Read first, decide whether to (re)write
-        existing = await self.get_row(handler_name=kwargs["handler_name"], event_id=kwargs["event_id"])
-        if existing is not None:
-            if existing.status in (LedgerStatus.SUCCESS, LedgerStatus.SKIPPED, LedgerStatus.FAILED_PERMANENT):
-                return AttemptResult(proceed=False, cached_row=existing)
-            if existing.status == LedgerStatus.IN_PROGRESS and existing.lease_expires_at:
-                if datetime.fromisoformat(existing.lease_expires_at) > datetime.now(timezone.utc):
-                    return AttemptResult(proceed=False, cached_row=existing)
-            attempts = (existing.attempts or 0) + 1
-        else:
-            attempts = 1
-
+    def _build_item(self, kwargs, attempts: int) -> dict:
         from datetime import timedelta
         lease_exp = (datetime.now(timezone.utc) + timedelta(seconds=kwargs.get("lease_seconds", 60))).isoformat()
         item = {
@@ -473,7 +743,49 @@ class DDBLedgerStore:
             item["org_id"] = {"S": kwargs["org_id"]}
         item["gsi2_pk"] = {"S": f"STATUS#{LedgerStatus.IN_PROGRESS.value}"}
         item["gsi2_sk"] = {"S": item["attempted_at"]["S"]}
+        return item
 
+    @staticmethod
+    def _decide_existing(existing: "LedgerRow") -> Optional[AttemptResult]:
+        if existing.status in (LedgerStatus.SUCCESS, LedgerStatus.SKIPPED, LedgerStatus.FAILED_PERMANENT):
+            return AttemptResult(proceed=False, cached_row=existing)
+        if existing.status == LedgerStatus.IN_PROGRESS and existing.lease_expires_at:
+            if datetime.fromisoformat(existing.lease_expires_at) > datetime.now(timezone.utc):
+                return AttemptResult(proceed=False, cached_row=existing)
+        return None
+
+    async def record_attempt(self, **kwargs) -> AttemptResult:
+        """Atomic claim via a conditional put (QC-01). The create race is closed
+        with `ConditionExpression=attribute_not_exists(PK)`: exactly one concurrent
+        creator's put succeeds; the loser gets ConditionalCheckFailed, re-reads,
+        and sees the winner's live-lease row (proceed=False). Existing rows keep
+        the state-machine semantics."""
+        existing = await self.get_row(handler_name=kwargs["handler_name"], event_id=kwargs["event_id"])
+
+        if existing is None:
+            item = self._build_item(kwargs, attempts=1)
+            try:
+                await self.ddb.put_item(
+                    TableName=self.table, Item=item,
+                    ConditionExpression="attribute_not_exists(PK)",
+                )
+                return AttemptResult(proceed=True)
+            except Exception as e:
+                if not _is_conditional_check_failed(e):
+                    raise
+                # Lost the create race — read the winner's row and decide.
+                existing = await self.get_row(
+                    handler_name=kwargs["handler_name"], event_id=kwargs["event_id"],
+                )
+                if existing is None:
+                    return AttemptResult(proceed=False, cached_row=None)
+
+        short = self._decide_existing(existing)
+        if short is not None:
+            return short
+
+        # Stale in_progress / failed-retryable → re-claim (unconditional overwrite).
+        item = self._build_item(kwargs, attempts=(existing.attempts or 0) + 1)
         await self.ddb.put_item(TableName=self.table, Item=item)
         return AttemptResult(proceed=True)
 
@@ -588,6 +900,9 @@ class DDBLedgerStore:
             if not last_key:
                 break
         return count
+
+    async def drain_stale_leases(self, *, handler, now=None, limit: int = 100) -> int:
+        return await _drain_stale(self, handler, now, limit)
 
     @staticmethod
     def _row_from_item(item: dict) -> LedgerRow:

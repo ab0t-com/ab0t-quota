@@ -38,3 +38,4 @@ coverage.xml
 
 # Internal dev notes (not for public repo)
 dev/
+.private/

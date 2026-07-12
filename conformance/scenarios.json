@@ -1,0 +1,2364 @@
+{
+  "conformance_version": "1",
+  "reference_runtime": "python (shared/ab0t-quota, executed on fakeredis)",
+  "generated_by": "conformance/generate_scenarios.py",
+  "generated_at": "2026-07-12T03:14:47.475517+00:00",
+  "ticket": "20260709_ab0t_quota_systemic_integrity_redesign (D-43)",
+  "normalization_rules": {
+    "gate_error": "an error/exception at an admission gate is a NON-admission (fail-closed)",
+    "op_error": "an op that raises normalizes to {'error': true}; no other field is asserted",
+    "gates": "each runner executes the INTERSECTION of a row's gates it implements, and must run at least one",
+    "expect_go": "per-op override for a recorded known_divergence \u2014 derived by EXECUTING Go, removed when Go aligns"
+  },
+  "known_divergences": [
+    {
+      "id": "SD-1",
+      "runtime": "go",
+      "class": "structural",
+      "decision_refs": [
+        "D-43"
+      ],
+      "note": "Go has no check-bundle gate (Python check_for_bundle). The gate_matrix rows list abstract gates; each runner executes the intersection it implements, so bundle admission in Go is still matrix-checked via Acquire(BundleName)."
+    },
+    {
+      "id": "SD-2",
+      "runtime": "go",
+      "class": "accepted_pending_fix",
+      "decision_refs": [
+        "D-54",
+        "D-56"
+      ],
+      "note": "Go derives enable_paid from billing config / a wired mesh client; Python defaults it true. Setup-level, not engine-level \u2014 no executable scenario. Align to Python's default once Go's emit path lands (D-56)."
+    },
+    {
+      "id": "SD-3",
+      "runtime": "go",
+      "class": "dev_only",
+      "decision_refs": [
+        "D-58"
+      ],
+      "note": "F-3: the IN-MEMORY idempotency claim never expires in Go; Python's carries a 24h TTL. Dev-only stores; the Redis-backed claim agrees."
+    },
+    {
+      "id": "seq_decrement_negative_delta_boundary",
+      "runtime": "go",
+      "class": "accepted_pending_fix",
+      "decision_refs": [
+        "D-58"
+      ],
+      "note": "Go Release(-2) == Release(2) (magnitude); Python raises a validation error and the gauge does not move. expect_go values derived by executing the Go runner."
+    },
+    {
+      "id": "seq_cost_zero_gauge",
+      "runtime": "go",
+      "class": "accepted_pending_fix",
+      "decision_refs": [
+        "D-58"
+      ],
+      "note": "expect_go derived by executing the Go runner (Spend treats Cost==0 as 1)."
+    }
+  ],
+  "structural_conformance": [
+    {
+      "id": "ST-TOPOLOGY-1",
+      "title": "Redis topology is machine-checked at startup; a cluster is REFUSED",
+      "decision_refs": [
+        "D-71",
+        "D-23",
+        "D-32",
+        "D-49",
+        "D-51"
+      ],
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "setup",
+      "why_not_a_scenario": "the check runs in setup_quota / quota.Setup, before an engine exists; the engine replayer has no boot verb. Declared structurally rather than forced into a scenario row that would not execute what it claims.",
+      "contract": [
+        "CLUSTER INFO reporting cluster_enabled:1 => REFUSE TO START (typed error).",
+        "CLUSTER INFO unavailable/unparseable => UNKNOWN => REFUSE TO START, unless storage.redis_cluster_confirmed_disabled is explicitly true (an operator assertion on the record).",
+        "An operator assertion NEVER overrides a positive cluster_enabled:1 \u2014 a definitive negative is not overridable (the allkeys-* eviction analogue, D-32).",
+        "cluster_enabled:0 => single-node => start (the guard is not a blanket reject).",
+        "The verdict is published as capability `redis_topology` and a non-single-node verdict FAILS the money-aware health probe (D-40/D-49/D-51)."
+      ],
+      "capability_key": "redis_topology",
+      "capability_values": [
+        "single-node",
+        "CLUSTER (unsupported)",
+        "unknown"
+      ],
+      "config_key": "storage.redis_cluster_confirmed_disabled",
+      "env_key": "AB0T_QUOTA_REDIS_CLUSTER_CONFIRMED_DISABLED",
+      "cluster_error_must_contain": [
+        "CROSSSLOT",
+        "multi-key",
+        "cluster_enabled:1",
+        "single-node",
+        "roadmap"
+      ],
+      "unknown_error_must_contain": [
+        "CROSSSLOT",
+        "redis_cluster_confirmed_disabled"
+      ],
+      "roadmap": "cluster SUPPORT (hash-tagged quota:{org} keyspace, storage.keyspace_version + dual-read/write) is gated future work (D-23). v1 ships an honest refusal."
+    },
+    {
+      "id": "ST-PREFLIGHT-1",
+      "title": "The COUNTER's Redis is machine-checked at startup: eviction, scripting, version",
+      "decision_refs": [
+        "D-72",
+        "D-73",
+        "D-74",
+        "D-32",
+        "D-31",
+        "D-49",
+        "D-51"
+      ],
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "setup",
+      "why_not_a_scenario": "the checks run in setup_quota / quota.Setup, before an engine exists; the engine replayer has no boot verb. Declared structurally rather than forced into a scenario row that would not execute what it claims.",
+      "contract": [
+        "D-72: maxmemory-policy=allkeys-* on the COUNTER's Redis => REFUSE TO START. Redis evicts a LIVE gauge under memory pressure; the counter then reads zero for a resource that is still running => under-count => phantom headroom => OVER-ADMISSION (D-31's forbidden direction). Unlike the topology guard this fails SILENTLY at runtime, as free quota, behind a green health check \u2014 which is why it outranks D-71.",
+        "D-72: CONFIG unavailable => REFUSE, unless storage.redis_durability_confirmed is explicitly true (an operator assertion on the record). An assertion NEVER overrides an allkeys-* policy the server actually reported (D-32's law).",
+        "D-72: the counter's fatal property is EVICTION, not persistence \u2014 appendonly=no alone must NOT block startup (a restart-lost counter heals via the reconciler, D-28; an evicted one silently under-counts). The OUTBOX needs both; the counter needs only the first.",
+        "D-73: SCRIPT LOAD of the REAL acquire source at boot; a Redis that cannot run the counter's Lua => REFUSE TO START (never a first-acquire outage).",
+        "D-74: a Redis below the supported version floor => REFUSE. An unreadable version is `unknown` (recorded, not a refusal \u2014 a stated deviation, see the artifact).",
+        "The verdicts are published as capabilities `counter_eviction_policy` / `redis_scripting` / `redis_version`; the first two FAIL the money-aware health probe, and their ABSENCE degrades it (D-40/D-49/D-51)."
+      ],
+      "capability_keys": [
+        "counter_eviction_policy",
+        "redis_scripting",
+        "redis_version"
+      ],
+      "config_key": "storage.redis_durability_confirmed",
+      "env_key": "AB0T_QUOTA_REDIS_DURABILITY_CONFIRMED",
+      "evicting_policies": [
+        "allkeys-lru",
+        "allkeys-lfu",
+        "allkeys-random"
+      ],
+      "version_floor": "6.0.0",
+      "eviction_error_must_contain": [
+        "evict",
+        "under-count",
+        "phantom headroom",
+        "over-admission",
+        "noeviction",
+        "redis_durability_confirmed"
+      ],
+      "scripting_error_must_contain": [
+        "eval",
+        "script",
+        "acquire"
+      ]
+    },
+    {
+      "id": "ST-RUNTIME-1",
+      "title": "The infrastructure invariants are RE-verified on an interval, and a runtime violation is LOUD but NOT FATAL",
+      "decision_refs": [
+        "D-75",
+        "D-76",
+        "D-77",
+        "D-50",
+        "D-40",
+        "D-49",
+        "D-51",
+        "D-31"
+      ],
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "setup+runtime",
+      "why_not_a_scenario": "this is about TIME, not about an engine operation: it asserts that a boot-time verdict is re-checked while the process runs. The engine replayer has no clock and no boot verb. Declared structurally rather than forced into a scenario row.",
+      "law": "An assumption machine-checked once is an assumption trusted thereafter.",
+      "contract": [
+        "D-75: the Redis invariants (topology, eviction policy, scripting, version, memory headroom) and the DDB tables are RE-VERIFIED on an interval \u2014 riding the RECONCILER loop, never a new worker (every loop we add is another thing that can be dead, D-50).",
+        "D-75: a safe->unsafe transition at RUNTIME is LOUD, NOT FATAL. It updates Capabilities, degrades the health probe IMMEDIATELY, and fires a money-incident alert. It MUST NOT crash or refuse: a running service that suddenly refuses is its own outage. The operator decides whether to drain.",
+        "D-75: the transition is not a one-way latch \u2014 a repaired Redis HEALS the probe with no restart, and a paired `restored` alert fires (D-26's resolve trail).",
+        "D-76: the DynamoDB tables holding the activation ledger and the outbox are verified at boot and re-verified on the interval: table ACTIVE, every GSI ACTIVE (a backfilling index silently MISSES rows), TTL enabled on the attribute the library actually writes (a TTL on any other attribute may DELETE rows we never marked), and PITR enabled. PITR-unverifiable (DynamoDB Local cannot answer it) requires the on-the-record storage.ddb_pitr_confirmed assertion.",
+        "D-76: a DISABLED TTL WARNS but does not refuse (rows never reap: growth and cost; nothing is lost). Refusing there would be the D-49 false-503 mistake.",
+        "D-77: memory headroom is surfaced and DEGRADES as it approaches the cliff. `noeviction` + a tight maxmemory fails CLOSED (the safe direction) but takes the service DOWN with no warning."
+      ],
+      "capability_keys": [
+        "counter_eviction_policy",
+        "redis_topology",
+        "redis_scripting",
+        "memory_headroom",
+        "ddb_outbox",
+        "ddb_activations"
+      ],
+      "config_key": "storage.ddb_pitr_confirmed",
+      "env_key": "AB0T_QUOTA_DDB_PITR_CONFIRMED",
+      "runtime_violation_is_fatal": false,
+      "runtime_violation_degrades_health": true,
+      "runtime_violation_alerts": true,
+      "reverification_rides": "the reconciler loop",
+      "memory_warn_ratio": 0.9,
+      "ddb_fatal_findings": [
+        "table_missing",
+        "table_not_active",
+        "gsi_not_active",
+        "ttl_on_unexpected_attribute",
+        "pitr_disabled",
+        "pitr_unverifiable_without_assertion"
+      ],
+      "ddb_warn_findings": [
+        "ttl_disabled"
+      ]
+    },
+    {
+      "id": "ST-EFFECT-1",
+      "title": "Check the EFFECT, not just the policy; and a guarantee the client can switch off may not disappear quietly",
+      "decision_refs": [
+        "D-80",
+        "D-79",
+        "D-78",
+        "D-66",
+        "D-50",
+        "D-31",
+        "D-49"
+      ],
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "setup+runtime",
+      "why_not_a_scenario": "both contracts are about the world OUTSIDE the engine (what a Redis already DID, and which loops a config REQUIRES). The engine replayer has neither a server nor a clock.",
+      "laws": [
+        "D-80: for every assumption we verify, ask whether an observable FACT proves it was ALREADY violated \u2014 and check that too. The policy is the forecast; INFO stats.evicted_keys is the fact.",
+        "D-79: wiring SATISFIES a contract; it does not DEFINE one (D-66). A required loop that is absent degrades the probe.",
+        "D-78: a double can prove what YOUR code does. It can never prove the OTHER side behaves as you modelled it."
+      ],
+      "contract": [
+        "D-80: `INFO stats.evicted_keys` > 0 on the Redis holding the COUNTER is a MONEY INCIDENT \u2014 degrade the health probe, alert a human, and mark the counter untrusted so the reconcile pass converges it. It fires even when maxmemory-policy now reads `noeviction`: a server corrected AFTER it evicted a live gauge passes every policy check, while the counter under-counts a resource that still exists (D-31).",
+        "D-80: zero evictions is healthy (the guard is not a blanket alarm); an unreadable INFO stats is `unknown` and does not degrade (the policy check already fails closed on an unverifiable server).",
+        "D-79: if the counter lives on Redis, `preflight_reverification` is a REQUIRED loop, DERIVED from config. Absent (no reconciler loop) or empty (a live reconciler carrying no preflight) \u21d2 the probe DEGRADES. Liveness of the carrier is not delivery of the cargo.",
+        "D-79: an in-memory counter derives no such requirement (n/a) \u2014 a false 503 trains operators to ignore the probe (D-49)."
+      ],
+      "capability_keys": [
+        "counter_evictions_observed",
+        "preflight_reverification"
+      ],
+      "eviction_fact_field": "INFO stats.evicted_keys",
+      "eviction_fact_degrades_health": true,
+      "eviction_fact_alerts": true,
+      "eviction_fact_marks_counter_untrusted": true,
+      "reverification_required_when": "the counter store is redis"
+    },
+    {
+      "id": "ST-WORKING-1",
+      "title": "A CONFIGURED guarantee is not a WORKING one; and a store must provision the table it depends on",
+      "decision_refs": [
+        "D-81",
+        "D-82",
+        "D-80",
+        "D-78",
+        "D-76",
+        "D-35",
+        "D-49",
+        "D-31"
+      ],
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "setup+runtime",
+      "why_not_a_scenario": "both are about the world outside the engine \u2014 whether a Redis is actually persisting, and whether a DynamoDB table exists. The engine replayer has neither a disk nor a control plane.",
+      "law": "The config is the intent; the status field is the fact. Verify both.",
+      "contract": [
+        "D-81: a Redis reporting aof_last_write_status / rdb_last_bgsave_status / aof_last_bgrewrite_status != ok is NOT durable, however green `appendonly` reads. The ONE durability check (D-35) asks both, so the existing boot gate refuses it.",
+        "D-81: at RUNTIME a persist failure on the Redis holding the OUTBOX is a MONEY INCIDENT (degrade + CRITICAL alert): a lost outbox row is money nobody can reconstruct. The SAME failure on a Redis that only holds the COUNTER is NOT: the counter heals (reconciler \u2192 \u03a3 open activations). Severity by CONSEQUENCE, not uniformity \u2014 reporting both as money loss would be the D-49 false-503 mistake.",
+        "D-81: an unreadable INFO persistence is `unknown` and does not degrade \u2014 the CONFIG check already fails closed on a server it cannot interrogate.",
+        "D-82: the handler-ledger DDB store PROVISIONS its table (create + wait ACTIVE + TTL on the `ttl` attribute it writes) and is PREFLIGHTED (D-76), exactly like the outbox and the activation store. It previously ASSUMED the table existed \u2014 invisible because the only thing exercising it was a fake, and a fake creates nothing (D-78)."
+      ],
+      "capability_keys": [
+        "redis_persist_status",
+        "ddb_handler_ledger"
+      ],
+      "persist_fact_fields": [
+        "aof_last_write_status",
+        "rdb_last_bgsave_status",
+        "aof_last_bgrewrite_status"
+      ],
+      "persist_failure_is_money_incident_when": "the outbox is on that redis",
+      "ledger_provisions_its_table": true,
+      "ledger_ttl_attribute": "ttl"
+    },
+    {
+      "id": "ST-SETTLE-1",
+      "title": "A money event past its reservation window is SETTLED, not voided \u2014 and the void survives as the fallback for what genuinely cannot settle",
+      "decision_refs": [
+        "D-12",
+        "D-31",
+        "D-35",
+        "D-36",
+        "D-64",
+        "B-D1",
+        "B-D9",
+        "B-D11"
+      ],
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "outbox+runtime",
+      "ticket": "billing/output/tickets/20260712_revenue_chain_integrity (the CALLER leg)",
+      "why_not_a_scenario": "this is about the world OUTSIDE the engine \u2014 an HTTP call to another service, its status codes, and a durable dedup marker in ITS database. The engine replayer has no billing service and no network. It is declared structurally, and each runtime proves it against real infrastructure: Python against billing's REAL FastAPI route on real DynamoDB Local + real Redis; Go against a real HTTP round-trip plus the FROZEN proration vectors that Python derived by EXECUTING billing's real function.",
+      "law": "Commit-cannot-take-it does not mean nothing-can-take-it. An undeliverable money event is SETTLED against billing's durable, activation-scoped path; it is voided ONLY if it genuinely cannot settle.",
+      "contract": [
+        "D-12/D-64: the drain used to VOID a past-horizon money event on the premise that 'a late commit would 404 at billing anyway'. Billing now has POST /billing/{org_id}/settle, so that premise is FALSE \u2014 and until this contract landed, NOTHING CALLED IT. The endpoint existed and the revenue was still lost: a mechanism is not a guarantee.",
+        "THE TERMINAL-EVENT GATE (load-bearing): ONLY resource.stopped / resource.deleted may settle. resource.started and resource.heartbeat ride the SAME outbox, reach the SAME void path and carry a reservation_id \u2014 so they LOOK settleable. Settling one would BURN the settlement key (which is the reservation_id, and whose dedup at billing is DURABLE AND ETERNAL) on a partial, wrong amount, and the REAL terminal settlement that follows would then be REFUSED as a duplicate: the customer charged the WRONG amount AND the true settlement LOST. Strictly worse than the defect.",
+        "THE KEY IS THE RESERVATION_ID \u2014 the same key billing's OWN SQS lifecycle consumer settles under. That is what makes the two settlement paths dedup AGAINST EACH OTHER when an SNS copy of an already-settled event is later delivered. A different key (e.g. activation_id) is TWO keys for ONE usage \u2014 a double charge.",
+        "D-31 FAIL DIRECTION: it fails toward RETRYING, never toward DISCARDING; and toward NOT DEBITING, never toward DEBITING TWICE. A 5xx / timeout / unreachable billing leaves the intent PENDING in the durable store (retried forever), and is NEVER voided \u2014 a network blip must not consume real revenue. This is safe on a TIMEOUT, where the caller cannot know whether the settlement landed, because the no-double-debit guarantee is billing's DynamoDB conditional write (NO TTL), not a branch of client code: a retry of a settlement that DID land returns the original result and moves no money.",
+        "\u26a0\ufe0f A 409 IS **NOT** A SUCCESS, AND MUST NEVER BE ACKED (this REPLACED the earlier clause, which said the opposite and was a REVENUE-LOSS BUG). Billing returns ONE OPAQUE 409 by design \u2014 distinct codes would build a CROSS-TENANT ENUMERATION ORACLE, because its precheck reads Redis BEFORE it checks tenancy. That single code covers 'reservation_still_live:use_commit' (THE MONEY IS NOT TAKEN), 'org_mismatch' (nothing settled) AND 'already_committed:ledger_row_exists' (the money IS booked). TWO OF THE THREE mean the settlement did not land, so acking a 409 retires the durable outbox row and DISCARDS the revenue \u2014 D-12's loss, re-entering through the ERROR CONTRACT. It must RETRY. Ambiguity is not success (D-49: 'not obviously a failure' is not 'definitely a success'). Retrying is FREE: billing's dedup is a durable conditional write, so an already-settled event moves no money and returns 200/replayed.",
+        "THE ONLY THING THAT MAY RETIRE A MONEY EVENT IS AN AFFIRMATIVE ANSWER \u2014 a 200 that positively says the usage is accounted for (settled, or replayed=true). No outcome may be INFERRED from an ambiguous refusal. OWED (B-D24): billing cannot currently give that affirmative signal for an already-committed reservation without re-opening the enumeration oracle, so such an event retries until a human retires it. That is loud and safe, and it is the correct direction to be wrong in.",
+        "A 4xx that is not 409 (400 negative cost, 403, 404 unknown org) is PERMANENT: void + ALERT, do not churn. The void/alert path is KEPT, and a human still hears it.",
+        "B-D11: dispatch on the STATUS CODE, never on the error's text. Billing's own consumer dispatched on str(e) \u2014 the EMPTY STRING for an HTTPException on its pinned starlette \u2014 and its entire revenue-loss alarm was dead code for months.",
+        "\u2b50 B-D13 (D-35, RESOLVED \u2014 this REPLACED the earlier clause): the caller sends the INPUTS (started_at, stopped_at, hourly_rate?, allocation_fee?) and BILLING PRICES THEM. /settle used to take a COMPUTED actual_cost, which forced every caller to reimplement billing's proration \u2014 THREE implementations of one money law (billing's, ab0t-quota's, ab0t-quota-go's), guarded by a frozen vector table. A copy kept in sync is still a copy. Both libraries' proration is now ARCHIVED, not synchronised: A CALLER THAT CANNOT COMPUTE A COST CANNOT COMPUTE IT WRONG. Neither runtime may reintroduce cost arithmetic.",
+        "NEVER INVENT A PRICE (D-36). A missing hourly_rate is reported as MISSING \u2014 it is NOT a reason to refuse (the allocation fee may still be owed, and refusing re-creates a revenue-loss path). Billing prices a rate-less RUNTIME at ZERO and ALERTS (settle_missing_hourly_rate). That policy lives in exactly ONE place: the libraries neither ship a competing default (billing's dead fallback would have invented $0.10/hr \u2014 a price nobody configured) nor raise a competing alert. A fabricated price is worse than no price: nothing is honest, recoverable and alertable; fabricated is an overcharge we cannot defend.",
+        "B-D14, AND NOT RECREATING IT: a money value the caller does not have is OMITTED from the payload, NEVER sent as an explicit null. The bug just fixed was an ALWAYS-PRESENT KEY WHOSE VALUE WAS SOMETIMES NULL \u2014 the library always set hourly_rate (to null when unpriced) and billing's .get(k, \"0.10\") only defaults on an ABSENT key, so it computed Decimal(\"None\") -> InvalidOperation -> the money event DLQ'd, and the fallback was unreachable. Send absence as ABSENCE.",
+        "THE CONTRACT IS PINNED, NOT THE ARITHMETIC: settlement_contract_vectors_20260712.json freezes, for each observed event, the EXACT request body billing's REAL pydantic model accepts and the cost billing's REAL price_usage computes \u2014 derived by EXECUTING billing. Go replays it. B-D16 is binding ON THAT TABLE: it MUST contain the sub-minute floor and the rounding boundary, because whole-hour lifetimes are where a wrong law HIDES (NC-5 swapped in a flatly wrong law and a whole-hour suite on real infrastructure stayed GREEN).",
+        "B-D1: the Go suite's billing server is a STAND-IN and is honest about it \u2014 a double proves what YOUR code does, never that the OTHER house behaves as you modelled it. The cross-house certification is Python's, against billing's real route."
+      ],
+      "capability_keys": [
+        "outbox_settlement_fallback"
+      ],
+      "terminal_cost_events": [
+        "resource.stopped",
+        "resource.deleted"
+      ],
+      "caller_sends_inputs_not_cost": true,
+      "caller_computes_no_cost": true,
+      "settlement_request_fields": [
+        "settlement_key",
+        "started_at",
+        "stopped_at",
+        "hourly_rate?",
+        "allocation_fee?",
+        "reservation_id?",
+        "usage_record_id?"
+      ],
+      "missing_rate_prices_runtime_at_zero_and_billing_alerts": true,
+      "caller_never_invents_a_rate": true,
+      "absent_money_keys_are_OMITTED_never_null": true,
+      "settlement_key": "reservation_id",
+      "settlement_endpoint": "POST /billing/{org_id}/settle",
+      "transient_statuses_retry_never_void": [
+        500,
+        502,
+        503,
+        504,
+        408,
+        429
+      ],
+      "permanent_statuses_void_and_alert": [
+        400,
+        401,
+        403,
+        404,
+        422
+      ],
+      "ambiguous_409_must_RETRY_never_ack": true,
+      "409_is_not_a_success": true,
+      "only_an_affirmative_200_may_retire_a_money_event": true,
+      "dedup_is_durable_no_ttl": true,
+      "contract_vector_table": "settlement_contract_vectors_20260712.json",
+      "unsettleable_still_voids_and_alerts": true
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "gm_under_limit_baseline",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-48"
+      ],
+      "notes": "sanity: the matrix is not vacuously denying everything",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "gates": [
+        "check_resource",
+        "check_bundle",
+        "acquire_resource",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": true
+      }
+    },
+    {
+      "id": "gm_over_limit_baseline",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-48"
+      ],
+      "notes": "",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 1.0
+        }
+      ],
+      "gates": [
+        "check_resource",
+        "check_bundle",
+        "acquire_resource",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": false
+      }
+    },
+    {
+      "id": "gm_under_limit_kill_switch",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-48",
+        "D-31"
+      ],
+      "notes": "the emergency stop must stop EVERY gate, under or over the limit",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {
+          "global_kill_switch": true
+        }
+      },
+      "setup": [],
+      "gates": [
+        "check_resource",
+        "check_bundle",
+        "acquire_resource",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": false
+      }
+    },
+    {
+      "id": "gm_over_limit_kill_switch",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-48",
+        "D-31"
+      ],
+      "notes": "",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {
+          "global_kill_switch": true
+        }
+      },
+      "setup": [
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 1.0
+        }
+      ],
+      "gates": [
+        "check_resource",
+        "check_bundle",
+        "acquire_resource",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": false
+      }
+    },
+    {
+      "id": "gm_over_limit_disabled",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-48",
+        "D-55"
+      ],
+      "notes": "enabled=false bypasses on every gate (N-1: the knob must DO something)",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {
+          "enabled": false
+        }
+      },
+      "setup": [
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 1.0
+        }
+      ],
+      "gates": [
+        "check_resource",
+        "check_bundle",
+        "acquire_resource",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": true
+      }
+    },
+    {
+      "id": "gm_over_limit_shadow",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-48",
+        "D-55"
+      ],
+      "notes": "shadow observes, never refuses \u2014 a hard-deny here blocks the rollout shadow exists to make safe",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {
+          "shadow_mode": true
+        }
+      },
+      "setup": [
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 1.0
+        }
+      ],
+      "gates": [
+        "check_resource",
+        "check_bundle",
+        "acquire_resource",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": true
+      }
+    },
+    {
+      "id": "gm_unknown_bundle_enforce",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-14",
+        "D-48"
+      ],
+      "notes": "a config typo must not silently disable enforcement",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "gates": [
+        "check_bundle",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": false
+      },
+      "target": {
+        "bundle": "typo_bundle"
+      }
+    },
+    {
+      "id": "gm_unknown_bundle_shadow",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-14",
+        "D-48"
+      ],
+      "notes": "",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {
+          "shadow_mode": true
+        }
+      },
+      "setup": [],
+      "gates": [
+        "check_bundle",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": true
+      },
+      "target": {
+        "bundle": "typo_bundle"
+      }
+    },
+    {
+      "id": "gm_unknown_resource_enforce",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-14",
+        "D-48"
+      ],
+      "notes": "resource-key analogue of the unknown-bundle hole; an error at a gate is a non-admission (fail-closed)",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "gates": [
+        "check_resource",
+        "acquire_resource"
+      ],
+      "expect": {
+        "admitted": false
+      },
+      "target": {
+        "resource": "typo.resource"
+      }
+    },
+    {
+      "id": "gm_unknown_tier_enforce",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-14",
+        "D-48"
+      ],
+      "notes": "a mis-mapped paying org must NOT get a silent unlimited admit",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "ghost_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "gates": [
+        "check_resource",
+        "check_bundle",
+        "acquire_resource",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": false
+      }
+    },
+    {
+      "id": "gm_unknown_tier_shadow",
+      "kind": "gate_matrix",
+      "group": "enforcement_matrix",
+      "decision_refs": [
+        "D-14",
+        "D-48"
+      ],
+      "notes": "unknown tier is a config ERROR, not a shadowable deny \u2014 it must surface",
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "ghost_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {
+          "shadow_mode": true
+        }
+      },
+      "setup": [],
+      "gates": [
+        "check_resource",
+        "check_bundle",
+        "acquire_resource",
+        "acquire_bundle"
+      ],
+      "expect": {
+        "admitted": false
+      }
+    },
+    {
+      "id": "seq_acquire_at_limit",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 2.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "admit to the limit, deny past it; denied acquire mints NO activation id",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "expect": {
+            "admitted": false,
+            "minted": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 2.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_double_release",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58",
+        "D-20"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "release is idempotent on activation_id; the second release performs NOTHING (no double-decrement)",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "save": "a1",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "release_activation",
+          "ref": "a1",
+          "expect": {
+            "performed": true
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 0.0
+          }
+        },
+        {
+          "op": "release_activation",
+          "ref": "a1",
+          "expect": {
+            "performed": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_release_unknown_id",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "an unknown activation_id releases NOTHING \u2014 it may not touch the gauge",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "release_activation",
+          "id": "act_00000000000000000000000000000000",
+          "expect": {
+            "performed": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_settle_without_release",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58",
+        "D-60"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "F-1: settle without release strands the gauge slot (over-count, fail-CLOSED); the reconciler heals it",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "save": "a1",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "settle",
+          "ref": "a1",
+          "cost": "0.42",
+          "expect": {
+            "settled": true
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 1.0
+          }
+        },
+        {
+          "op": "release_activation",
+          "ref": "a1",
+          "expect": {
+            "performed": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_settle_after_release",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58",
+        "D-46"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "settle after release still lands (the money is real); the re-settle with a DIFFERENT cost replays idempotently (first wins) AND fires the loud settle_conflict alert (D-46) \u2014 never a silent choice between two costs.",
+      "expect_events": [
+        {
+          "kind": "settle_conflict",
+          "resource": "conf.g"
+        }
+      ],
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "save": "a1",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "release_activation",
+          "ref": "a1",
+          "expect": {
+            "performed": true
+          }
+        },
+        {
+          "op": "settle",
+          "ref": "a1",
+          "cost": "1.00",
+          "expect": {
+            "settled": true
+          }
+        },
+        {
+          "op": "settle",
+          "ref": "a1",
+          "cost": "9.99",
+          "expect": {
+            "settled": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_duplicate_acquire_same_idem",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "an idempotent replay admits WITHOUT re-spending and mints NO second id",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "idem": "create-1",
+          "expect": {
+            "admitted": true,
+            "minted": true,
+            "reason": "ok"
+          }
+        },
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "idem": "create-1",
+          "expect": {
+            "admitted": true,
+            "minted": false,
+            "reason": "dup"
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_concurrent_release_one_id",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58",
+        "D-20"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "10 racing releases of ONE id perform exactly one decrement (mark-then-decrement)",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "save": "a1",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "concurrent_release",
+          "ref": "a1",
+          "n": 10,
+          "expect": {
+            "performed_count": 1
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_per_user_acquire_release",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "per-user partition + seq key maintained alongside the org gauge, and released with it",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "user": "user-1",
+          "save": "a1",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "scope": "user",
+          "user": "user-1",
+          "expect": {
+            "value": 1.0
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "scope": "user_seq",
+          "user": "user-1",
+          "expect": {
+            "value": 1.0
+          }
+        },
+        {
+          "op": "release_activation",
+          "ref": "a1",
+          "expect": {
+            "performed": true
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 0.0
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "scope": "user",
+          "user": "user-1",
+          "expect": {
+            "value": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_legacy_floor",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58",
+        "D-20"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "QG-06: a gauge floors at zero \u2014 a decrement may never manufacture headroom",
+      "ops": [
+        {
+          "op": "increment",
+          "resource": "conf.g",
+          "delta": 1,
+          "expect": {
+            "value": 1.0
+          }
+        },
+        {
+          "op": "decrement",
+          "resource": "conf.g",
+          "delta": 5,
+          "expect": {
+            "value": 0.0
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 0.0
+          }
+        },
+        {
+          "op": "decrement",
+          "resource": "conf.g",
+          "delta": 1,
+          "expect": {
+            "value": 0.0
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_increment_negative_delta_magnitude",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58",
+        "D-31"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 5.0
+        }
+      ],
+      "notes": "GT-02: a negative increment delta is a MAGNITUDE \u2014 it may never erase a spend (pre-fix Go applied the raw negative). Deprecated: next major REJECTS it (D-58).",
+      "ops": [
+        {
+          "op": "increment",
+          "resource": "conf.g",
+          "delta": -3,
+          "expect": {
+            "value": 8.0
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 8.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_decrement_negative_delta_boundary",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58",
+        "D-31"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 5.0
+        }
+      ],
+      "notes": "GT-03 at the ENGINE boundary: Python REJECTS decrement(delta<0) (model gt=0); Go Release() coerces to magnitude. Both are fail-safe directions but they DIVERGE; D-58's deprecation (reject at the boundary) is the convergence target.",
+      "known_divergence": {
+        "runtime": "go",
+        "class": "accepted_pending_fix",
+        "decision_refs": [
+          "D-58"
+        ],
+        "note": "Go Release(-2) == Release(2) (magnitude); Python raises a validation error and the gauge does not move. expect_go values derived by executing the Go runner."
+      },
+      "ops": [
+        {
+          "op": "decrement",
+          "resource": "conf.g",
+          "delta": -2,
+          "expect": {
+            "error": true
+          },
+          "expect_go": {
+            "error": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 5.0
+          },
+          "expect_go": {
+            "value": 3.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_rate_cost_event_count",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58",
+        "D-31"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "GT-04: a rate delta is an EVENT COUNT \u2014 increment(3) records 3 events. Pre-fix Go recorded ONE: its rate limit was silently 3x wider.",
+      "ops": [
+        {
+          "op": "increment",
+          "resource": "conf.r",
+          "delta": 3,
+          "expect": {
+            "value": 3.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_rate_fractional_cost",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-60"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "F-4: a fractional rate delta truncates to ZERO events in BOTH runtimes (agreed, and agreed-WRONG: fail-open; D-60 says reject non-integer rate costs at the boundary). This row pins the AGREEMENT until that lands.",
+      "ops": [
+        {
+          "op": "increment",
+          "resource": "conf.r",
+          "delta": 0.5,
+          "expect": {
+            "value": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_cost_zero_gauge",
+      "kind": "sequence",
+      "group": "semantics",
+      "decision_refs": [
+        "D-58"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "F-2: cost==0 is a NO-OP in Python; Go coerces 0 to 1 (its CheckInput cannot distinguish unset from explicit zero) \u2014 a silent over-count. D-58: Go must adopt the no-op; until then this is a recorded divergence, not a blessing.",
+      "known_divergence": {
+        "runtime": "go",
+        "class": "accepted_pending_fix",
+        "decision_refs": [
+          "D-58"
+        ],
+        "note": "expect_go derived by executing the Go runner (Spend treats Cost==0 as 1)."
+      },
+      "ops": [
+        {
+          "op": "increment",
+          "resource": "conf.g",
+          "delta": 0,
+          "expect": {
+            "value": 0.0
+          },
+          "expect_go": {
+            "value": 1.0
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 0.0
+          },
+          "expect_go": {
+            "value": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_settle_rejects_nonfinite_cost",
+      "kind": "sequence",
+      "group": "money",
+      "decision_refs": [
+        "D-47"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "D-47: NaN is money poison \u2014 one accepted NaN makes every subsequent read NaN. Python rejects BEFORE the ledger; Go has NO settle-cost validation (defect).",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "save": "a1",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "settle",
+          "ref": "a1",
+          "cost": "NaN",
+          "expect": {
+            "error": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_settle_rejects_negative_cost",
+      "kind": "sequence",
+      "group": "money",
+      "decision_refs": [
+        "D-47"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "D-47: a negative cost is a refund wearing usage's clothes \u2014 refunds go through billing, never settle.",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "save": "a1",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "settle",
+          "ref": "a1",
+          "cost": "-1",
+          "expect": {
+            "error": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_acquire_persist_failure_fail_closed",
+      "kind": "sequence",
+      "group": "crash",
+      "decision_refs": [
+        "D-27",
+        "D-28",
+        "D-31"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [
+        {
+          "do": "fault",
+          "type": "activation_put_fails"
+        }
+      ],
+      "notes": "THE fail-direction row. When the activation store dies between the spend and the persist, acquire must ERROR (never a silent admitted=true) and the spend must STAY (over-count/deny is the only acceptable silent direction). A runtime that rolls the gauge back \u2014 or admits \u2014 under-counts: forbidden.",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "expect": {
+            "error": true
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "seq_over_limit_admitted_event",
+      "kind": "sequence",
+      "group": "observability",
+      "decision_refs": [
+        "D-24",
+        "D-26"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 1.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {}
+      },
+      "setup": [],
+      "notes": "D-24 B's premise: the legacy counter counts at the fact and never refuses, so crossing the limit MUST become an observable event (a sink, not a comment).",
+      "ops": [
+        {
+          "op": "increment",
+          "resource": "conf.g",
+          "delta": 1,
+          "expect": {
+            "value": 1.0
+          }
+        },
+        {
+          "op": "increment",
+          "resource": "conf.g",
+          "delta": 1,
+          "expect": {
+            "value": 2.0
+          }
+        }
+      ],
+      "expect_events": [
+        {
+          "kind": "over_limit_admitted",
+          "resource": "conf.g"
+        }
+      ]
+    },
+    {
+      "id": "rec_ledger_only_heals_drift",
+      "kind": "sequence",
+      "group": "reconcile",
+      "decision_refs": [
+        "D-33"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {},
+        "reconcile": {
+          "activity_guard_seconds": 0
+        }
+      },
+      "setup": [
+        {
+          "do": "seed_open",
+          "resource": "conf.g",
+          "n": 1,
+          "age_seconds": 3600
+        },
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 5.0
+        }
+      ],
+      "notes": "D-33 \u00a71: no provider -> the ledger is the best proxy for existence; a crash-orphaned over-count heals DOWN to \u03a3 open activations. No divergence alarm (there is no second source to disagree with).",
+      "ops": [
+        {
+          "op": "reconcile_org",
+          "expect": {
+            "divergence_alert": false,
+            "unreachable_alert": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "rec_provider_wins_existence_divergence",
+      "kind": "sequence",
+      "group": "reconcile",
+      "decision_refs": [
+        "D-33",
+        "D-36"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {},
+        "reconcile": {
+          "activity_guard_seconds": 0
+        }
+      },
+      "setup": [
+        {
+          "do": "seed_open",
+          "resource": "conf.g",
+          "n": 1,
+          "age_seconds": 3600
+        },
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 1.0
+        },
+        {
+          "do": "provider",
+          "observed": {
+            "conf.g": 3
+          }
+        }
+      ],
+      "notes": "D-33 \u00a72: provider and ledger DISAGREE about existence \u2014 that is a BUG, not drift. Converge to the PROVIDER (reality), ALERT, never fabricate a row.",
+      "ops": [
+        {
+          "op": "reconcile_org",
+          "expect": {
+            "divergence_alert": true,
+            "unreachable_alert": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 3.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "rec_provider_unreachable_do_nothing",
+      "kind": "sequence",
+      "group": "reconcile",
+      "decision_refs": [
+        "D-33",
+        "D-31"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {},
+        "reconcile": {
+          "activity_guard_seconds": 0
+        }
+      },
+      "setup": [
+        {
+          "do": "seed_open",
+          "resource": "conf.g",
+          "n": 1,
+          "age_seconds": 3600
+        },
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 99.0
+        },
+        {
+          "do": "provider_unreachable"
+        }
+      ],
+      "notes": "D-31 binds the reconciler: provider unreachable -> do NOTHING and alert. Never converge to the ledger as a fallback \u2014 that erases reality exactly when the record is the thing that's broken.",
+      "ops": [
+        {
+          "op": "reconcile_org",
+          "expect": {
+            "divergence_alert": false,
+            "unreachable_alert": true
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 99.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "rec_provider_absent_key_means_unknown",
+      "kind": "sequence",
+      "group": "reconcile",
+      "decision_refs": [
+        "D-51",
+        "D-31",
+        "D-33"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {},
+        "reconcile": {
+          "activity_guard_seconds": 0
+        }
+      },
+      "setup": [
+        {
+          "do": "seed_open",
+          "resource": "conf.g",
+          "n": 1,
+          "age_seconds": 3600
+        },
+        {
+          "do": "set_gauge",
+          "resource": "conf.g",
+          "value": 1.0
+        },
+        {
+          "do": "provider",
+          "observed": {}
+        }
+      ],
+      "notes": "D-51: a resource_key ABSENT from the provider result is 'no observation', never an affirmative zero. Converging absence to 0 erases a live spend \u2014 the forbidden direction.",
+      "ops": [
+        {
+          "op": "reconcile_org",
+          "expect": {
+            "divergence_alert": false,
+            "unreachable_alert": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "id": "rec_recent_touch_guard",
+      "kind": "sequence",
+      "group": "reconcile",
+      "decision_refs": [
+        "D-62",
+        "D-33"
+      ],
+      "config": {
+        "resources": [
+          {
+            "key": "conf.g",
+            "counter_type": "gauge"
+          },
+          {
+            "key": "conf.r",
+            "counter_type": "rate",
+            "window_seconds": 60
+          }
+        ],
+        "limits": {
+          "conf.g": 10.0
+        },
+        "org_tier": "conf_tier",
+        "bundles": {
+          "conf_bundle": [
+            "conf.g"
+          ]
+        },
+        "enforcement": {},
+        "reconcile": {
+          "activity_guard_seconds": 90
+        }
+      },
+      "setup": [],
+      "notes": "D-62: the recent-activity guard is a correctness PRECONDITION. A provider lags creation; force-setting a just-touched (org,resource) down is under-count/phantom headroom on every fast create (the 20260626 incident).",
+      "ops": [
+        {
+          "op": "acquire",
+          "resource": "conf.g",
+          "expect": {
+            "admitted": true,
+            "minted": true
+          }
+        },
+        {
+          "op": "set_gauge",
+          "resource": "conf.g",
+          "value": 5.0,
+          "expect": {}
+        },
+        {
+          "op": "reconcile_org",
+          "expect": {
+            "divergence_alert": false,
+            "unreachable_alert": false
+          }
+        },
+        {
+          "op": "get_gauge",
+          "resource": "conf.g",
+          "expect": {
+            "value": 5.0
+          }
+        }
+      ]
+    }
+  ]
+}

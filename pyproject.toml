@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ab0t-quota"
-version = "0.6.0"
+version = "0.6.1"
 description = "Shared quota, rate-limit, and tier enforcement for ab0t platform services"
 requires-python = ">=3.11"
 license = {text = "Proprietary"}
@@ -33,7 +33,7 @@ billing = ["httpx>=0.24", "jinja2>=3.0", "stripe>=7,<8", "structlog>=23.1"]
 webhooks = ["httpx>=0.24"]
 dynamo = ["aioboto3>=12.0"]
 all = ["httpx>=0.24", "aioboto3>=12.0", "jinja2>=3.0", "stripe>=7,<8", "structlog>=23.1"]
-dev = ["pytest", "pytest-asyncio", "fakeredis", "httpx", "stripe>=7,<8", "structlog>=23.1"]
+dev = ["pytest", "pytest-asyncio", "fakeredis[lua]", "httpx", "stripe>=7,<8", "structlog>=23.1"]
 
 [tool.setuptools.packages.find]
 include = ["ab0t_quota*"]

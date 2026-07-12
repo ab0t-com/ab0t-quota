@@ -26,8 +26,15 @@ from .persistence import QuotaStore
 from .setup import setup_quota, QuotaContext
 from .bridge import BridgeClient, BridgeContext, RemoteTierProvider
 from .caches import CachedBridgeClient, TTLCache
+from .activations import (
+    Activation, ActivationState, ActivationStore, InMemoryActivationStore,
+    RedisActivationStore, DDBActivationStore, mint_activation_id,
+    resolve_gauge_level, converge_gauge, stale_open_activations,
+)
+from .reconcile import LibraryReconciler, ReconcileConfig
+from .alerts import DriftAlertManager
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 __all__ = [
     # Engine & middleware
@@ -58,6 +65,10 @@ __all__ = [
     "AlertDispatcher",
     "LogAlertDispatcher",
     "WebhookAlertDispatcher",
+    "DriftAlertManager",
+    # Reconciler (P4)
+    "LibraryReconciler",
+    "ReconcileConfig",
     # Persistence
     "QuotaStore",
     # Config

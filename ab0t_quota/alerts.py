@@ -152,3 +152,273 @@ class AlertManager:
         # Record this alert with cooldown TTL
         await self._redis.set(cache_key, alert.severity.value, ex=self._cooldown)
         return True
+
+
+class DriftAlertManager:
+    """Alerts for the GAUGE reconciler (P4.3, ticket 20260709).
+
+    This is a DISTINCT channel from ``AlertManager`` (which is escalation-only
+    and emits no de-escalation). It exists because two second-order hazards
+    (FUTURE §5 / D-26) bite a reconciler that reuses the escalation-only path:
+
+      1. A drift that self-heals leaves NO "resolved" trail — so an on-call
+         engineer sees a scary "drift detected" and never the "all clear".
+      2. A reconciler force-set can ALERT-STORM: every pass re-fires.
+
+    So this manager fires a PAIRED event set — ``gauge_drift_detected`` and
+    ``gauge_drift_resolved`` — with the resolve keyed SEPARATELY from the detect
+    cooldown, so a *heal* is never suppressed by a prior *detect* (this is the
+    exact shape Go ships for ``over_limit_admitted`` / ``over_limit_resolved``).
+    A ``detected`` is rate-limited by a cooldown; a ``resolved`` fires whenever
+    an ``active`` marker exists, regardless of that cooldown.
+
+    A reconciliation-induced transition therefore never reads as a fresh
+    limit-incident: distinct message tags (``gauge_drift_*``), distinct
+    keyspace, distinct cooldown.
+    """
+
+    def __init__(
+        self,
+        redis: Redis,
+        dispatchers: Optional[list[AlertDispatcher]] = None,
+        cooldown_seconds: int = 600,
+        key_prefix: str = "quota:reconcile:drift",
+    ):
+        self._redis = redis
+        self._dispatchers = dispatchers or [LogAlertDispatcher()]
+        self._cooldown = cooldown_seconds
+        self._prefix = key_prefix
+
+    def _active_key(self, org_id: str, resource_key: str) -> str:
+        return f"{self._prefix}:{org_id}:{resource_key}:active"
+
+    def _detect_cd_key(self, org_id: str, resource_key: str) -> str:
+        return f"{self._prefix}:{org_id}:{resource_key}:detect_cd"
+
+    def _unreachable_cd_key(self, org_id: str) -> str:
+        return f"{self._prefix}:{org_id}:provider_unreachable_cd"
+
+    async def _dispatch(self, alert: QuotaAlert) -> None:
+        for dispatcher in self._dispatchers:
+            try:
+                await dispatcher.dispatch(alert)
+            except Exception as e:  # a broken dispatcher must never break reconcile
+                logger.error("drift_alert_dispatch_error dispatcher=%s error=%s",
+                             type(dispatcher).__name__, str(e))
+
+    # ---- D-75: infrastructure invariants (the guards' own boundary: TIME) ----------
+    # Every guard we own (D-32 durability, D-71 topology, D-72 eviction, D-73 scripting,
+    # D-76 DDB) verified the world ONCE, at boot, and then trusted it forever. A
+    # `CONFIG SET maxmemory-policy allkeys-lru` at 3am — or a managed failover onto a
+    # differently-configured replica — is invisible to all of them, and the counter becomes
+    # silently evictable (under-count → phantom headroom → over-admission, D-31). The
+    # re-check that catches it needs a HUMAN at the other end (D-40: an event with no sink
+    # is not observability), and a PAIRED restore so an on-call engineer sees the all-clear
+    # (D-26) rather than a scary violation that never closes.
+
+    def _invariant_active_key(self, name: str) -> str:
+        return f"{self._prefix}:invariant:{name}:active"
+
+    def _invariant_cd_key(self, name: str) -> str:
+        return f"{self._prefix}:invariant:{name}:detect_cd"
+
+    async def invariant_violated(self, name: str, detail: str) -> bool:
+        """An infrastructure invariant the library VERIFIED AT STARTUP has changed
+        underneath us. Rate-limited by the detect cooldown; sets the persistent `active`
+        marker so a later restore can pair with it. Returns True if dispatched."""
+        await self._redis.set(self._invariant_active_key(name), detail[:200],
+                              ex=max(self._cooldown * 8, 3600))
+        if not await self._redis.set(self._invariant_cd_key(name), "1",
+                                     ex=self._cooldown, nx=True):
+            return False  # rate-limited: already fired inside the cooldown
+        await self._dispatch(QuotaAlert(
+            org_id="_platform", resource_key=name, tier_id="",
+            severity=AlertSeverity.CRITICAL,
+            current=0.0, limit=0.0, utilization=1.0,
+            message=(f"infrastructure_invariant_violated capability={name} detail={detail} "
+                     f"— the library verified this at STARTUP and it has CHANGED at runtime "
+                     f"(D-75). Health is degraded; the service keeps serving. Drain or fix."),
+        ))
+        return True
+
+    async def invariant_restored(self, name: str) -> bool:
+        """The invariant is safe again. Fires whenever an `active` marker exists, regardless
+        of the detect cooldown — a heal must never be swallowed by a prior violation."""
+        active_key = self._invariant_active_key(name)
+        if not await self._redis.get(active_key):
+            return False
+        await self._redis.delete(active_key)
+        await self._redis.delete(self._invariant_cd_key(name))
+        await self._dispatch(QuotaAlert(
+            org_id="_platform", resource_key=name, tier_id="",
+            severity=AlertSeverity.WARNING,
+            current=0.0, limit=0.0, utilization=0.0,
+            message=f"infrastructure_invariant_restored capability={name} (D-75)",
+        ))
+        return True
+
+    async def drift_detected(
+        self, org_id: str, resource_key: str, *,
+        observed: float, ledger: float, before: float, after: float,
+        source: str, tier_id: str = "",
+    ) -> bool:
+        """Reconciler force-set the counter (a real drift). Rate-limited by the
+        detect cooldown; sets the persistent ``active`` marker so a later
+        ``drift_resolved`` can pair with it. Returns True if dispatched."""
+        # Persist the active marker (long-lived; cleared only by a resolve) so a
+        # heal can always find it. Its TTL is generous — a drift that never heals
+        # should stay "active".
+        await self._redis.set(self._active_key(org_id, resource_key), source,
+                              ex=max(self._cooldown * 8, 3600))
+        cd = self._detect_cd_key(org_id, resource_key)
+        if not await self._redis.set(cd, "1", ex=self._cooldown, nx=True):
+            return False  # rate-limited: a detect already fired inside the cooldown
+        await self._dispatch(QuotaAlert(
+            org_id=org_id, resource_key=resource_key,
+            severity=AlertSeverity.WARNING,
+            current=after, limit=observed,
+            utilization=(after / observed) if observed else 0.0,
+            tier_id=tier_id,
+            message=(f"gauge_drift_detected source={source} observed={observed} "
+                     f"ledger={ledger} counter_before={before} counter_after={after}"),
+        ))
+        return True
+
+    async def drift_resolved(
+        self, org_id: str, resource_key: str, *, value: float, tier_id: str = "",
+    ) -> bool:
+        """The (org, resource) value now matches its authoritative level. Fires
+        ONLY if a drift was previously active, then clears the markers. NOT
+        suppressed by the detect cooldown — a resolve must never be swallowed by
+        a prior admit. Returns True if dispatched."""
+        active_key = self._active_key(org_id, resource_key)
+        was_active = await self._redis.get(active_key)
+        if not was_active:
+            return False
+        await self._redis.delete(active_key)
+        await self._redis.delete(self._detect_cd_key(org_id, resource_key))
+        await self._dispatch(QuotaAlert(
+            org_id=org_id, resource_key=resource_key,
+            severity=AlertSeverity.WARNING,
+            current=value, limit=value, utilization=1.0, tier_id=tier_id,
+            message=f"gauge_drift_resolved value={value}",
+        ))
+        return True
+
+    async def divergence_detected(
+        self, org_id: str, resource_key: str, *, provider: float, ledger: float,
+        tier_id: str = "",
+    ) -> bool:
+        """D-33 §2 / D-36: the provider (reality) and the ledger (record) disagree
+        about EXISTENCE. This is a BUG, not drift, and it must read as a MONEY
+        incident — not a counter nit.
+
+        When the provider sees MORE live than the ledger records, those resources
+        have **no activation row**, so their usage **cannot be settled** —
+        un-billable usage, QB-01's signature. That is CRITICAL. When the ledger
+        over-states (phantom rows for resources no longer live), it is a WARNING
+        over-count. Rate-limited under the drift detect cooldown (and marks the
+        pair active so a later resolve fires)."""
+        await self._redis.set(self._active_key(org_id, resource_key), "divergence",
+                              ex=max(self._cooldown * 8, 3600))
+        cd = self._detect_cd_key(org_id, resource_key)
+        if not await self._redis.set(cd, "1", ex=self._cooldown, nx=True):
+            return False
+        unbillable = provider - ledger
+        if unbillable > 0:
+            severity = AlertSeverity.CRITICAL
+            msg = (f"gauge_drift_detected ledger_reality_divergence UN-BILLABLE "
+                   f"provider={provider} ledger={ledger} unbillable_live={unbillable} — "
+                   f"{unbillable:g} resource(s) live with NO activation record; their "
+                   f"usage CANNOT be settled (QB-01 signature). The record lost a row.")
+        else:
+            severity = AlertSeverity.WARNING
+            msg = (f"gauge_drift_detected ledger_reality_divergence PHANTOM_RECORDS "
+                   f"provider={provider} ledger={ledger} phantom_rows={-unbillable:g} — "
+                   f"the ledger records resources that are no longer live (over-count).")
+        await self._dispatch(QuotaAlert(
+            org_id=org_id, resource_key=resource_key, severity=severity,
+            current=provider, limit=ledger,
+            utilization=(provider / ledger) if ledger else 0.0,
+            tier_id=tier_id, message=msg,
+        ))
+        return True
+
+    async def provider_unreachable(self, org_id: str, *, error: str = "") -> bool:
+        """The observed_usage_provider raised. Per D-31 the reconciler did
+        NOTHING for this org; this makes that visible + loud. Rate-limited so a
+        sustained provider outage does not alert-storm."""
+        cd = self._unreachable_cd_key(org_id)
+        if not await self._redis.set(cd, "1", ex=self._cooldown, nx=True):
+            return False
+        await self._dispatch(QuotaAlert(
+            org_id=org_id, resource_key="*",
+            severity=AlertSeverity.CRITICAL,
+            current=0.0, limit=0.0, utilization=0.0, tier_id="",
+            message=("observed_usage_provider_unreachable — reconciler skipped this "
+                     "org and did NOT converge to the ledger (D-31); an IO error may "
+                     "never erase reality"),
+        ))
+        return True
+
+    async def missing_observation(self, org_id: str, resource_key: str) -> bool:
+        """D-51: the provider returned NO observation for this (org, resource) —
+        the key was absent, not an explicit zero. Absence means UNKNOWN, never an
+        affirmative value, so the reconciler left the counter alone and fails
+        closed. Rate-limited under the detect cooldown so an incomplete provider
+        does not alert-storm."""
+        cd = self._detect_cd_key(org_id, resource_key)
+        if not await self._redis.set(cd, "1", ex=self._cooldown, nx=True):
+            return False
+        await self._dispatch(QuotaAlert(
+            org_id=org_id, resource_key=resource_key,
+            severity=AlertSeverity.WARNING,
+            current=0.0, limit=0.0, utilization=0.0, tier_id="",
+            message=("gauge_reconcile_missing_observation — the provider returned NO "
+                     "observation for this key (absence != zero, D-51); the counter "
+                     "was left untouched rather than silently wiped to 0. If the "
+                     "provider legitimately omits ⇒ zero, set empty_provider=converge."),
+        ))
+        return True
+
+    async def per_user_sum_mismatch(
+        self, org_id: str, resource_key: str, *, total: float, per_user_sum: float,
+    ) -> bool:
+        """D-53: the provider's per_user values do not sum to its org total — a
+        CONSUMER bug. The reconciler converged from the numbers it was given AND
+        alerts (never silently picks a side). Rate-limited under the detect
+        cooldown."""
+        cd = self._detect_cd_key(org_id, resource_key) + ":pus"
+        if not await self._redis.set(cd, "1", ex=self._cooldown, nx=True):
+            return False
+        await self._dispatch(QuotaAlert(
+            org_id=org_id, resource_key=resource_key,
+            severity=AlertSeverity.WARNING,
+            current=per_user_sum, limit=total,
+            utilization=(per_user_sum / total) if total else 0.0, tier_id="",
+            message=(f"gauge_reconcile_per_user_sum_mismatch total={total} "
+                     f"sum_per_user={per_user_sum} — the provider is inconsistent "
+                     f"(a consumer bug); converged from its numbers and alerting."),
+        ))
+        return True
+
+    async def stale_open_activations(
+        self, org_id: str, *, count: int, older_than_s: float,
+    ) -> bool:
+        """D2 (QB-03): N activations have been OPEN past the stale threshold with no
+        release — the missed-decrement alarm for the leak that shipped three times.
+        A leaked slot denies capacity (fail-closed) and its usage may accrue
+        UNBILLED, so it reads as a money incident. Rate-limited per org."""
+        cd = f"{self._prefix}:{org_id}:stale_open_cd"
+        if not await self._redis.set(cd, "1", ex=self._cooldown, nx=True):
+            return False
+        await self._dispatch(QuotaAlert(
+            org_id=org_id, resource_key="*",
+            severity=AlertSeverity.WARNING,
+            current=float(count), limit=0.0, utilization=0.0, tier_id="",
+            message=(f"gauge_reconcile_stale_open_activations count={count} "
+                     f"older_than_s={older_than_s:g} — {count} activation(s) OPEN with no "
+                     f"release past the threshold; likely a MISSED DECREMENT (QB-03). A "
+                     f"leaked slot denies capacity and its usage may accrue UNBILLED."),
+        ))
+        return True

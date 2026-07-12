@@ -7,13 +7,15 @@ check, increment, decrement, get_usage.
 from __future__ import annotations
 
 import logging
+import os
+from dataclasses import dataclass, field
 from typing import Optional
 
 from redis.asyncio import Redis
 
 from .models.core import (
     ResourceDef, TierConfig, TierLimits, QuotaOverride,
-    QuotaState, AlertSeverity, QuotaAlert, CounterType,
+    QuotaState, AlertSeverity, QuotaAlert, CounterType, EnforcementConfig,
 )
 from .models.requests import (
     QuotaCheckRequest, QuotaIncrementRequest, QuotaDecrementRequest,
@@ -32,6 +34,81 @@ from .providers import TierProvider
 from .tiers import DEFAULT_TIERS
 
 logger = logging.getLogger("ab0t_quota")
+
+
+class InvalidSettlementCost(ValueError):
+    """A settle() cost that is not a finite, non-negative decimal (D-47).
+
+    NaN poisons a money accumulator irrecoverably (every subsequent read is NaN);
+    inf is nonsensical; a negative cost is a refund wearing usage's clothes (refunds
+    go through billing, never through settle()). settle() rejects them fail-closed —
+    the activation stays unsettled (the drift alarm) rather than record poison."""
+
+
+@dataclass
+class AcquireResult:
+    """Outcome of engine.acquire(). ``activation_id`` is the minted, retry-safe
+    handle the caller carries to release()/settle()."""
+    admitted: bool
+    activation_id: Optional[str]
+    denied_resource: Optional[str]
+    reason: str
+    values: dict = field(default_factory=dict)
+
+
+# Atomic bundle check-and-spend (P2.2, QI-03). Checks ALL gauge limits (org and
+# per-user) and, only if EVERY one passes, spends ALL of them — in ONE Lua op.
+# This is the real cross-resource atomicity the old sequential-loop batch_check
+# only *claimed* (its docstring said "atomically"; the body was a per-resource
+# loop). KEYS = [idem, then per gauge: org, user, seq]; a gauge with no per-user
+# limit still passes placeholder user/seq keys (has_user='0' skips them).
+#   ARGV[1]=has_idem ARGV[2]=idem_ttl ARGV[3]=n
+#   per gauge i (base = 3 + (i-1)*4): has_user, delta, org_limit, user_limit
+# Returns {admitted('1'/'0'), reason} where reason is 'ok'|'dup'|the 1-based index
+# of the first gauge that would exceed its limit.
+_ACQUIRE = """
+local n = tonumber(ARGV[3])
+if ARGV[1] == '1' then
+  if redis.call('GET', KEYS[1]) then
+    return {'1', 'dup'}
+  end
+end
+for i=1,n do
+  local kb = 1 + (i-1)*3
+  local ab = 3 + (i-1)*4
+  local has_user = ARGV[ab+1]
+  local delta = tonumber(ARGV[ab+2])
+  local org_limit = ARGV[ab+3]
+  local user_limit = ARGV[ab+4]
+  local ocur = redis.call('GET', KEYS[kb+1]); if not ocur then ocur = '0' end
+  if org_limit ~= '' and (tonumber(ocur) + delta) > tonumber(org_limit) then
+    return {'0', tostring(i)}
+  end
+  if has_user == '1' and user_limit ~= '' then
+    local ucur = redis.call('GET', KEYS[kb+2]); if not ucur then ucur = '0' end
+    if (tonumber(ucur) + delta) > tonumber(user_limit) then
+      return {'0', tostring(i)}
+    end
+  end
+end
+if ARGV[1] == '1' then
+  if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
+    return {'1', 'dup'}
+  end
+end
+for i=1,n do
+  local kb = 1 + (i-1)*3
+  local ab = 3 + (i-1)*4
+  local has_user = ARGV[ab+1]
+  local delta = tonumber(ARGV[ab+2])
+  redis.call('INCRBYFLOAT', KEYS[kb+1], delta)
+  if has_user == '1' then
+    redis.call('INCR', KEYS[kb+3])
+    redis.call('INCRBYFLOAT', KEYS[kb+2], delta)
+  end
+end
+return {'1', 'ok'}
+"""
 
 
 class QuotaEngine:
@@ -60,6 +137,9 @@ class QuotaEngine:
         tiers: Optional[dict[str, TierConfig]] = None,
         override_loader: Optional[callable] = None,
         resource_bundles: Optional[dict[str, list[str]]] = None,
+        enforcement: Optional[EnforcementConfig | dict] = None,
+        activation_store=None,
+        activations_enabled: Optional[bool] = None,
     ):
         self._redis = redis
         self._tier_provider = tier_provider
@@ -67,6 +147,27 @@ class QuotaEngine:
         self._tiers = tiers or DEFAULT_TIERS
         self._override_loader = override_loader  # async fn(org_id, resource_key) → QuotaOverride | None
         self._alert_manager: Optional[AlertManager] = None
+        # --- Activation core (P2.1/P2.2, DECISIONS D-10) ---------------------
+        # The atomic acquire()/release()/settle() API and the atomic-enforcing
+        # increment path. `activations_enabled` is the documented rollback knob
+        # (tasklist P2.2): default ON so the counter can never exceed the limit
+        # under concurrency (QI-03); AB0T_QUOTA_ACTIVATIONS=off reverts increment
+        # to the legacy pure-add behaviour for a consumer that needs the old
+        # (racy) semantics during migration. See D-24.
+        if activations_enabled is None:
+            activations_enabled = os.getenv(
+                "AB0T_QUOTA_ACTIVATIONS", "on",
+            ).strip().lower() not in ("off", "false", "0", "no")
+        self._activations_enabled = activations_enabled
+        if activation_store is None:
+            from .activations import InMemoryActivationStore
+            activation_store = InMemoryActivationStore()
+        self._activation_store = activation_store
+        # Enforcement knobs (QP-01 / D-15). Coerce a plain dict (from config)
+        # into the typed model. Mirrors the Go engine's Cfg.Enforcement.
+        if isinstance(enforcement, dict):
+            enforcement = EnforcementConfig(**enforcement)
+        self._enforcement: EnforcementConfig = enforcement or EnforcementConfig()
         # Bundle name → list[resource_key]: a named set of resources that
         # are checked / incremented / decremented together when the consumer
         # creates one "thing" of this kind. Generic — the library knows
@@ -100,13 +201,73 @@ class QuotaEngine:
     # Check
     # ------------------------------------------------------------------
 
+    def _enforcement_short_circuit(
+        self, request: QuotaCheckRequest, decision: QuotaDecision,
+        *, reason: str, message: str, severity: AlertSeverity = AlertSeverity.INFO,
+    ) -> QuotaResult:
+        """Minimal result for a global enforcement decision (kill-switch /
+        enforcement-disabled) taken before any tier/counter work (mirrors Go
+        engine.go:49-64). Static message — no dynamic client strings."""
+        return QuotaResult(
+            decision=decision,
+            resource_key=request.resource_key,
+            current=0.0,
+            requested=request.increment,
+            limit=None,
+            tier_id="",
+            tier_display="",
+            severity=severity,
+            message=message,
+            reason=reason,
+        )
+
     async def check(self, request: QuotaCheckRequest, **provider_kwargs) -> QuotaResult:
         """Check whether an org can consume a resource. Does NOT modify counters."""
+        # Enforcement knobs (QP-01 / D-15), mirroring the Go engine.
+        # Global kill-switch — fail closed.
+        if self._enforcement.global_kill_switch:
+            return self._enforcement_short_circuit(
+                request, QuotaDecision.DENY, reason="global_kill_switch",
+                message="Quota enforcement halted by global kill switch.",
+                severity=AlertSeverity.EXCEEDED,
+            )
+        # Enforcement disabled — allow everything without computing.
+        if not self._enforcement.enabled:
+            return self._enforcement_short_circuit(
+                request, QuotaDecision.ALLOW, reason="enforcement_disabled",
+                message="Quota enforcement is disabled.",
+            )
+
         resource_def = self._registry.require(request.resource_key)
         tier_id = await self._tier_provider.get_tier(request.org_id, **provider_kwargs)
         tier = self._tiers.get(tier_id)
         if tier is None:
-            tier = self._tiers.get("free", TierConfig(tier_id="free", display_name="Free"))
+            # QP-02 / D-14: an unmapped tier id is a CONFIG ERROR — surface it
+            # explicitly and alert. NEVER silently coerce to `free` (that denies
+            # a paying org its capacity while hiding the bug). Mirrors Go's
+            # `tier_not_in_config`.
+            logger.error(
+                "tier_not_in_config org=%s tier_id=%r resource=%s — check tier config",
+                request.org_id, tier_id, request.resource_key,
+            )
+            if self._alert_manager:
+                await self._alert_manager.maybe_alert(QuotaAlert(
+                    org_id=request.org_id,
+                    resource_key=request.resource_key,
+                    severity=AlertSeverity.EXCEEDED,
+                    current=0, limit=0, utilization=0,
+                    tier_id=tier_id,
+                    message="tier_not_in_config",
+                ))
+            return QuotaResult(
+                decision=QuotaDecision.UNKNOWN_TIER,
+                resource_key=request.resource_key,
+                current=0.0, requested=request.increment, limit=None,
+                tier_id=tier_id, tier_display=tier_id,
+                severity=AlertSeverity.EXCEEDED,
+                message="Your account tier is not configured. Please contact support.",
+                reason="tier_not_in_config",
+            )
 
         tier_limits = tier.get_limit(request.resource_key)
 
@@ -195,6 +356,20 @@ class QuotaEngine:
                 message=result.message,
             ))
 
+        # Shadow mode — a would-be DENY becomes an ALLOW, logged not enforced
+        # (D-15, mirror Go engine.go:164). Config errors (UNKNOWN_TIER) are NOT
+        # shadowed — a mis-configured tier must still surface.
+        if result.decision == QuotaDecision.DENY and self._enforcement.shadow_mode:
+            logger.info(
+                "shadow_would_deny org=%s resource=%s current=%s requested=%s limit=%s",
+                request.org_id, request.resource_key,
+                result.current, result.requested, result.limit,
+            )
+            result = result.model_copy(update={
+                "decision": QuotaDecision.SHADOW_ALLOW,
+                "reason": "shadow_would_deny",
+            })
+
         return result
 
     async def batch_check(self, request: QuotaBatchCheckRequest, **provider_kwargs) -> QuotaBatchResult:
@@ -224,16 +399,156 @@ class QuotaEngine:
     # Increment / Decrement
     # ------------------------------------------------------------------
 
-    async def increment(self, request: QuotaIncrementRequest) -> float:
-        """Increment a counter after successful provisioning. Returns new value."""
+    async def _effective_limits(
+        self, org_id: str, resource_key: str, resource_def, user_id: Optional[str],
+        **provider_kwargs,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Resolve (org_limit_including_burst, per_user_limit) for a GAUGE, using
+        the SAME tier/override/burst/per-user resolution as check(). None means
+        unlimited / no-limit. If the tier is not in config, treat as unlimited
+        here — check() owns the explicit UNKNOWN_TIER denial (D-14); increment must
+        not silently deny on a tier lookup miss."""
+        tier_id = await self._tier_provider.get_tier(org_id, **provider_kwargs)
+        tier = self._tiers.get(tier_id)
+        if tier is None:
+            return None, None
+        tier_limits = tier.get_limit(resource_key)
+        override = await self._load_override(org_id, resource_key)
+        base = override.limit if (override and not override.is_expired) else tier_limits.limit
+        if base is None:
+            org_limit = None
+        else:
+            org_limit = base + (tier_limits.burst_allowance or 0)
+        per_user = None
+        if user_id and resource_def.counter_type == CounterType.GAUGE:
+            per_user = tier.derive_per_user_limit(tier_limits)
+        return org_limit, per_user
+
+    async def increment(self, request: QuotaIncrementRequest, **provider_kwargs) -> float:
+        """Count usage after a resource actually exists. Returns the new value.
+
+        D-24 (Option B) — the governing rule: **quota may refuse to authorise a
+        FUTURE (at acquire(), before provisioning); it must never refuse to
+        acknowledge a PRESENT.** increment() runs AFTER provisioning, so a refusal
+        here would leave a resource existing-and-uncounted → phantom headroom
+        (exactly the QG-06/QI-02 defect this ticket kills). Therefore:
+
+          * DEFAULT `enforcement.legacy_increment='count_and_alert'`: GAUGES always
+            count; when the new level crosses the limit an `over_limit_admitted`
+            event fires so the over-admission is an OBSERVABLE fact (pillar 1) for
+            the open-activation ledger + reconciler to catch. A one-time
+            deprecation notice names acquire() as the enforcing replacement.
+          * OPT-IN `enforcement.legacy_increment='enforce'`: atomic check-and-spend
+            that refuses over-limit — ONLY safe for a consumer that has verified it
+            increments BEFORE provisioning.
+
+        ACCUMULATORS / RATES always record actual usage (cost past the cap must be
+        recorded, not dropped). AB0T_QUOTA_ACTIVATIONS=off is the activation-PATH
+        rollback (acquire persistence), NOT the lever for this behaviour.
+        """
         resource_def = self._registry.require(request.resource_key)
         counter = create_counter(self._redis, request.org_id, resource_def)
-        # Per-user partition for gauges
-        if request.user_id and resource_def.counter_type == CounterType.GAUGE:
+
+        if resource_def.counter_type == CounterType.GAUGE:
             from .counters.gauge import GaugeCounter
             if isinstance(counter, GaugeCounter):
-                return await counter.increment_user(request.user_id, request.delta, request.idempotency_key)
+                if self._enforcement.legacy_increment == "enforce":
+                    org_limit, per_user = await self._effective_limits(
+                        request.org_id, request.resource_key, resource_def,
+                        request.user_id, **provider_kwargs,
+                    )
+                    if request.user_id:
+                        value, admitted = await counter.try_increment_user(
+                            request.user_id, request.delta, org_limit, per_user,
+                            request.idempotency_key,
+                        )
+                    else:
+                        value, admitted = await counter.try_increment(
+                            request.delta, org_limit, request.idempotency_key,
+                        )
+                    if not admitted:
+                        logger.warning(
+                            "gauge_admission_refused org=%s resource=%s user=%s "
+                            "delta=%s limit=%s current=%s — legacy_increment=enforce; "
+                            "create over limit NOT counted. Use acquire() to gate "
+                            "BEFORE provisioning.",
+                            request.org_id, request.resource_key, request.user_id,
+                            request.delta, org_limit, value,
+                        )
+                    return value
+
+                # DEFAULT (Option B): count at the fact, never refuse.
+                self._warn_legacy_increment_once()
+                if request.user_id:
+                    value = await counter.increment_user(
+                        request.user_id, request.delta, request.idempotency_key)
+                else:
+                    value = await counter.increment(request.delta, request.idempotency_key)
+                await self._emit_over_limit_if_crossed(
+                    request, resource_def, **provider_kwargs)
+                return value
+
+        # Non-gauge counters (accumulators / rates): always record.
         return await counter.increment(request.delta, request.idempotency_key)
+
+    def _warn_legacy_increment_once(self) -> None:
+        if getattr(self, "_legacy_increment_warned", False):
+            return
+        self._legacy_increment_warned = True
+        logger.warning(
+            "DEPRECATION: engine.increment()/increment_for_bundle() count at the fact "
+            "and do NOT enforce limits (D-24 Option B) — a create past the limit is "
+            "counted + alerted (over_limit_admitted), not blocked. Enforce BEFORE "
+            "provisioning with engine.acquire(), which returns admitted + an "
+            "activation_id. This notice fires once per engine.",
+        )
+
+    async def _emit_over_limit_if_crossed(
+        self, request: QuotaIncrementRequest, resource_def, **provider_kwargs,
+    ) -> None:
+        """After a count-at-the-fact increment, if the new level is over the HARD
+        limit (tier/override, burst excluded), emit `over_limit_admitted` — the
+        observable-fact signal the reconciler/ledger exist to catch (pillar 1)."""
+        tier_id = await self._tier_provider.get_tier(request.org_id, **provider_kwargs)
+        tier = self._tiers.get(tier_id)
+        if tier is None:
+            return
+        tl = tier.get_limit(request.resource_key)
+        override = await self._load_override(request.org_id, request.resource_key)
+        base = override.limit if (override and not override.is_expired) else tl.limit
+        counter = create_counter(self._redis, request.org_id, resource_def)
+        if base is not None:
+            org_cur = await counter.get()
+            if org_cur > base:
+                await self._fire_over_limit(request.org_id, request.resource_key,
+                                            "org", org_cur, base, tier_id)
+        if request.user_id:
+            from .counters.gauge import GaugeCounter
+            if isinstance(counter, GaugeCounter):
+                per_user = tier.derive_per_user_limit(tl)
+                if per_user is not None:
+                    u = await counter.get_user(request.user_id)
+                    if u > per_user:
+                        await self._fire_over_limit(request.org_id, request.resource_key,
+                                                    "user", u, per_user, tier_id,
+                                                    user_id=request.user_id)
+
+    async def _fire_over_limit(self, org_id, resource_key, scope, level, limit,
+                               tier_id, user_id=None) -> None:
+        logger.warning(
+            "over_limit_admitted org=%s resource=%s scope=%s user=%s level=%s limit=%s "
+            "— counted at the fact (D-24 B); over-admission is now an OBSERVABLE fact. "
+            "Gate with acquire() to prevent it.",
+            org_id, resource_key, scope, user_id, level, limit,
+        )
+        if self._alert_manager:
+            await self._alert_manager.maybe_alert(QuotaAlert(
+                org_id=org_id, resource_key=resource_key,
+                severity=AlertSeverity.EXCEEDED,
+                current=level, limit=limit,
+                utilization=(level / limit) if limit else 0,
+                tier_id=tier_id, message="over_limit_admitted",
+            ))
 
     async def decrement(self, request: QuotaDecrementRequest) -> float:
         """Decrement a GAUGE counter on resource release. Returns new value."""
@@ -281,8 +596,27 @@ class QuotaEngine:
         from .models.requests import QuotaCheckItem
         resource_keys = self._resource_bundles.get(bundle_name)
         if not resource_keys:
+            # QP-02 / D-14: an undeclared bundle name (usually a typo in
+            # resource_bundles) must NOT silently disable enforcement. Always
+            # loud; deny in enforce mode, allow+warn under shadow_mode.
+            logger.warning(
+                "unknown_bundle org=%s bundle=%r — not declared in resource_bundles; "
+                "enforcement outcome=%s",
+                org_id, bundle_name,
+                "allow_warn" if (self._enforcement.shadow_mode
+                                 or self._enforcement.unknown_bundle == "allow_warn"
+                                 or not self._enforcement.enabled) else "deny",
+            )
+            allow = (
+                not self._enforcement.enabled
+                or self._enforcement.shadow_mode
+                or self._enforcement.unknown_bundle == "allow_warn"
+            )
             return QuotaBatchResult(
-                allowed=True, results=[], denied_resources=[], warning_resources=[],
+                allowed=allow,
+                results=[],
+                denied_resources=[] if allow else [bundle_name],
+                warning_resources=[bundle_name] if allow else [],
             )
         return await self.batch_check(
             QuotaBatchCheckRequest(
@@ -293,6 +627,378 @@ class QuotaEngine:
             **provider_kwargs,
         )
 
+    async def _gauge_specs(
+        self, org_id: str, resource_keys: list[str], user_id: Optional[str],
+        deltas: Optional[dict[str, float]] = None, **provider_kwargs,
+    ) -> list[dict]:
+        """Resolve the per-gauge (keys, limits, delta) specs for an atomic acquire.
+        Non-gauge resources are skipped (they don't gate concurrency).
+
+        W-T3/ET-04 (D-31): each delta is a MAGNITUDE, validated finite BEFORE
+        the Lua. Pre-fix, acquire(deltas={rk: -5}) was ADMITTED and drove the
+        gauge to -4.0 — the admission API erasing spend and breaching the
+        QG-06 zero floor in one call; a NaN delta in a bundle would partially
+        spend earlier gauges then burn the idem claim (scripts don't roll back)."""
+        from .counters.base import finite_magnitude
+        from .counters.gauge import GaugeCounter
+        specs: list[dict] = []
+        _seen: set[str] = set()
+        for rk in resource_keys:
+            # D-45: a bundle naming the same resource twice would spend it twice in
+            # ONE acquire (counter past its limit; ledger records one unit) — the core
+            # invariant broken in steady state. A bundle is a SET of resources; dedup
+            # defensively (config load also REJECTS duplicates, config.py — belt & braces).
+            if rk in _seen:
+                logger.warning(
+                    "resource_bundle_duplicate_key org=%s resource=%s — a bundle names "
+                    "this resource more than once; counting it ONCE (D-45).", org_id, rk)
+                continue
+            _seen.add(rk)
+            rd = self._registry.get(rk)
+            if rd is None or rd.counter_type != CounterType.GAUGE:
+                continue
+            g = create_counter(self._redis, org_id, rd)
+            if not isinstance(g, GaugeCounter):
+                continue
+            org_limit, per_user = await self._effective_limits(
+                org_id, rk, rd, user_id, **provider_kwargs,
+            )
+            specs.append({
+                "resource_key": rk, "gauge": g,
+                "delta": finite_magnitude((deltas or {}).get(rk, 1.0)),
+                "org_limit": org_limit,
+                "user_limit": per_user if user_id else None,
+                "has_user": bool(user_id),
+            })
+        return specs
+
+    async def _atomic_bundle_spend(
+        self, specs: list[dict], user_id: Optional[str], idem: Optional[str],
+    ) -> tuple[bool, str]:
+        """Run the one-Lua check-ALL-then-spend-ALL over the gauge specs.
+        Returns (admitted, reason)."""
+        if not specs:
+            return True, "ok"
+        from .counters.gauge import GaugeCounter
+        keys: list = [
+            (f"{specs[0]['gauge']._key_prefix}:idem:{idem}" if idem
+             else f"{specs[0]['gauge']._key_prefix}:idem:__unused__")
+        ]
+        argv: list = ["1" if idem else "0", 86400, len(specs)]
+        for s in specs:
+            g: GaugeCounter = s["gauge"]
+            keys.append(g._redis_key)
+            if user_id:
+                keys.append(g._user_key(user_id))
+                keys.append(g._seq_user_key(user_id))
+            else:
+                keys.append(g._redis_key)   # placeholder (has_user='0' skips it)
+                keys.append(g._redis_key)
+            argv.extend([
+                "1" if s["has_user"] else "0",
+                repr(float(s["delta"])),
+                GaugeCounter._fmt_limit(s["org_limit"]),
+                GaugeCounter._fmt_limit(s["user_limit"]),
+            ])
+        res = await self._redis.eval(_ACQUIRE, len(keys), *keys, *argv)
+        admitted = res[0] in (b"1", "1", 1)
+        reason = res[1].decode() if isinstance(res[1], bytes) else str(res[1])
+        return admitted, reason
+
+    async def acquire(
+        self,
+        org_id: str,
+        bundle_name: Optional[str] = None,
+        *,
+        resource_key: Optional[str] = None,
+        user_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        **provider_kwargs,
+    ):
+        """Atomically check ALL of a bundle's (or a single resource's) gauge limits
+        and, only if every one passes, spend them all — in ONE Lua op — then mint an
+        `activation_id` and persist an OPEN activation record (P2.2, DECISIONS D-10).
+
+        This is the fully retry-safe create path (kills QI-03 TOCTOU + the
+        fake-atomic batch_check, and QI-05 by minting identity). Returns an
+        ``AcquireResult`` carrying ``admitted``, the ``activation_id`` (when
+        admitted), the first denied resource, and per-resource new values.
+
+        Non-gauge resources in a bundle (accumulators/rates) are NOT gated here —
+        they record actual usage via settle()/increment(), not admission.
+        """
+        from .activations import Activation, mint_activation_id, ActivationState
+        # Enforcement preamble (QP-01/QP-02, DECISIONS D-14/D-15/D-31). The atomic
+        # admission gate MUST honor the same knobs check()/check_for_bundle() do.
+        # acquire() previously bypassed them, silently ADMITTING (1) when an operator
+        # flipped the global kill switch and (2) when a bundle name / resource_key was
+        # an undeclared typo. Both are the forbidden fail-OPEN direction (D-31): a
+        # config that means "deny" must never be silently widened to "allow".
+        if bundle_name is not None:
+            resource_keys = self._resource_bundles.get(bundle_name)
+            label = bundle_name
+            unknown = resource_keys is None
+        elif resource_key is not None:
+            resource_keys = [resource_key]
+            label = resource_key
+            unknown = self._registry.get(resource_key) is None
+        else:
+            raise ValueError("acquire requires bundle_name or resource_key")
+
+        # --- Enforcement preamble (D-48) --------------------------------------
+        # The atomic admission gate MUST honor EVERY enforcement knob check() does.
+        # acquire() was written after D-14/D-15 and inherited NEITHER, silently
+        # ADMITTING under the kill switch, an unknown bundle, an unknown tier, and
+        # ignoring shadow_mode/enabled. Each is the forbidden fail-OPEN direction
+        # (D-31): a config that means "deny"/"allow" silently produced the opposite.
+        # This block is verified IDENTICAL to check()/check_for_bundle() by the
+        # enforcement-contract matrix (tests/test_enforcement_contract_matrix_*).
+        #
+        # global kill switch — fail closed (mirrors check(), Go engine.go:49-64).
+        if self._enforcement.global_kill_switch:
+            logger.warning(
+                "acquire_denied org=%s bundle=%s reason=global_kill_switch",
+                org_id, label,
+            )
+            return AcquireResult(admitted=False, activation_id=None,
+                                 denied_resource=label, reason="global_kill_switch",
+                                 values={})
+        enforce = self._enforcement.enabled
+        # Unknown bundle / unregistered resource — a config typo must NOT silently
+        # disable enforcement (QP-02/D-14). Deny in enforce mode; allow+warn under
+        # shadow_mode / unknown_bundle='allow_warn' / enforcement disabled. Always loud.
+        if unknown:
+            allow = (
+                not enforce
+                or self._enforcement.shadow_mode
+                or self._enforcement.unknown_bundle == "allow_warn"
+            )
+            logger.warning(
+                "unknown_bundle org=%s bundle=%r — not declared/registered; acquire "
+                "enforcement outcome=%s", org_id, label,
+                "allow_warn" if allow else "deny",
+            )
+            if not allow:
+                return AcquireResult(admitted=False, activation_id=None,
+                                     denied_resource=label, reason="unknown_bundle",
+                                     values={})
+            resource_keys = resource_keys or []
+        # Unknown tier — explicit deny + alert, NOT shadowed (a config error must
+        # surface; mirrors check()'s UNKNOWN_TIER, D-14). Never silent-coerce to free.
+        # Skipped only when enforcement is disabled (which allows without computing).
+        if enforce:
+            tier_id = await self._tier_provider.get_tier(org_id, **provider_kwargs)
+            if self._tiers.get(tier_id) is None:
+                logger.error(
+                    "tier_not_in_config org=%s tier_id=%r bundle=%s — acquire denied",
+                    org_id, tier_id, label,
+                )
+                if self._alert_manager:
+                    await self._alert_manager.maybe_alert(QuotaAlert(
+                        org_id=org_id, resource_key=label,
+                        severity=AlertSeverity.EXCEEDED,
+                        current=0, limit=0, utilization=0, tier_id=tier_id,
+                        message="tier_not_in_config",
+                    ))
+                return AcquireResult(admitted=False, activation_id=None,
+                                     denied_resource=label, reason="tier_not_in_config",
+                                     values={})
+
+        specs = await self._gauge_specs(org_id, resource_keys, user_id, **provider_kwargs)
+        # Enforcement disabled — allow everything without computing (D-15): drop all
+        # limits so the atomic spend still records usage + mints the activation
+        # (counting is not enforcing), but never denies.
+        if not enforce:
+            for s in specs:
+                s["org_limit"] = None
+                s["user_limit"] = None
+
+        admitted, reason = await self._atomic_bundle_spend(specs, user_id, idempotency_key)
+
+        # Shadow mode — a would-be DENY becomes an ALLOW: spent + logged, not blocked
+        # (D-15, mirror check()/Go engine.go:164). The first (limited) spend claimed
+        # NOTHING on denial (the Lua sets the idem key only after every check passes),
+        # so re-running with limits dropped is replay-safe and spends exactly once.
+        if not admitted and self._enforcement.shadow_mode:
+            logger.info(
+                "shadow_would_deny org=%s bundle=%s user=%s", org_id, label, user_id,
+            )
+            for s in specs:
+                s["org_limit"] = None
+                s["user_limit"] = None
+            admitted, reason = await self._atomic_bundle_spend(
+                specs, user_id, idempotency_key)
+            reason = "shadow_would_deny"
+
+        if not admitted:
+            denied_rk = None
+            try:
+                denied_rk = specs[int(reason) - 1]["resource_key"]
+            except (ValueError, IndexError):
+                denied_rk = label
+            logger.info(
+                "acquire_denied org=%s bundle=%s user=%s denied_resource=%s",
+                org_id, label, user_id, denied_rk,
+            )
+            return AcquireResult(admitted=False, activation_id=None,
+                                 denied_resource=denied_rk, reason=reason, values={})
+
+        values = {s["resource_key"]: await s["gauge"].get() for s in specs}
+        activation_id = None
+        if self._activations_enabled and reason != "dup":
+            activation_id = mint_activation_id()
+            spend = {s["resource_key"]: float(s["delta"]) for s in specs}
+            try:
+                await self._activation_store.put_open(Activation(
+                    activation_id=activation_id, org_id=org_id, user_id=user_id,
+                    resource_key=label, spend=spend,
+                    state=ActivationState.OPEN.value,
+                ))
+            except Exception:
+                # FAIL-CLOSED (D-27). The counter is already spent (over-count vs the
+                # ledger). We must NOT report this acquire as admitted: if we did and
+                # the caller provisioned, the ledger would be MISSING the row, and the
+                # reconciler (converge_gauge) would later drive the counter DOWN to
+                # Σ open activations — BELOW the live resource. That is under-count /
+                # phantom headroom, the one forbidden direction (QI-02/QG-06 class).
+                # Re-raise instead: the caller does not provision; the orphaned spend
+                # is an OVER-count that converge heals to Σ open. Over-count only ever
+                # DENIES capacity (annoying, safe), never grants it. The invariant the
+                # ledger guarantees — acquire succeeds ⟹ activation persisted — holds.
+                logger.error(
+                    "acquire_persist_failed org=%s bundle=%s — FAILING the acquire "
+                    "(fail-closed, D-27); the orphaned counter spend will heal to "
+                    "Σ open activations. Caller MUST NOT provision.",
+                    org_id, label,
+                )
+                raise
+        return AcquireResult(admitted=True, activation_id=activation_id,
+                             denied_resource=None, reason=reason, values=values)
+
+    async def release(self, activation_id: str) -> bool:
+        """Release an activation: idempotently mark it RELEASED and return its spent
+        gauges to zero. Keyed ONLY on the minted `activation_id` — no caller-composed
+        key, no TTL horizon — so a reused resource-id can never collide (QI-05.1) and
+        a replayed release is a no-op. Returns True if THIS call performed the release,
+        False if it was already released / unknown."""
+        # Ordering is LOAD-BEARING and fail-closed (D-27): mark RELEASED (ledger
+        # drops) BEFORE decrementing the counter, so a crash in the window leaves an
+        # OVER-count (counter >= Σ open), never an under-count. Inverting this
+        # (decrement-then-mark) is a fail-OPEN under-count — guarded by the negative
+        # control in tests/test_crash_fail_closed_20260710.py (inverting it goes RED).
+        row = await self._activation_store.mark_released(activation_id)
+        if row is None:
+            return False  # already released or unknown — replay-safe by construction
+        from .counters.gauge import GaugeCounter
+        for rk, delta in (row.spend or {}).items():
+            rd = self._registry.get(rk)
+            if rd is None or rd.counter_type != CounterType.GAUGE:
+                continue
+            g = create_counter(self._redis, row.org_id, rd)
+            if not isinstance(g, GaugeCounter):
+                continue
+            # Idempotent by the activation state transition above (this line only
+            # runs once per activation), so a plain decrement is safe here.
+            if row.user_id:
+                await g.decrement_user(row.user_id, float(delta),
+                                       idempotency_key=f"release:{activation_id}")
+            else:
+                await g.decrement(float(delta), idempotency_key=f"release:{activation_id}")
+        return True
+
+    @staticmethod
+    def _validate_settlement_cost(cost) -> str:
+        """D-47: a settlement cost must be a FINITE, NON-NEGATIVE decimal. Reject
+        NaN/inf/negative fail-closed with a typed error BEFORE touching the ledger —
+        never let poison into a money accumulator. Returns the normalized string."""
+        from decimal import Decimal, InvalidOperation
+        s = str(cost).strip()
+        try:
+            d = Decimal(s)
+        except (InvalidOperation, ValueError):
+            raise InvalidSettlementCost("settlement cost is not a valid decimal")
+        if not d.is_finite():
+            raise InvalidSettlementCost("settlement cost must be finite")
+        if d < 0:
+            raise InvalidSettlementCost("settlement cost must be non-negative")
+        return s
+
+    async def settle(self, activation_id: str, cost: str) -> bool:
+        """Record an activation's final cost, idempotent on `activation_id` (QB-02).
+        Returns True if THIS call recorded it, False if already settled / unknown.
+
+        D-47: rejects a non-finite / negative cost (raises InvalidSettlementCost)
+        before any ledger write — fail-closed, so poison never lands.
+        D-46: a re-settle with a DIFFERENT cost keeps first-wins idempotence but emits
+        a loud `settle_conflict` alert carrying BOTH values — a caller that computed two
+        different costs for one activation has a money bug, never silently discarded."""
+        cost_str = self._validate_settlement_cost(cost)
+        row = await self._activation_store.mark_settled(activation_id, cost_str)
+        if row is not None:
+            return True
+        # Already settled or unknown. Detect a CONFLICTING re-settle (D-46): same
+        # activation, already SETTLED, but a DIFFERENT cost than this call carries.
+        from .activations import ActivationState
+        existing = await self._activation_store.get(activation_id)
+        if (existing is not None
+                and existing.state == ActivationState.SETTLED.value
+                and existing.cost is not None
+                and existing.cost != cost_str):
+            logger.warning(
+                "settle_conflict activation_id=%s org=%s settled_cost=%s new_cost=%s "
+                "— caller computed two different costs for one activation; keeping the "
+                "first (idempotent), NOT overwriting. Investigate the caller (D-46).",
+                activation_id, existing.org_id, existing.cost, cost_str,
+            )
+            if self._alert_manager:
+                await self._alert_manager.maybe_alert(QuotaAlert(
+                    org_id=existing.org_id, resource_key=existing.resource_key,
+                    severity=AlertSeverity.EXCEEDED,
+                    current=0, limit=0, utilization=0,
+                    tier_id="", message="settle_conflict",
+                ))
+        return False
+
+    async def open_activations(self, org_id: str, *, limit: int = 100):
+        """List an org's OPEN activations (the drift alarm — QB-03)."""
+        return await self._activation_store.list_open(org_id, limit=limit)
+
+    async def stale_open_activations(self, org_id: str, *, older_than_s: float, limit: int = 500):
+        """OPEN activations older than `older_than_s` — a missed-decrement (QB-03)
+        made an OBSERVABLE fact instead of invisible drift. Fires the alert manager
+        (if wired) once per stale activation-set so operators SEE the leak. Returns
+        the stale activations."""
+        from .activations import stale_open_activations as _filter
+        opens = await self._activation_store.list_open(org_id, limit=limit)
+        stale = _filter(opens, older_than_s=older_than_s)
+        if stale:
+            logger.warning(
+                "stale_open_activations org=%s count=%d older_than_s=%s — likely "
+                "missed release(s); investigate for drift (QB-03).",
+                org_id, len(stale), older_than_s,
+            )
+        return stale
+
+    async def _mark_gauge_activity(self, org_id: str) -> None:
+        """Recent-activity marker for the reconciler's guard (D-33 §3). Set on
+        every gauge bundle mutation so the periodic reconciler skips an org with
+        in-flight lifecycle traffic instead of racing a just-applied delta against
+        a lagging provider/GSI read. The library owns BOTH halves of the guard now:
+        this SET, and the READ in reconcile.LibraryReconciler._is_recent_activity —
+        so a consumer that deletes its bespoke marker keeps the guarantee. Window =
+        QUOTA_RECONCILE_ACTIVITY_GUARD_SECONDS (default 90), matching the reconciler.
+        Best-effort: a marker failure must never break the counter op."""
+        try:
+            window = max(int(os.getenv("QUOTA_RECONCILE_ACTIVITY_GUARD_SECONDS", "90") or 90), 0)
+        except ValueError:
+            window = 90
+        if window <= 0:
+            return
+        try:
+            await self._redis.set(f"quota:reconcile:recent:{org_id}", "1", ex=window)
+        except Exception:
+            pass
+
     async def increment_for_bundle(
         self,
         org_id: str,
@@ -302,16 +1008,57 @@ class QuotaEngine:
     ) -> dict[str, float]:
         """Increment every counter the bundle consumes, after successful create.
 
-        Returns {resource_key: new_value}. Per-resource idempotency keys
-        are namespaced so a retry that already partially committed is safe.
+        D-24 (Option B): by DEFAULT each resource is counted at the fact via
+        increment() (which fires over_limit_admitted on crossing) — a bundle create
+        past the limit is COUNTED + alerted, never silently refused. The opt-in
+        `enforcement.legacy_increment='enforce'` runs the ONE-Lua atomic
+        check-ALL-then-spend-ALL instead (all-or-nothing, refuses over-limit) — only
+        safe for a consumer that increments BEFORE provisioning. The fully
+        retry-safe gate is acquire() (returns an activation_id + admitted).
+        Returns {resource_key: new_value}.
         """
         out: dict[str, float] = {}
-        for rk in self._resource_bundles.get(bundle_name, []):
+        resource_keys = self._resource_bundles.get(bundle_name)
+        if resource_keys is None:
+            # D-14/D-48: an undeclared bundle name (a typo) must NOT silently count
+            # NOTHING — that leaves the just-provisioned resources uncounted (phantom
+            # headroom). increment counts at the fact (D-24) so this cannot DENY, but
+            # it must be LOUD, never silent.
+            logger.warning(
+                "unknown_bundle org=%s bundle=%r — not declared in resource_bundles; "
+                "increment_for_bundle counted NOTHING (a typo leaves provisioned "
+                "resources uncounted). Fix the bundle name.", org_id, bundle_name)
+            resource_keys = []
+        await self._mark_gauge_activity(org_id)
+
+        if self._enforcement.legacy_increment == "enforce":
+            specs = await self._gauge_specs(org_id, resource_keys, user_id)
+            admitted, _reason = await self._atomic_bundle_spend(specs, user_id, idempotency_key)
+            if not admitted:
+                logger.warning(
+                    "increment_for_bundle_refused org=%s bundle=%s user=%s — "
+                    "legacy_increment=enforce; bundle over limit NOT counted. "
+                    "Use acquire() to gate BEFORE provisioning.",
+                    org_id, bundle_name, user_id,
+                )
+            for s in specs:
+                out[s["resource_key"]] = await s["gauge"].get()
+            for rk in resource_keys:  # non-gauges always record
+                rd = self._registry.get(rk)
+                if rd is None or rd.counter_type == CounterType.GAUGE:
+                    continue
+                idem = f"{idempotency_key}:{rk}" if idempotency_key else None
+                out[rk] = await self.increment(QuotaIncrementRequest(
+                    org_id=org_id, resource_key=rk, user_id=user_id, idempotency_key=idem,
+                ))
+            return out
+
+        # DEFAULT (Option B): count each resource at the fact; increment() alerts.
+        for rk in resource_keys:
             idem = f"{idempotency_key}:{rk}" if idempotency_key else None
-            new_val = await self.increment(QuotaIncrementRequest(
+            out[rk] = await self.increment(QuotaIncrementRequest(
                 org_id=org_id, resource_key=rk, user_id=user_id, idempotency_key=idem,
             ))
-            out[rk] = new_val
         return out
 
     async def decrement_for_bundle(
@@ -327,6 +1074,7 @@ class QuotaEngine:
         skipped — they don't decrement.
         """
         out: dict[str, float] = {}
+        await self._mark_gauge_activity(org_id)
         for rk in self._resource_bundles.get(bundle_name, []):
             rd = self._registry.get(rk)
             if rd is None or rd.counter_type != CounterType.GAUGE:
@@ -338,8 +1086,14 @@ class QuotaEngine:
                 ))
                 out[rk] = new_val
             except Exception as e:
-                logger.warning(
-                    "decrement_for_bundle_failed org=%s bundle=%s resource=%s error=%s",
+                # A failed release leaves the gauge NOT decremented → OVER-count
+                # (fail-closed: denies capacity, never grants — safe). But it is DRIFT,
+                # not a no-op: surface it loudly so the reconciler/operator sees it,
+                # rather than letting it vanish. (converge_gauge heals it to Σ open.)
+                logger.error(
+                    "gauge_release_drift org=%s bundle=%s resource=%s error=%s — "
+                    "release did NOT decrement; counter now OVER-counts (fail-closed, "
+                    "denies capacity). Will heal on next reconcile (converge_gauge).",
                     org_id, bundle_name, rk, str(e),
                 )
         return out
@@ -503,8 +1257,17 @@ class QuotaEngine:
         try:
             return await self._override_loader(org_id, resource_key)
         except Exception as e:
+            # FAIL-CLOSED (FE2 / D-27 shape): an override can RESTRICT a limit BELOW
+            # the tier (an org deliberately capped). Swallowing a load IO error and
+            # returning None falls back to the HIGHER base limit — the restriction
+            # evaporates and the org OVER-admits. An IO error must never become a
+            # permission / a wider limit. Re-raise: the admission decision fails
+            # closed (deny) rather than silently widening. (A reporting caller like
+            # get_usage will surface the error rather than show a wrong limit.)
             logger.error(
-                "override_load_error org_id=%s resource_key=%s error=%s",
+                "override_load_error org_id=%s resource_key=%s error=%s — FAILING "
+                "CLOSED (an override may restrict below tier; an IO error must not "
+                "silently widen the limit).",
                 org_id, resource_key, str(e),
             )
-            return None
+            raise

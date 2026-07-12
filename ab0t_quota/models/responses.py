@@ -22,6 +22,8 @@ class QuotaDecision(str, Enum):
     ALLOW_WARNING = "allow_warning"  # under limit but approaching — proceed with caution
     DENY = "deny"               # over limit, reject the request
     UNLIMITED = "unlimited"     # no limit configured for this resource
+    SHADOW_ALLOW = "shadow_allow"  # would DENY but shadow_mode is on — allowed + logged (D-15)
+    UNKNOWN_TIER = "unknown_tier"  # tier id not in config — fail closed + alert, never silent free (D-14)
 
 
 class QuotaResult(BaseModel):
@@ -60,6 +62,12 @@ class QuotaResult(BaseModel):
         default=None,
         description="Which level caused denial: 'org' or 'user' (None if allowed)",
     )
+    reason: Optional[str] = Field(
+        default=None,
+        description="Machine-readable reason code for enforcement outcomes "
+                    "(e.g. 'global_kill_switch', 'enforcement_disabled', "
+                    "'shadow_would_deny', 'tier_not_in_config'). None for normal results.",
+    )
 
     @computed_field
     @property
@@ -79,11 +87,14 @@ class QuotaResult(BaseModel):
 
     @property
     def allowed(self) -> bool:
-        return self.decision in (QuotaDecision.ALLOW, QuotaDecision.ALLOW_WARNING, QuotaDecision.UNLIMITED)
+        return self.decision in (
+            QuotaDecision.ALLOW, QuotaDecision.ALLOW_WARNING,
+            QuotaDecision.UNLIMITED, QuotaDecision.SHADOW_ALLOW,
+        )
 
     @property
     def denied(self) -> bool:
-        return self.decision == QuotaDecision.DENY
+        return self.decision in (QuotaDecision.DENY, QuotaDecision.UNKNOWN_TIER)
 
     @property
     def warning(self) -> bool:

@@ -158,6 +158,41 @@ class ResourceDef(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Enforcement configuration (mirrors ab0t-quota-go Cfg.Enforcement — D-15/D-14)
+# ---------------------------------------------------------------------------
+
+class EnforcementConfig(BaseModel):
+    """Runtime enforcement knobs, mirroring the Go engine's `Cfg.Enforcement`
+    (ab0t-quota-go/engine/engine.go:49-64,164). Wired into QuotaEngine so the
+    documented knobs actually behave identically on both runtimes.
+
+    Semantics (see DECISIONS D-15, D-14):
+      - global_kill_switch: fail closed — every check DENIES ('global_kill_switch').
+      - enabled=false:      allow everything without computing ('enforcement_disabled').
+      - shadow_mode:        a would-be DENY becomes an ALLOW, logged/reasoned
+                            'shadow_would_deny' (rollout-safe; never hard-enforces).
+      - unknown_bundle:     'deny' (fail closed) or 'allow_warn'; forced to
+                            'allow_warn' while shadow_mode is on. Always loud.
+    """
+    enabled: bool = Field(default=True)
+    shadow_mode: bool = Field(default=False)
+    global_kill_switch: bool = Field(default=False)
+    unknown_bundle: Literal["deny", "allow_warn"] = Field(default="deny")
+    # D-24 (Option B): the legacy increment()/increment_for_bundle() path runs
+    # AFTER provisioning (check -> provision -> increment). A refusal there would
+    # leave the resource existing-and-uncounted => phantom headroom (the QG-06/QI-02
+    # defect class). So legacy increment must COUNT AT THE FACT, never refuse; when
+    # a count crosses the limit it emits a loud `over_limit_admitted` event so the
+    # over-admission is an OBSERVABLE fact (pillar 1) for the ledger/reconciler to
+    # catch. Enforcement belongs at acquire() — BEFORE provisioning, where refusal
+    # is still actionable.
+    #   count_and_alert (default): increment always counts + alerts on crossing.
+    #   enforce: increment refuses over-limit — ONLY for a consumer that has
+    #            verified it increments BEFORE provisioning (rare).
+    legacy_increment: Literal["count_and_alert", "enforce"] = Field(default="count_and_alert")
+
+
+# ---------------------------------------------------------------------------
 # Tier & Limits
 # ---------------------------------------------------------------------------
 
