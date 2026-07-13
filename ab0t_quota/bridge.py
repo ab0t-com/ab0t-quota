@@ -25,6 +25,7 @@ The library API the consumer sees is identical across modes —
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import httpx
@@ -32,6 +33,16 @@ import httpx
 logger = logging.getLogger("ab0t_quota.bridge")
 
 DEFAULT_TIMEOUT = 5.0  # seconds
+
+
+def _bridge_fail_open() -> bool:
+    """Bridge outage policy. DEFAULT = FAIL-CLOSED (deny), so a billing outage can
+    NEVER admit unbilled usage — the money-safety invariant (never lose a tenant's
+    usage or payment). A consumer that explicitly prefers availability-over-billing
+    (let traffic through during a billing outage, accepting some unbilled usage) can
+    opt in with AB0T_QUOTA_BRIDGE_FAIL_OPEN=true|1|yes|on. The choice is logged
+    loudly at every fallback. Matches the middleware default (fail_open=False)."""
+    return os.getenv("AB0T_QUOTA_BRIDGE_FAIL_OPEN", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class BridgeClient:
@@ -171,12 +182,17 @@ class BridgeClient:
             detail = resp.json().get("detail", resp.text)
         except Exception:
             detail = resp.text or f"HTTP {resp.status_code}"
-        logger.warning("bridge_%s_error status=%d detail=%s", op, resp.status_code, detail)
-        # TODO(public-mesh-ga): Replace hardcoded fail-open bridge behavior
-        # with explicit per-consumer outage policy and telemetry. Backlink:
-        # audit: 2026-05-16 public-mesh-ga readiness pass
+        # Money-safety (D5, ticket 20260712_payment_credit_calls_404): FAIL-CLOSED by
+        # default. A billing error must NOT admit unbilled usage — during a billing
+        # outage the usage-record call fails too, so allowing = lost revenue. Opt into
+        # fail-open (availability over billing) with AB0T_QUOTA_BRIDGE_FAIL_OPEN.
+        _fail_open = _bridge_fail_open()
+        logger.error(
+            "bridge_%s_billing_error status=%d — failing %s (AB0T_QUOTA_BRIDGE_FAIL_OPEN=%s) detail=%s",
+            op, resp.status_code, "OPEN/allow" if _fail_open else "CLOSED/deny", _fail_open, detail,
+        )
         return {
-            "decision": "allow",  # fail-open on bridge errors (configurable later)
+            "decision": "allow" if _fail_open else "deny",
             "current": 0,
             "limit": None,
             "message": f"bridge error: {detail}",
@@ -187,16 +203,19 @@ class BridgeClient:
 
 def _network_error_result(resource_key: str, error: str) -> dict:
     """Shape of a check result when the network call itself failed."""
-    # TODO(public-mesh-ga): Use the same explicit outage policy as _parse();
-    # public mesh consumers need to opt into fail-open for billing gates.
-    # Backlink:
-    # audit: 2026-05-16 public-mesh-ga readiness pass
+    # Money-safety (D5): FAIL-CLOSED by default — a bridge/network outage must not
+    # admit unbilled usage. Opt into fail-open with AB0T_QUOTA_BRIDGE_FAIL_OPEN.
+    _fail_open = _bridge_fail_open()
+    logger.error(
+        "bridge_network_error resource=%s — failing %s (AB0T_QUOTA_BRIDGE_FAIL_OPEN=%s): %s",
+        resource_key, "OPEN/allow" if _fail_open else "CLOSED/deny", _fail_open, error,
+    )
     return {
-        "decision": "allow",  # fail-open by default
+        "decision": "allow" if _fail_open else "deny",
         "resource_key": resource_key,
         "current": 0, "requested": 1, "limit": None,
         "tier_id": "free", "tier_display": "Free",
-        "severity": "info",
+        "severity": "info" if _fail_open else "warning",
         "message": f"bridge unreachable: {error}",
         "_bridge_error": True,
     }

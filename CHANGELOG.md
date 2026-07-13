@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.2] — 2026-07-13
+
+### ⚠️ Breaking (bridge mode) — bridge now FAILS CLOSED by default
+Ticket `20260712_payment_credit_calls_404` (D5). In **bridge mode**, when the mesh
+billing service is unreachable or errors, the quota gate previously **failed OPEN**
+(`decision: "allow"`) — which, during a billing outage, admits usage that can't be
+recorded = **lost revenue**. It now **fails CLOSED** (`decision: "deny"`, the guard
+returns 429) by default, so a billing outage can never admit unbilled usage.
+
+**Action:** a consumer that prefers *availability over billing* (let traffic through
+during a billing outage, accepting some unbilled usage) must now **opt in** by setting
+`AB0T_QUOTA_BRIDGE_FAIL_OPEN=true`. Every outage fallback is logged loudly with the
+policy in effect. Matches the middleware default (`fail_open=False`). Engine-local mode
+is unaffected (only bridge mode had the fail-open fallback).
+
 All notable changes to `ab0t-quota`. This project follows semantic versioning:
 a change that requires you to do something to keep working is at least a MINOR.
 

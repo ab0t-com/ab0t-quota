@@ -34,7 +34,7 @@ from .activations import (
 from .reconcile import LibraryReconciler, ReconcileConfig
 from .alerts import DriftAlertManager
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 __all__ = [
     # Engine & middleware

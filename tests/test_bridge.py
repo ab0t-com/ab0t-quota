@@ -153,14 +153,18 @@ class TestWireProtocol:
 
 class TestFailureBehavior:
     @pytest.mark.asyncio
-    async def test_network_error_returns_fail_open_check_result(self):
+    async def test_network_error_FAILS_CLOSED_by_default(self, monkeypatch):
+        # D5 (ticket 20260712_payment_credit_calls_404): the bridge now FAILS CLOSED
+        # by default — a billing/network outage must never admit unbilled usage
+        # (that would be lost revenue). Was fail-open; opt into availability-over-
+        # billing with AB0T_QUOTA_BRIDGE_FAIL_OPEN. See test_bridge_fail_closed_20260713.py.
+        monkeypatch.delenv("AB0T_QUOTA_BRIDGE_FAIL_OPEN", raising=False)
         async def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("connection refused")
 
         client = _client_with_handler(handler)
         result = await client.check("org-1", "thing.concurrent")
-        # Fail-open default: treat as allow with marker
-        assert result["decision"] == "allow"
+        assert result["decision"] == "deny"  # fail-CLOSED default (money-safety)
         assert result.get("_bridge_error") is True
         await client.close()
 
