@@ -168,6 +168,25 @@ to `/quota/*` are rate-limited per `service_name` (1000 req/min default;
 higher tiers get more). Hit your own quota and you'll get a 429 — at
 which point you should back off, batch, or migrate to BYO-Redis mode.
 
+## Outage policy — the bridge FAILS CLOSED by default (since 0.6.2)
+
+When the mesh billing service is unreachable or errors, the bridge quota gate
+**fails CLOSED** by default: the check returns `decision: "deny"` and the guard
+responds **429**. This is deliberate money-safety — during a billing outage the
+usage-record call fails too, so *allowing* the request would admit usage that can
+never be billed (lost revenue).
+
+If your product prefers **availability over billing** — let traffic through during a
+billing outage, accepting that some usage goes unbilled — opt in explicitly:
+
+```bash
+AB0T_QUOTA_BRIDGE_FAIL_OPEN=true   # (or 1 | yes | on)
+```
+
+Every outage fallback is logged loudly with the policy in effect. The default
+(fail-closed) matches the library's middleware default (`fail_open=False`).
+Engine-local / BYO-Redis mode does not have this fallback — it enforces directly.
+
 ## Performance
 
 Expected latency p50 / p99:
