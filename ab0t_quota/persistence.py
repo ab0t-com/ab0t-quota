@@ -63,8 +63,10 @@ class QuotaStore:
                 f"Use None for production (uses default AWS endpoint)."
             )
 
-    async def initialize(self, session=None):
-        """Initialize DynamoDB table (create if not exists)."""
+    async def initialize(self, session=None, *, create: bool = True):
+        """Initialize DynamoDB table (create if not exists). `create=False` is
+        the T-6/D-3 call-site policy: an existing table is used as-is; a
+        missing one is a refusal naming `storage.auto_create_tables`."""
         import aioboto3
 
         self._session = session or aioboto3.Session()
@@ -77,6 +79,12 @@ class QuotaStore:
                 await client.describe_table(TableName=self._table_name)
                 logger.info("Quota state table %s exists", self._table_name)
             except client.exceptions.ResourceNotFoundException:
+                if not create:
+                    raise RuntimeError(
+                        f"quota state table {self._table_name} does not exist and "
+                        f"storage.auto_create_tables is false (the default) — "
+                        f"pre-create the table or set storage.auto_create_tables: "
+                        f"true (ENV-04)")
                 await client.create_table(
                     TableName=self._table_name,
                     KeySchema=[
@@ -186,13 +194,21 @@ class QuotaStore:
     # Counter Snapshots (for recovery)
     # ------------------------------------------------------------------
 
-    async def snapshot_counter(self, org_id: str, resource_key: str, value: float) -> None:
-        """Save a counter snapshot to DynamoDB (called periodically by sync worker)."""
+    async def snapshot_counter(self, org_id: str, resource_key: str, value: float,
+                               service: Optional[str] = None) -> None:
+        """Save a counter snapshot to DynamoDB (called periodically by sync worker).
+        K-4 (spec §7 row 8): a v2 counter row is service-scoped
+        (SK=COUNTER#v2#{svc}#{rk}) so two bridge services' same resource_key
+        cannot collide in one state table. ``service=None`` = v1 row, unchanged."""
+        sk = (f"COUNTER#v2#{service}#{resource_key}" if service
+              else f"COUNTER#{resource_key}")
+        gsi1sk = (f"ORG#{org_id}#v2#{service}#{resource_key}" if service
+                  else f"ORG#{org_id}#{resource_key}")
         await self._table.put_item(Item={
             "PK": f"ORG#{org_id}",
-            "SK": f"COUNTER#{resource_key}",
+            "SK": sk,
             "GSI1PK": "COUNTER",
-            "GSI1SK": f"ORG#{org_id}#{resource_key}",
+            "GSI1SK": gsi1sk,
             "value": str(value),
             "snapshotted_at": datetime.now(timezone.utc).isoformat(),
         })
@@ -210,7 +226,8 @@ class QuotaStore:
     # Seed Redis from DynamoDB (startup recovery)
     # ------------------------------------------------------------------
 
-    async def seed_redis(self, redis, registry, activation_store=None) -> int:
+    async def seed_redis(self, redis, registry, activation_store=None,
+                         keyspace=None) -> int:
         """On startup, restore Redis counters from DynamoDB.
 
         Uses GSI1 (GSI1PK=COUNTER) to enumerate the (org, resource) pairs to
@@ -246,7 +263,7 @@ class QuotaStore:
             if not resource_def or resource_def.counter_type != CounterType.GAUGE:
                 return False
             from .activations import converge_gauge
-            counter = create_counter(redis, org_id, resource_def)
+            counter = create_counter(redis, org_id, resource_def, keyspace=keyspace)
             v, src = await converge_gauge(
                 activation_store=activation_store, org_id=org_id,
                 resource_key=resource_key, counter=counter,
@@ -277,7 +294,16 @@ class QuotaStore:
             response = await self._table.query(**query_kwargs)
             for item in response.get("Items", []):
                 org_id = item["PK"].replace("ORG#", "")
-                resource_key = item["SK"].replace("COUNTER#", "")
+                sk = item["SK"]
+                if sk.startswith("COUNTER#v2#"):
+                    # K-4: v2 rows are service-scoped (SK=COUNTER#v2#{svc}#{rk});
+                    # seed only our own scope — another bridge service's rows
+                    # belong to its engine (spec §7 row 8).
+                    _c, _v, svc, resource_key = sk.split("#", 3)
+                    if keyspace is None or getattr(keyspace, "service", None) != svc:
+                        continue
+                else:
+                    resource_key = sk[len("COUNTER#"):]
                 value = float(item["value"])
 
                 resource_def = registry.get(resource_key)
@@ -290,7 +316,7 @@ class QuotaStore:
                         restored += 1
                     continue
 
-                counter = create_counter(redis, org_id, resource_def)
+                counter = create_counter(redis, org_id, resource_def, keyspace=keyspace)
                 current = await counter.get()
                 if current == 0 and value > 0:
                     await counter.reset(value)
@@ -398,10 +424,11 @@ class QuotaStore:
             )
             for key in batch:
                 key_str = key.decode() if isinstance(key, bytes) else key
-                parsed = self._parse_quota_key(key_str)
-                if parsed is None:
+                from .keyspace import parse_counter_key
+                full = parse_counter_key(key_str)
+                if full is None:
                     continue
-                org_id, resource_key, kind = parsed
+                _version, service, org_id, resource_key, kind = full
 
                 resource_def = keys_by_name.get(resource_key)
                 if resource_def is None:
@@ -421,12 +448,14 @@ class QuotaStore:
                 except (TypeError, ValueError):
                     continue
 
-                # Skip no-op writes
-                cache_key = (org_id, resource_key)
+                # Skip no-op writes (cache keyed per shape — during dual both
+                # shapes' rows are maintained, K-4)
+                cache_key = (org_id, resource_key, service)
                 if self._last_snapshot.get(cache_key) == value:
                     continue
                 try:
-                    await self.snapshot_counter(org_id, resource_key, value)
+                    await self.snapshot_counter(org_id, resource_key, value,
+                                                service=service)
                     self._last_snapshot[cache_key] = value
                     written += 1
                 except Exception as e:
@@ -445,38 +474,22 @@ class QuotaStore:
 
     @staticmethod
     def _parse_quota_key(key: str):
-        """Parse a Redis quota key into (org_id, resource_key, kind).
+        """Parse a Redis quota key of EITHER shape into (org_id, resource_key, kind).
 
-        Recognized layouts:
-          quota:{org_id}:{resource_key}:gauge                  → ("...", "...", "gauge")
-          quota:{org_id}:{resource_key}:gauge:user:{user_id}   → ("...", "...", "user")
-          quota:{org_id}:{resource_key}:acc:{period}           → ("...", "...", "acc")
+        Recognized layouts (K-4: v1 AND v2 — the one home for shape is
+        ab0t_quota.keyspace.parse_counter_key; spec §7 row 7):
+          quota:{org}:{rk}:gauge[...]            v1
+          quota:v2:{svc/org}:{rk}:gauge[...]     v2
+          (+ :gauge:user:{uid} → "user", :acc:{period} → "acc")
 
-        Returns None for keys that don't match (idem keys, alert cooldowns, tier cache, etc).
+        Returns None for keys that don't match (idem, alert, tier cache, etc).
         """
-        if not key.startswith("quota:"):
+        from .keyspace import parse_counter_key
+        parsed = parse_counter_key(key)
+        if parsed is None:
             return None
-        # Strip the "quota:" prefix
-        remainder = key[len("quota:"):]
-        parts = remainder.split(":")
-        # Need at least: {org_id}, {resource_key_a}.{resource_key_b}, {kind}
-        # resource_key always contains a '.' (validated by ResourceDef regex)
-        if len(parts) < 3:
-            return None
-        org_id = parts[0]
-        # Find the part that ends in a recognized counter suffix
-        # parts[1] is the resource_key (single token containing '.')
-        if "." not in parts[1]:
-            return None
-        resource_key = parts[1]
-        suffix = parts[2]
-        if suffix == "gauge":
-            if len(parts) >= 5 and parts[3] == "user":
-                return (org_id, resource_key, "user")
-            return (org_id, resource_key, "gauge")
-        if suffix == "acc":
-            return (org_id, resource_key, "acc")
-        return None  # idem, alert, tier, dispatch, etc.
+        _version, _service, org_id, resource_key, kind = parsed
+        return (org_id, resource_key, kind)
 
     async def close(self):
         """Clean up DynamoDB resource. Stops the snapshot worker if running."""

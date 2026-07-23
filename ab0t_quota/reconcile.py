@@ -86,11 +86,10 @@ logger = logging.getLogger("ab0t_quota.reconcile")
 ObservedUsage = dict
 ObservedUsageProvider = Callable[[str], "ObservedUsage | Awaitable[ObservedUsage]"]
 
-# Recent-activity marker key. Same shape sandbox-platform sets on every gauge
-# increment/decrement, so a consumer's existing touch keeps working after the
-# P4.4 migration AND a handle-using consumer needs no touch at all (the ledger's
-# opened_at is used as a second, zero-config signal).
-_RECENT_KEY = "quota:reconcile:recent:{org_id}"
+# Recent-activity marker key: shape owned by ab0t_quota.keyspace (K-6 census —
+# one home for key shape). A consumer's existing v1 touch keeps working (the
+# default Keyspace() builds the identical string); the ledger's opened_at is
+# the second, zero-config signal.
 
 _ADMIN_USER = "system:library-reconciler"
 _EPS = 1e-9
@@ -349,8 +348,19 @@ class LibraryReconciler:
           (b) an open activation was opened inside the guard window (zero-config:
               a handle-using consumer needs no touch at all)."""
         try:
-            if await self._redis.get(_RECENT_KEY.format(org_id=org_id)):
-                return True
+            # K-4: read the guard in the ENGINE's key shape(s) — a v2 engine
+            # marks activity under v2; during dual a pre-flip replica still
+            # marks v1, so both shapes are consulted (spec §6.3, §7 row 5).
+            ks = getattr(self._engine, "_keyspace", None)
+            if ks is None:
+                from .keyspace import Keyspace
+                ks = Keyspace()  # engine without the seam (mock) — v1 shape
+            guard_keys = [ks.recent_key(org_id)]
+            if ks.secondary_version:
+                guard_keys.append(ks.recent_key(org_id, version=ks.secondary_version))
+            for gk in guard_keys:
+                if await self._redis.get(gk):
+                    return True
         except Exception:
             # The guard failing OPEN (treating as not-recent) would let us
             # force-set during in-flight traffic. Fail SAFE: treat a guard-read
@@ -715,18 +725,26 @@ class LibraryReconciler:
           it is the population sandbox-platform's bespoke loop scanned by hand.
         """
         if self._config.truth_source == "provider":
-            gauge_suffix = ":gauge"
+            # K-4: parse through the ONE shape home (keyspace.parse_counter_key)
+            # so v2 gauges are enumerable; a v2 key carries a service scope and
+            # is only ours when it matches the engine's (bridge independence).
+            from .keyspace import parse_counter_key
+            eng_ks = getattr(self._engine, "_keyspace", None)
+            own_service = getattr(eng_ks, "service", None)
             orgs: set[str] = set()
             try:
                 async for key in self._redis.scan_iter(match="quota:*:gauge", count=200):
                     ks = key.decode() if isinstance(key, bytes) else str(key)
-                    # quota:{org}:{resource_key}:gauge — org is a UUID and resource
-                    # keys are dotted (no colons), so a 4-part split is unambiguous;
-                    # per-user keys (…:gauge:user:{uid}) don't end in ':gauge'.
-                    parts = ks.split(":")
-                    if len(parts) == 4 and parts[0] == "quota" and ks.endswith(gauge_suffix):
-                        if not self._gauge_keys or parts[2] in self._gauge_keys:
-                            orgs.add(parts[1])
+                    parsed = parse_counter_key(ks)
+                    if parsed is None:
+                        continue
+                    _version, service, org_id, rk, kind = parsed
+                    if kind != "gauge":
+                        continue
+                    if service is not None and service != own_service:
+                        continue
+                    if not self._gauge_keys or rk in self._gauge_keys:
+                        orgs.add(org_id)
             except Exception as e:
                 logger.error("reconcile_enumerate_provider_failed error=%s", e)
             return sorted(orgs)

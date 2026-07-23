@@ -293,6 +293,28 @@ fi
 [ "$errors" -eq 0 ] && ok "No sensitive files tracked"
 
 # ---------------------------------------------------------------------------
+# 9. Tracked-but-ignored — the whole class, not a hand-maintained list
+# ---------------------------------------------------------------------------
+
+section "9. Tracked files that .gitignore says to exclude"
+
+# .gitignore does NOT untrack a file already in the index. So a directory can be
+# gitignored — the intent recorded — while its files keep shipping on every push.
+# That is how tickets/ (consumer infra profiles, incident reports, internal host
+# ids) stayed publishable after being ignored. --no-index is required: by default
+# check-ignore skips tracked files, which is exactly the set we need to inspect.
+tracked_ignored=$(git ls-files | git check-ignore --no-index --stdin 2>/dev/null || true)
+if [ -n "$tracked_ignored" ]; then
+  count=$(echo "$tracked_ignored" | wc -l | tr -d ' ')
+  err "$count tracked file(s) are gitignored — the ignore never took effect, they WILL be pushed:"
+  echo "$tracked_ignored" | head -10 | sed 's/^/    /'
+  [ "$count" -gt 10 ] && echo "    … and $((count - 10)) more"
+  echo "    Fix: git rm -r --cached <dir>   (untracks, keeps the files on disk)"
+else
+  ok "No tracked file is gitignored"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

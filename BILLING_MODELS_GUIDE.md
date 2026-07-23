@@ -73,6 +73,7 @@ Your service ships a `quota-config.json` (typically in the repo root). Library r
 
 Top-level shape:
 
+<!-- doc-exec: fragment (ellipsis shape illustration of the tiers key only — not a bootable config; adjudicated on its own merit at T-29 R-1, not inherited from the Skills copy; the executable config is quota-config.example.json) -->
 ```jsonc
 {
   "tiers": [

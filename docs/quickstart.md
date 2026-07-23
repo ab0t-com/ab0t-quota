@@ -3,7 +3,9 @@
 Add quota enforcement, rate limiting, tier management, and the full
 billing/payment surface (pricing pages, checkout, customer portal,
 invoices) to your service in **one line of code**, **two env vars**,
-and **one config file**.
+and **one config file** — plus the infrastructure prerequisites in
+`docs/requirements.md`. Verify your environment before deploying:
+`python -m ab0t_quota preflight`.
 
 ---
 
@@ -21,13 +23,31 @@ and **one config file**.
   | Mode | Latency | What you provision | Right when |
   |---|---|---|---|
   | **`bridge`** | 10–100 ms per check | Nothing. HTTPS-only. | Prototyping. Low-volume per-org checks. Cross-cloud / cross-region from ab0t. |
-  | **`byo_redis`** | <5 ms per check | A Redis instance (Upstash / ElastiCache / Fly.io — 2 min to provision) | Production. Anything in your hot request path. Rate-limit middleware. |
+  | **`byo_redis`** | <5 ms per check | A Redis instance (Upstash / ElastiCache / Fly.io — 2 min to provision, plus one on-the-record assertion for managed providers: see "Managed Redis providers" in §6) | Production. Anything in your hot request path. Rate-limit middleware. |
 
   Same code in your service. Same config. Mode is a deployment choice.
 
 ---
 
 ## 5-minute setup
+
+### 0. Try it first — 2 commands, no account, no credential
+
+Before any of the steps below, you can run the whole enforcement path locally:
+
+```bash
+python -m ab0t_quota provision --local   # a conforming local Redis
+AB0T_QUOTA_OFFLINE=true python -m ab0t_quota preflight   # verifies it, contacts nothing
+```
+
+`provision --local` starts a Redis meeting every requirement the library enforces
+at boot, and `preflight` re-runs those same checks read-only, printing what it
+resolved and from where. **Neither needs a mesh credential and neither contacts
+anything** — evaluate the library completely before step 1.
+
+Steps 1-2 below are only needed for the **mesh commercial surface** (tiers synced
+from billing, checkout, invoices, the customer portal). Quota enforcement itself
+does not require them.
 
 ### 1. Get a mesh credential
 
@@ -36,6 +56,11 @@ Register your service with ab0t (one-time). You get back:
 - `AB0T_CONSUMER_ORG_ID` — your service's identity in the mesh
 
 Set both as environment variables in your deployment.
+
+> **How to register:** this is currently a manual step — contact ab0t
+> (support@ab0t.com) to have your service registered and your credentials
+> issued. There is no self-service portal yet. **If you only want to evaluate
+> the library, skip this entirely and use step 0.**
 
 ### 2. Install the library
 
@@ -54,6 +79,11 @@ Minimal example — replace `widget` with your domain:
 {
   "service_name": "my-widget-service",
 
+  "storage": {
+    "$_comment_redis_url": "REQUIRED for local/byo_redis modes — declare YOUR Redis here or via the QUOTA_REDIS_URL env var. No Redis? Use \"engine_mode\": \"bridge\" instead and delete this block.",
+    "redis_url": "redis://your-redis:6379/0"
+  },
+
   "tier_provider": { "type": "mesh", "default_tier": "free" },
 
   "resources": [
@@ -61,6 +91,7 @@ Minimal example — replace `widget` with your domain:
       "service": "my-widget-service",
       "resource_key": "widget.concurrent",
       "display_name": "Concurrent Widgets",
+      "action_hint": "Delete a widget to free up a slot.",
       "counter_type": "gauge",
       "unit": "widgets"
     },
@@ -109,7 +140,13 @@ app = FastAPI()
 setup_quota(app)        # one line. Done.
 ```
 
-That's everything. After this call:
+That's everything — provided the prerequisites in step 3 are real: the Redis
+you declared (or bridge mode) must exist and meet `docs/requirements.md`.
+No conforming Redis yet? `python -m ab0t_quota provision --local` starts a
+verified local dev one (or `provision --emit compose|terraform|acl|iam` emits
+the artifacts to apply yourself). `python -m ab0t_quota preflight` verifies
+it all before you deploy, and `python -m ab0t_quota doctor` grades production
+posture before go-live — full CLI in `docs/cli.md`. After this call:
 
 - `/api/quotas/usage`, `/api/quotas/tiers`, `/api/quotas/check/{key}`,
   `/api/quotas/check-bundle/{name}` are mounted
@@ -178,9 +215,29 @@ Or pass at the call site:
 setup_quota(app, mode="bridge")
 ```
 
-For BYO-Redis, just point the `storage.redis_url` at your managed Redis
+For BYO-Redis, point the `storage.redis_url` at your managed Redis
 in the config — engine-local mode against your own Redis instead of
 ab0t's shared one.
+
+**Managed Redis providers.** At boot the library machine-checks the Redis
+it was given: topology (no Redis Cluster), eviction policy (must not evict
+counter keys), Lua scripting, and a version floor. A check it cannot RUN
+fails closed unless you put the matching assertion on the record:
+
+| Provider reality | What the gate sees | The assertion you set |
+|---|---|---|
+| `CONFIG` disabled (ElastiCache, Upstash) | eviction policy unverifiable | set `maxmemory-policy noeviction` in the provider's parameter group, then `storage.redis_durability_confirmed: true` |
+| `INFO cluster` / `CLUSTER INFO` unavailable | topology unverifiable | `storage.redis_cluster_confirmed_disabled: true` |
+| `SCRIPT` command disabled/renamed (EVAL still works) | scripting unverifiable | `storage.redis_scripting_confirmed: true` |
+
+An assertion never overrides a negative the server actually reported
+(an observed cluster, an observed `allkeys-*` policy, a rejected script,
+a below-floor version): those refusals have no flag, deliberately — fix
+the Redis instead. (A rejected script is recognised by the server's
+"Error compiling" message — a disclosed heuristic; if it ever misses,
+the first counter operation fails closed, never open.) Run
+`python -m ab0t_quota preflight` in CI to see every verdict before you
+deploy.
 
 ---
 
@@ -288,6 +345,7 @@ for normal. No branching logic in your routes.
 If you charge customers per resource-hour, declare a cost accumulator
 and the library auto-records on resource teardown:
 
+<!-- doc-exec: fragment (feature illustration — shows ONLY the cost-cap keys; merge into the step-3 config, which declares the store) -->
 ```json
 {
   "billing_integration": { "cost_resource_key": "widget.monthly_cost" },
@@ -364,6 +422,7 @@ The full set you need:
 |---|---|---|---|
 | `AB0T_MESH_API_KEY` | yes | — | Your mesh credential |
 | `AB0T_CONSUMER_ORG_ID` | yes (paid mode) | — | Your service's mesh org UUID |
+| `QUOTA_REDIS_URL` | yes for local/byo_redis, unless `storage.redis_url` is set in the config | — | The DECLARED Redis (0.7: never harvested, never invented; bridge mode needs neither) |
 | `QUOTA_CONFIG_PATH` | no | `./quota-config.json` | Library auto-discovers |
 | `AB0T_SERVICE_NAME` | no | from config or first resource's `service` field | Identity for the catalog publish |
 | `AB0T_MESH_BILLING_URL` | no — local dev only | `https://billing.service.ab0t.com` | Override for testing against local stack |
@@ -375,8 +434,11 @@ The full set you need:
 | `AB0T_AUTH_WEBHOOK_PUBLIC_URL` | no (required for auto-subscribe) | — | Externally-reachable base URL of this service. Auth POSTs events to `<this>/api/quotas/_webhooks/auth`. |
 | `AB0T_AUTH_WATCH_ORG_SLUG` | no | from `AB0T_AUTH_ORG_SLUG` | Auth org slug to filter events for. Resolved to org_id at subscribe time. |
 
-That's it. **Two required env vars.** Compare to a typical
-hand-rolled integration: 6+ URLs/keys/ARNs across multiple service clients.
+**Two required env vars for the mesh surface** — plus the storage
+prerequisites in `docs/requirements.md` (declared Redis or bridge mode; DDB
+tables pre-created or opted in), which `python -m ab0t_quota preflight`
+verifies before you deploy. Compare to a typical hand-rolled integration:
+6+ URLs/keys/ARNs across multiple service clients.
 
 ---
 

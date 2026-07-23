@@ -45,6 +45,15 @@ logger = logging.getLogger(__name__)
 SINGLE_NODE = "single-node"
 CLUSTER = "CLUSTER (unsupported)"
 UNKNOWN = "unknown"
+#: GT T4 (ST-TOPOLOGY-1): the probe could not RUN (auth/connection). NOT a
+#: topology verdict — the reachability gate owns the refusal.
+PROBE_FAILED = "PROBE FAILED (reachability/credentials — not a topology verdict)"
+
+#: GT T4 — the data-plane probe keys: inside the library's own keyspace
+#: (ACL ~quota:*), hash TAGS chosen to land on different cluster slots (the
+#: slot difference is ASSERTED by a unit test, not assumed).
+PROBE_KEY_A = "quota:topology-probe:{foo}"
+PROBE_KEY_B = "quota:topology-probe:{bar}"
 
 #: Env equivalent of `storage.redis_cluster_confirmed_disabled` (config wins).
 CONFIRM_ENV = "AB0T_QUOTA_REDIS_CLUSTER_CONFIRMED_DISABLED"
@@ -84,6 +93,44 @@ def parse_cluster_enabled(raw) -> Optional[bool]:
     return None
 
 
+def _is_crossslot(exc: Exception) -> bool:
+    """True iff `exc` is the cluster CROSSSLOT rejection. Type first (the
+    shipped client's contract); raw-message token as the disclosed fallback."""
+    import redis.exceptions as rex
+    if isinstance(exc, rex.ClusterCrossSlotError):
+        return True
+    return "CROSSSLOT" in str(exc).upper()
+
+
+async def probe_data_plane_crossslot(redis) -> Tuple[Optional[bool], str]:
+    """GT T4 — the PRIMARY topology signal, requiring ZERO admin privileges:
+    a multi-key EXISTS on two different-slot keys in our own keyspace.
+
+    Returns (is_cluster, detail): (True, why) on CROSSSLOT — a DEFINITIVE
+    cluster verdict no assertion overrides; (None, "") on success or an
+    ACL/other error — success is NOT proof of single-node (a key-splitting
+    proxy can mask a cluster; Go's rule, kept): the caller still consults the
+    control plane or the operator assertion. Auth/connection failures
+    re-raise as RedisUnreachableError (never a topology verdict)."""
+    from .redis_preflight import _reraise_if_unreachable
+    try:
+        await redis.exists(PROBE_KEY_A, PROBE_KEY_B)
+        return None, ""
+    except Exception as e:
+        # Gate-D F-1: detection is by EXCEPTION TYPE — redis-py maps the
+        # `-CROSSSLOT` prefix to ClusterCrossSlotError and STRIPS it from the
+        # message (7.4.0: "Keys in request don't hash to the same slot"), so a
+        # substring match on "CROSSSLOT" is dead code through the shipped
+        # client. The message check survives only as a documented HEURISTIC
+        # fallback for clients that surface the raw server error instead.
+        if _is_crossslot(e):
+            return True, ("data-plane probe: multi-key EXISTS across slots failed "
+                          "with CROSSSLOT — this Redis IS a cluster (no admin "
+                          "command was needed to know it)")
+        _reraise_if_unreachable(e, probe="data-plane CROSSSLOT")
+        return None, ""  # NOPERM/other: absent signal — fall to the control plane
+
+
 async def probe_cluster_enabled(redis) -> Tuple[Optional[bool], str]:
     """Ask the client's Redis whether it is clustered. Returns (enabled, probe).
 
@@ -102,6 +149,8 @@ async def probe_cluster_enabled(redis) -> Tuple[Optional[bool], str]:
     with a trimmed INFO: it *answering at all* is itself the positive cluster signal,
     and its "cluster support disabled" error is a positive single-node signal.
     """
+    from .redis_preflight import _reraise_if_unreachable
+
     # (1) INFO cluster — definitive on both topologies.
     try:
         raw = await redis.info("cluster")
@@ -109,6 +158,7 @@ async def probe_cluster_enabled(redis) -> Tuple[Optional[bool], str]:
         if enabled is not None:
             return enabled, "INFO cluster"
     except Exception as e:
+        _reraise_if_unreachable(e, probe="INFO cluster")  # GT T4: never fold
         info_err = f"{type(e).__name__}"
     else:
         info_err = "no cluster_enabled field"
@@ -117,8 +167,13 @@ async def probe_cluster_enabled(redis) -> Tuple[Optional[bool], str]:
     try:
         raw = await redis.execute_command("CLUSTER", "INFO")
     except Exception as e:
+        # Disclosed heuristic (F-1 audit): no exception TYPE exists for this
+        # server reply; the token is MID-message, so redis-py's prefix-strip
+        # ("ERR ") cannot remove it — unlike the CROSSSLOT prefix, which is
+        # typed and detected by isinstance above in the data-plane probe.
         if "cluster support disabled" in str(e).lower():
             return False, "CLUSTER INFO (server: cluster support disabled)"
+        _reraise_if_unreachable(e, probe="CLUSTER INFO")  # GT T4
         return None, f"INFO cluster [{info_err}]; CLUSTER INFO [{type(e).__name__}]"
     enabled = parse_cluster_enabled(raw)
     if enabled is not None:
@@ -170,9 +225,21 @@ async def check_redis_cluster_topology(
 ) -> Tuple[str, str]:
     """Ask the client's Redis what it is → (topology, reason).
 
-    Never raises: the caller decides what to do with UNKNOWN/CLUSTER (setup_quota
+    GT T4 order: the data-plane CROSSSLOT probe is PRIMARY (definitive-cluster
+    with zero admin privileges; success defers — not single-node proof), the
+    INFO/CLUSTER control-plane probes are fallbacks. Auth/connection failures
+    become (PROBE_FAILED, detail) — never a topology verdict.
+
+    Never raises: the caller decides what to do with the verdict (setup_quota
     refuses to start; see `topology_error`)."""
-    enabled, probe = await probe_cluster_enabled(redis)
+    from .redis_preflight import RedisUnreachableError
+    try:
+        is_cluster, dp_detail = await probe_data_plane_crossslot(redis)
+        if is_cluster:
+            return CLUSTER, dp_detail
+        enabled, probe = await probe_cluster_enabled(redis)
+    except RedisUnreachableError as e:
+        return PROBE_FAILED, str(e)
     return evaluate_topology(enabled, confirmed_disabled=confirmed_disabled, probe=probe)
 
 
@@ -199,9 +266,16 @@ _UNKNOWN_MSG = (
 )
 
 
-def topology_error(topology: str, detail: str) -> ClusterTopologyError:
+def topology_error(topology: str, detail: str):
     """Build the loud, typed startup refusal. Names the CAUSE and the REMEDY —
-    a refusal a client cannot act on is just an outage."""
+    a refusal a client cannot act on is just an outage.
+
+    GT T4, load-bearing: PROBE_FAILED maps to the typed REACHABILITY error —
+    a ClusterTopologyError can NEVER be constructed from an auth/connection
+    failure path (the incident made structurally impossible)."""
+    if topology == PROBE_FAILED:
+        from .redis_preflight import reachability_error
+        return reachability_error("probe", detail)
     head = _CLUSTER_MSG if topology == CLUSTER else _UNKNOWN_MSG
     return ClusterTopologyError(f"{head} [detail: {detail}]")
 

@@ -10,20 +10,27 @@ set -e
 
 echo "=== Quota System Health Check ==="
 
-# 1. Redis
+# 1. Redis — from the DECLARED source only (config file, else QUOTA_REDIS_URL).
+# Never invent localhost: probing a Redis the service does not use produces
+# green health over the wrong instance (0.7, declared-not-discovered).
 echo ""
 echo "--- Redis ---"
-REDIS_URL="${QUOTA_REDIS_URL:-redis://localhost:6379/0}"
-if redis-cli -u "$REDIS_URL" PING | grep -q PONG; then
+DECLARED_REDIS_URL="$(jq -r '.storage.redis_url // empty' quota-config.json 2>/dev/null)"
+DECLARED_REDIS_URL="${DECLARED_REDIS_URL:-$QUOTA_REDIS_URL}"
+if [ -z "$DECLARED_REDIS_URL" ]; then
+    echo "FAIL: no declared Redis (storage.redis_url / QUOTA_REDIS_URL) — nothing to check"
+    exit 1
+fi
+if redis-cli -u "$DECLARED_REDIS_URL" PING | grep -q PONG; then
     echo "OK: Redis reachable"
-    COUNTER_COUNT=$(redis-cli -u "$REDIS_URL" KEYS "quota:*:gauge" 2>/dev/null | wc -l)
-    RATE_COUNT=$(redis-cli -u "$REDIS_URL" KEYS "quota:*:rate" 2>/dev/null | wc -l)
-    ACC_COUNT=$(redis-cli -u "$REDIS_URL" KEYS "quota:*:acc:*" 2>/dev/null | wc -l)
+    COUNTER_COUNT=$(redis-cli -u "$DECLARED_REDIS_URL" KEYS "quota:*:gauge" 2>/dev/null | wc -l)
+    RATE_COUNT=$(redis-cli -u "$DECLARED_REDIS_URL" KEYS "quota:*:rate" 2>/dev/null | wc -l)
+    ACC_COUNT=$(redis-cli -u "$DECLARED_REDIS_URL" KEYS "quota:*:acc:*" 2>/dev/null | wc -l)
     echo "  Gauge counters: $COUNTER_COUNT"
     echo "  Rate counters: $RATE_COUNT"
     echo "  Accumulator counters: $ACC_COUNT"
 else
-    echo "FAIL: Redis unreachable at $REDIS_URL"
+    echo "FAIL: Redis unreachable at $DECLARED_REDIS_URL"
 fi
 
 # 2. DynamoDB

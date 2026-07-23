@@ -28,10 +28,10 @@ from .models.responses import (
 from .alerts import AlertManager
 from .counters.factory import create_counter
 from .counters.rate import RateCounter
+from .errors import QuotaConfigError
 from .messages import MessageBuilder
 from .registry import ResourceRegistry
 from .providers import TierProvider
-from .tiers import DEFAULT_TIERS
 
 logger = logging.getLogger("ab0t_quota")
 
@@ -58,24 +58,29 @@ class AcquireResult:
 
 # Atomic bundle check-and-spend (P2.2, QI-03). Checks ALL gauge limits (org and
 # per-user) and, only if EVERY one passes, spends ALL of them — in ONE Lua op.
-# This is the real cross-resource atomicity the old sequential-loop batch_check
-# only *claimed* (its docstring said "atomically"; the body was a per-resource
-# loop). KEYS = [idem, then per gauge: org, user, seq]; a gauge with no per-user
-# limit still passes placeholder user/seq keys (has_user='0' skips them).
-#   ARGV[1]=has_idem ARGV[2]=idem_ttl ARGV[3]=n
-#   per gauge i (base = 3 + (i-1)*4): has_user, delta, org_limit, user_limit
-# Returns {admitted('1'/'0'), reason} where reason is 'ok'|'dup'|the 1-based index
-# of the first gauge that would exceed its limit.
-_ACQUIRE = """
+# KEYS = [idem, then per gauge: org, user, seq] (placeholders when no user);
+# during dual-write (K-3) the whole key set is doubled with the secondary shape.
+#   ARGV[1]=has_idem ARGV[2]=idem_ttl ARGV[3]=n ARGV[4]=dual ARGV[5]=v2p
+#   per gauge i (base = 5 + (i-1)*4): has_user, delta, org_limit, user_limit
+# Returns {admitted('1'/'0'), reason} reason='ok'|'dup'|1-based denied index.
+from .counters.base import dual_lua
+
+_ACQUIRE = dual_lua("1 + tonumber(ARGV[3])*3", 4, """
 local n = tonumber(ARGV[3])
+for i=1,n do
+  local kb = 1 + (i-1)*3
+  local ab = 5 + (i-1)*4
+  seedv2(kb+1)
+  if ARGV[ab+1] == '1' then seedv2(kb+2); seedv2(kb+3) end
+end
 if ARGV[1] == '1' then
-  if redis.call('GET', KEYS[1]) then
+  if idem_dup(1) then
     return {'1', 'dup'}
   end
 end
 for i=1,n do
   local kb = 1 + (i-1)*3
-  local ab = 3 + (i-1)*4
+  local ab = 5 + (i-1)*4
   local has_user = ARGV[ab+1]
   local delta = tonumber(ARGV[ab+2])
   local org_limit = ARGV[ab+3]
@@ -92,30 +97,29 @@ for i=1,n do
   end
 end
 if ARGV[1] == '1' then
-  if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
-    return {'1', 'dup'}
-  end
+  idem_claim(1)
 end
 for i=1,n do
   local kb = 1 + (i-1)*3
-  local ab = 3 + (i-1)*4
+  local ab = 5 + (i-1)*4
   local has_user = ARGV[ab+1]
   local delta = tonumber(ARGV[ab+2])
-  redis.call('INCRBYFLOAT', KEYS[kb+1], delta)
+  incrboth(kb+1, delta)
   if has_user == '1' then
-    redis.call('INCR', KEYS[kb+3])
-    redis.call('INCRBYFLOAT', KEYS[kb+2], delta)
+    incrintboth(kb+3)
+    incrboth(kb+2, delta)
   end
 end
 return {'1', 'ok'}
-"""
+""")
 
 
 class QuotaEngine:
     """Core quota enforcement engine.
 
     Usage:
-        engine = QuotaEngine(redis=redis, tier_provider=provider, registry=registry)
+        engine = QuotaEngine(redis=redis, tier_provider=provider, registry=registry,
+                             tiers=load_tiers(config))  # tiers are POLICY: always explicit
 
         # Pre-flight check
         result = await engine.check(QuotaCheckRequest(org_id="org-1", resource_key="sandbox.concurrent"))
@@ -140,11 +144,26 @@ class QuotaEngine:
         enforcement: Optional[EnforcementConfig | dict] = None,
         activation_store=None,
         activations_enabled: Optional[bool] = None,
+        keyspace=None,
     ):
         self._redis = redis
         self._tier_provider = tier_provider
         self._registry = registry
-        self._tiers = tiers or DEFAULT_TIERS
+        # K-1 (keyspace spec §3.2): the declared keyspace state — service scope,
+        # version, dual flag. None = v1 single-shape, today's behaviour.
+        from .keyspace import Keyspace
+        self._keyspace = keyspace or Keyspace()
+        # T-3/ENV-12: the tier catalog is POLICY and is never invented. An
+        # explicit {} is a declaration (honoured); None/omitted is an error.
+        if tiers is None:
+            raise QuotaConfigError(
+                name="tier catalog", config_key="tiers", code="QUOTA-CFG-004",
+                state="QuotaEngine(tiers=None) — not supplied", env_names=(),
+                remedy=("pass tiers=load_tiers(config). For tests/local dev only: "
+                        "ab0t_quota.tiers.DEFAULT_TIERS may be passed explicitly."),
+                docs_anchor="tiers",
+            )
+        self._tiers = tiers
         self._override_loader = override_loader  # async fn(org_id, resource_key) → QuotaOverride | None
         self._alert_manager: Optional[AlertManager] = None
         # --- Activation core (P2.1/P2.2, DECISIONS D-10) ---------------------
@@ -192,9 +211,9 @@ class QuotaEngine:
 
     def bundle_resources(self, bundle_name: str) -> list[str]:
         """Return the resource_keys this bundle consumes. Empty list if
-        the bundle is not declared (no checks happen — fail open at the
-        dispatch layer; per-resource enforcement still applies if the
-        consumer calls check() / increment() directly)."""
+        the bundle is not declared — callers must treat that per the
+        enforcement unknown_bundle policy (default 'deny', loud — D-14/D-48),
+        never as a silent allow."""
         return list(self._resource_bundles.get(bundle_name, []))
 
     # ------------------------------------------------------------------
@@ -277,7 +296,7 @@ class QuotaEngine:
         has_override = override is not None and not override.is_expired
 
         # Get current org-level usage
-        counter = create_counter(self._redis, request.org_id, resource_def)
+        counter = create_counter(self._redis, request.org_id, resource_def, keyspace=self._keyspace)
         current = await counter.get()
 
         # Org-level check
@@ -447,7 +466,7 @@ class QuotaEngine:
         rollback (acquire persistence), NOT the lever for this behaviour.
         """
         resource_def = self._registry.require(request.resource_key)
-        counter = create_counter(self._redis, request.org_id, resource_def)
+        counter = create_counter(self._redis, request.org_id, resource_def, keyspace=self._keyspace)
 
         if resource_def.counter_type == CounterType.GAUGE:
             from .counters.gauge import GaugeCounter
@@ -516,7 +535,7 @@ class QuotaEngine:
         tl = tier.get_limit(request.resource_key)
         override = await self._load_override(request.org_id, request.resource_key)
         base = override.limit if (override and not override.is_expired) else tl.limit
-        counter = create_counter(self._redis, request.org_id, resource_def)
+        counter = create_counter(self._redis, request.org_id, resource_def, keyspace=self._keyspace)
         if base is not None:
             org_cur = await counter.get()
             if org_cur > base:
@@ -555,7 +574,7 @@ class QuotaEngine:
         resource_def = self._registry.require(request.resource_key)
         if resource_def.counter_type != CounterType.GAUGE:
             raise TypeError(f"Cannot decrement {resource_def.counter_type.value} counter '{request.resource_key}'")
-        counter = create_counter(self._redis, request.org_id, resource_def)
+        counter = create_counter(self._redis, request.org_id, resource_def, keyspace=self._keyspace)
         # Per-user partition for gauges
         if request.user_id:
             from .counters.gauge import GaugeCounter
@@ -566,7 +585,7 @@ class QuotaEngine:
     async def reset(self, request: QuotaResetRequest) -> None:
         """Admin: force-set a counter value."""
         resource_def = self._registry.require(request.resource_key)
-        counter = create_counter(self._redis, request.org_id, resource_def)
+        counter = create_counter(self._redis, request.org_id, resource_def, keyspace=self._keyspace)
         previous_value = await counter.get()
         logger.warning(
             "ADMIN_QUOTA_RESET admin_user_id=%s org_id=%s resource_key=%s previous_value=%s new_value=%s reason=%s",
@@ -657,7 +676,7 @@ class QuotaEngine:
             rd = self._registry.get(rk)
             if rd is None or rd.counter_type != CounterType.GAUGE:
                 continue
-            g = create_counter(self._redis, org_id, rd)
+            g = create_counter(self._redis, org_id, rd, keyspace=self._keyspace)
             if not isinstance(g, GaugeCounter):
                 continue
             org_limit, per_user = await self._effective_limits(
@@ -680,20 +699,32 @@ class QuotaEngine:
         if not specs:
             return True, "ok"
         from .counters.gauge import GaugeCounter
-        keys: list = [
-            (f"{specs[0]['gauge']._key_prefix}:idem:{idem}" if idem
-             else f"{specs[0]['gauge']._key_prefix}:idem:__unused__")
-        ]
-        argv: list = ["1" if idem else "0", 86400, len(specs)]
+        ks = self._keyspace
+        g0: GaugeCounter = specs[0]["gauge"]
+
+        def _key_set(version=None):
+            """One full [idem, per-gauge org/user/seq] set in the given shape
+            (None = primary). Dual doubles the whole set (K-3)."""
+            out = [ks.idem_key(g0._org_id, g0._resource_key, idem, version=version)]
+            for s in specs:
+                g: GaugeCounter = s["gauge"]
+                org_key = ks.gauge_key(g._org_id, g._resource_key, version=version)
+                out.append(org_key)
+                if user_id:
+                    out.append(ks.user_key(g._org_id, g._resource_key, user_id, version=version))
+                    out.append(ks.seq_user_key(g._org_id, g._resource_key, user_id, version=version))
+                else:
+                    out.append(org_key)   # placeholder (has_user='0' skips it)
+                    out.append(org_key)
+            return out
+
+        keys: list = _key_set()
+        if ks.secondary_version:
+            keys += _key_set(version=ks.secondary_version)
+        argv: list = ["1" if idem else "0", 86400, len(specs),
+                      "1" if ks.secondary_version else "0",
+                      "1" if ks.primary_is_v2 else "0"]
         for s in specs:
-            g: GaugeCounter = s["gauge"]
-            keys.append(g._redis_key)
-            if user_id:
-                keys.append(g._user_key(user_id))
-                keys.append(g._seq_user_key(user_id))
-            else:
-                keys.append(g._redis_key)   # placeholder (has_user='0' skips it)
-                keys.append(g._redis_key)
             argv.extend([
                 "1" if s["has_user"] else "0",
                 repr(float(s["delta"])),
@@ -894,7 +925,7 @@ class QuotaEngine:
             rd = self._registry.get(rk)
             if rd is None or rd.counter_type != CounterType.GAUGE:
                 continue
-            g = create_counter(self._redis, row.org_id, rd)
+            g = create_counter(self._redis, row.org_id, rd, keyspace=self._keyspace)
             if not isinstance(g, GaugeCounter):
                 continue
             # Idempotent by the activation state transition above (this line only
@@ -995,7 +1026,11 @@ class QuotaEngine:
         if window <= 0:
             return
         try:
-            await self._redis.set(f"quota:reconcile:recent:{org_id}", "1", ex=window)
+            ks = self._keyspace
+            await self._redis.set(ks.recent_key(org_id), "1", ex=window)
+            if ks.secondary_version:  # dual: both shapes (keyspace spec §7 #5)
+                await self._redis.set(
+                    ks.recent_key(org_id, version=ks.secondary_version), "1", ex=window)
         except Exception:
             pass
 
@@ -1105,11 +1140,11 @@ class QuotaEngine:
     async def get_usage(self, org_id: str, **provider_kwargs) -> QuotaUsageResponse:
         """Get full usage report for an org across all registered resources."""
         tier_id = await self._tier_provider.get_tier(org_id, **provider_kwargs)
-        tier = self._tiers.get(tier_id, self._tiers.get("free"))
+        tier = self._tiers.get(tier_id) or self._lowest_tier()
 
         items = []
         for resource_def in self._registry.all():
-            counter = create_counter(self._redis, org_id, resource_def)
+            counter = create_counter(self._redis, org_id, resource_def, keyspace=self._keyspace)
             current = await counter.get()
             tier_limits = tier.get_limit(resource_def.resource_key)
 
@@ -1124,6 +1159,8 @@ class QuotaEngine:
                 limit=effective_limit,
                 tier_id=tier_id,
                 has_override=has_override,
+                warning_threshold=tier_limits.warning_threshold,
+                critical_threshold=tier_limits.critical_threshold,
             )
             items.append(QuotaUsageItem(
                 resource_key=resource_def.resource_key,
@@ -1161,10 +1198,30 @@ class QuotaEngine:
     # Feature gating
     # ------------------------------------------------------------------
 
+    def _lowest_tier(self) -> TierConfig:
+        """The consumer's OWN lowest tier, by sort_order.
+
+        D-CK-5: the fallback used to be `self._tiers.get("free")` — a tier
+        NAME in library logic, which returns None (and then AttributeErrors)
+        for any consumer whose entry plan is called something else. The
+        catalog is non-empty by construction (QUOTA-CFG-004 refuses
+        tiers=None); an explicitly EMPTY catalog is a declaration and raises.
+        """
+        try:
+            return min(self._tiers.values(), key=lambda t: (t.sort_order, t.tier_id))
+        except ValueError:
+            raise QuotaConfigError(
+                name="tier catalog", config_key="tiers", code="QUOTA-CFG-004",
+                state="empty catalog — no tier to fall back to",
+                env_names=(),
+                remedy="declare at least one tier in quota-config.json `tiers[]`",
+                docs_anchor="tiers",
+            )
+
     async def check_feature(self, org_id: str, feature_name: str, **provider_kwargs) -> bool:
         """Check if an org's tier includes a feature (e.g. 'gpu_access', 'sso')."""
         tier_id = await self._tier_provider.get_tier(org_id, **provider_kwargs)
-        tier = self._tiers.get(tier_id, self._tiers.get("free"))
+        tier = self._tiers.get(tier_id) or self._lowest_tier()
         return feature_name in tier.features
 
     # ------------------------------------------------------------------
@@ -1221,7 +1278,8 @@ class QuotaEngine:
             return QuotaResult(
                 decision=QuotaDecision.DENY,
                 severity=AlertSeverity.EXCEEDED,
-                message=MessageBuilder.deny(resource_def, tier, current, limit, requested),
+                message=MessageBuilder.deny(resource_def, tier, current, limit, requested,
+                                            tiers=self._tiers),
                 retry_after=retry_after,
                 **base,
             )
@@ -1232,14 +1290,20 @@ class QuotaEngine:
             return QuotaResult(
                 decision=QuotaDecision.ALLOW_WARNING,
                 severity=AlertSeverity.CRITICAL,
-                message=MessageBuilder.warning(resource_def, tier, current, limit, after),
+                message=MessageBuilder.warning(
+                    resource_def, tier, current, limit, after,
+                    warning_threshold=tier_limits.warning_threshold,
+                    critical_threshold=tier_limits.critical_threshold),
                 **base,
             )
         if utilization >= tier_limits.warning_threshold:
             return QuotaResult(
                 decision=QuotaDecision.ALLOW_WARNING,
                 severity=AlertSeverity.WARNING,
-                message=MessageBuilder.warning(resource_def, tier, current, limit, after),
+                message=MessageBuilder.warning(
+                    resource_def, tier, current, limit, after,
+                    warning_threshold=tier_limits.warning_threshold,
+                    critical_threshold=tier_limits.critical_threshold),
                 **base,
             )
 

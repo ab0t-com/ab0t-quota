@@ -11,7 +11,9 @@ End-to-end deployment guide for the four-service stack:
 
 Plus shared infrastructure already running:
 - `shared-redis:6379` (quota counters, tier cache, alert cooldowns)
-- DynamoDB (`ab0t_quota_state` table — auto-created by the library/billing on first start)
+- DynamoDB (`ab0t_quota_state` table — pre-create it, or opt in to auto-creation
+  with `storage.auto_create_tables: true`; since 0.7 the library never creates
+  tables without that explicit opt-in)
 - LocalStack SNS (lifecycle events for billing proration)
 
 ---
@@ -240,6 +242,7 @@ In the Stripe dashboard:
   - `invoice.payment_succeeded` (older Stripe API versions; safe to also enable — lib accepts both)
   - `invoice.payment_failed`
 - Copy the signing secret → set `STRIPE_WEBHOOK_SECRET` in payment service env
+  (payment-service's own variable; ab0t-quota consumers use `AB0T_QUOTA_STRIPE_WEBHOOK_SECRET` — the library never reads the generic name)
 
 The library's webhook proxy in sandbox forwards to payment service which
 verifies the signature.
@@ -339,6 +342,8 @@ AB0T_CONSUMER_ORG_ID=00000000-0000-0000-0000-000000000000
 
 # Quota config
 QUOTA_CONFIG_PATH=/app/quota-config.json
+# QUOTA_REDIS_URL is one of the TWO declared sources (config storage.redis_url
+# wins per the documented precedence). The generic REDIS_URL is never read (0.7).
 QUOTA_REDIS_URL=redis://shared-redis:6379/4
 QUOTA_STATE_TABLE=ab0t_quota_state
 
@@ -347,6 +352,8 @@ BILLING_ENFORCEMENT_ENABLED=true
 
 # Auth
 JWT_SECRET=<your secret>
+# The service's OWN auth variable — ab0t-quota never reads the generic
+# AUTH_SERVICE_URL (0.7; the library's auth URL is AB0T_AUTH_AUTH_URL / auth.url).
 AUTH_SERVICE_URL=https://auth.service.ab0t.com
 
 # AWS
@@ -362,6 +369,7 @@ That's the full required set. **Eight env vars.** Compare to pre-migration:
 
 ```bash
 DATABASE_URL=postgresql://...
+# Billing service's OWN variable — the quota library never reads the generic REDIS_URL (0.7).
 REDIS_URL=redis://shared-redis:6379/1
 CLICKHOUSE_URL=...
 QUOTA_STATE_TABLE=ab0t_quota_state
@@ -374,6 +382,8 @@ SQS_LIFECYCLE_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/...
 
 ```bash
 STRIPE_SECRET_KEY=sk_live_...
+# This is PAYMENT-SERVICE's own variable. ab0t-quota consumers use
+# AB0T_QUOTA_STRIPE_WEBHOOK_SECRET — the library does not read the generic name (0.7).
 STRIPE_WEBHOOK_SECRET=whsec_...
 DATABASE_URL=postgresql://...
 BILLING_SERVICE_URL=http://billing:8002    # internal-cluster reach

@@ -63,22 +63,57 @@ async def verify_ddb_table(
     *,
     ttl_attribute: str,
     pitr_confirmed: bool = False,
+    required_gsis: Tuple[str, ...] = (),
 ) -> Tuple[str, Optional[str], Optional[str]]:
     """Verify one table. Never raises.
 
     Returns ``(capability_value, fatal_reason | None, warn_reason | None)``.
     The caller decides the consequence: refuse at boot; degrade + alert at runtime (D-75).
+
+    ``required_gsis`` (T-18/ENV-16): the indexes the CALLER'S QUERIES need.
+    Checking only that existing GSIs are ACTIVE let a zero-GSI table pass
+    trivially while every query against it failed at runtime — the gate
+    verified the quality of what it found, never whether what is REQUIRED
+    is there (GATE-04's blind spot, one layer down).
     """
     # --- table + GSIs -------------------------------------------------------
     try:
         desc = (await client.describe_table(TableName=table))["Table"]
     except Exception as e:
-        detail = f"table {table!r} not found or not describable ({type(e).__name__})"
+        # T-8 (GATE-01, AWS half): a PERMISSION failure is not a missing table.
+        # Both refuse (fail-closed, MUST #6) — but the verdict must name the
+        # actual cause, or a 3am operator "fixes" a table that exists.
+        # Gate-D F-1 audit: STRUCTURED code first — botocore carries the error
+        # code in e.response['Error']['Code'] (the field the SDK contract
+        # guarantees); the name/message substring stays as the disclosed
+        # heuristic fallback for fakes/wrapped exceptions.
+        exc_name = type(e).__name__
+        code = ""
+        try:
+            code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+        except Exception:
+            pass
+        if code in ("AccessDeniedException", "AccessDenied") \
+                or "AccessDenied" in exc_name or "AccessDenied" in str(e):
+            detail = (f"permission denied describing table {table!r} "
+                      f"(dynamodb:DescribeTable, {exc_name}) — the table may exist; "
+                      f"grant the IAM action so the library can verify it")
+            return f"UNSAFE ({detail})", detail, None
+        detail = f"table {table!r} not found or not describable ({exc_name})"
         return f"UNSAFE ({detail})", detail, None
 
     status = str(desc.get("TableStatus", "")).upper()
     if status != "ACTIVE":
         detail = f"table {table!r} is {status or 'UNKNOWN'}, not ACTIVE"
+        return f"UNSAFE ({detail})", detail, None
+
+    present_gsis = {g.get("IndexName") for g in desc.get("GlobalSecondaryIndexes", []) or []}
+    missing = [n for n in required_gsis if n not in present_gsis]
+    if missing:
+        detail = (f"table {table!r} is missing required GSI(s) {', '.join(missing)} — "
+                  f"queries against them fail with ValidationException at runtime. "
+                  f"Self-provisioned tables created before 0.7 lack them; add the "
+                  f"index(es) (online UpdateTable) or recreate the table")
         return f"UNSAFE ({detail})", detail, None
 
     for gsi in desc.get("GlobalSecondaryIndexes", []) or []:

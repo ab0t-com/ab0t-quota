@@ -51,6 +51,85 @@ REDIS_VERSION_FLOOR = (6, 0, 0)
 
 #: Env equivalent of `storage.redis_durability_confirmed` (config wins).
 DURABILITY_CONFIRM_ENV = "AB0T_QUOTA_REDIS_DURABILITY_CONFIRMED"
+SCRIPTING_CONFIRM_ENV = "AB0T_QUOTA_REDIS_SCRIPTING_CONFIRMED"
+
+#: Capability values for `redis_reachable` (GT lane T1/T2 — the incident's fix).
+REACHABLE_OK = "on (PING verified)"
+PROBE_FAILED_CAP = "PROBE FAILED (reachability/credentials — not a topology verdict)"
+
+
+class RedisUnreachableError(RuntimeError):
+    """The DECLARED Redis could not be reached or authenticated (GT T1).
+
+    This is a REACHABILITY refusal, never an infrastructure verdict: the
+    topology/eviction/scripting/version checks never ran. `kind` is one of
+    'auth' | 'acl' | 'unreachable' | 'error' | 'probe'."""
+
+    def __init__(self, kind: str, message: str):
+        self.kind = kind
+        super().__init__(message)
+
+
+def classify_redis_error(exc: Exception) -> str:
+    """The T-G3 taxonomy, ported as a RULE (never a diff):
+    'auth' (NOAUTH/WRONGPASS — nothing was checked at all) · 'acl' (NOPERM —
+    this specific command denied; a genuine ABSENT signal where assertion
+    flags legitimately apply) · 'unreachable' (network) · '' (anything else).
+    Type-based first; message tokens as a disclosed-heuristic fallback."""
+    import redis.exceptions as rex
+    if isinstance(exc, rex.NoPermissionError):
+        return "acl"
+    if isinstance(exc, rex.AuthenticationError):  # subclasses ConnectionError!
+        return "auth"
+    if isinstance(exc, (rex.ConnectionError, rex.TimeoutError, OSError)):
+        return "unreachable"
+    s = str(exc).lower()
+    if "noperm" in s:
+        return "acl"
+    if any(t in s for t in ("noauth", "wrongpass", "invalid password",
+                            "invalid username-password", "authentication required")):
+        return "auth"
+    if any(t in s for t in ("connection refused", "connection reset", "broken pipe",
+                            "timed out", "no route to host", "network is unreachable",
+                            "name or service not known")):
+        return "unreachable"
+    return ""
+
+
+def _reraise_if_unreachable(exc: Exception, *, probe: str) -> None:
+    """T5: a probe that hit an auth/connection failure re-raises to T1's gate
+    — it must NEVER fold the failure into its own verdict vocabulary (the
+    incident's shape). NOPERM ('acl') stays: that IS the absent signal."""
+    kind = classify_redis_error(exc)
+    if kind in ("auth", "unreachable"):
+        raise reachability_error(
+            kind, f"{type(exc).__name__}: {exc} (raised during the {probe} probe)")
+
+
+async def check_redis_reachable(redis, *, timeout: float = 5.0):
+    """T1 — one PING, classified. Returns (ok, kind, detail); never raises."""
+    import asyncio as _asyncio
+    try:
+        await _asyncio.wait_for(redis.ping(), timeout)
+        return True, "", "PING ok"
+    except Exception as e:
+        kind = classify_redis_error(e) or "error"
+        return False, kind, f"{type(e).__name__}: {e}"
+
+
+def reachability_error(kind: str, detail: str, *, url_display: str = "",
+                       source: str = "") -> RedisUnreachableError:
+    where = f" {url_display}" if url_display else ""
+    src = f" (declared by {source})" if source else ""
+    verb = "AUTHENTICATE to" if kind in ("auth", "acl") else "REACH"
+    return RedisUnreachableError(kind, (
+        f"ab0t-quota could not {verb} the DECLARED Redis{where}{src} — "
+        f"{kind}: {detail}. This is NOT a topology verdict: the "
+        f"topology/eviction/scripting/version checks never ran. Remedy: fix the "
+        f"credential or reachability condition (storage.redis_url / "
+        f"storage.redis_password / URL userinfo, network path). The "
+        f"*_confirmed_* assertion flags would NOT help and are not the remedy — "
+        f"they exist for a REACHABLE Redis whose signals cannot be probed."))
 
 
 class CounterEvictionError(RuntimeError):
@@ -93,6 +172,7 @@ async def read_redis_policy(redis) -> Tuple[str, str, str, bool, str]:
         ao = await redis.config_get("appendonly")
         save = await redis.config_get("save")
     except Exception as e:
+        _reraise_if_unreachable(e, probe="CONFIG GET")  # T5: never fold auth/conn
         return "", "", "", True, type(e).__name__
     return (_val(pol, "maxmemory-policy").lower(),
             _val(ao, "appendonly").lower(),
@@ -181,14 +261,44 @@ async def check_redis_counter_eviction(redis, *, confirmed: bool = False) -> Tup
 # D-73 — scripting capability
 # ---------------------------------------------------------------------------
 
-async def check_redis_script_capability(redis) -> Tuple[bool, str]:
+def scripting_confirmed_from(config: dict) -> bool:
+    """The operator's on-the-record scripting assertion (T-9/GATE-02), from
+    config (canonical) or env. A positive act, never a default."""
+    storage = (config or {}).get("storage", {}) or {}
+    if "redis_scripting_confirmed" in storage:
+        return bool(storage["redis_scripting_confirmed"])
+    return os.getenv(SCRIPTING_CONFIRM_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+async def check_redis_script_capability(redis, *, confirmed: bool = False) -> Tuple[bool, str]:
     """`SCRIPT LOAD` the REAL `_ACQUIRE` source. If this Redis cannot run our Lua, we
     learn it at BOOT — not at the first admission decision. Bonus: the script cache is
-    warm, so the first acquire does not pay the load."""
+    warm, so the first acquire does not pay the load.
+
+    `confirmed` (T-9/GATE-02: storage.redis_scripting_confirmed) covers ONLY the
+    UNVERIFIABLE case — the probe could not RUN (SCRIPT disabled/renamed/denied
+    on some managed Redis) while EVAL may still work. A server that RAN the load
+    and REJECTED the Lua (compile error) is an observed negative the assertion
+    never overrides (MUST #6, the D-71/D-72 law). Rejection is detected by the
+    'compil' substring of the server's error — a disclosed HEURISTIC (real
+    Redis/Valkey emit "Error compiling script"), same class as the AccessDenied
+    match in ddb_preflight. If it misses, or the assertion is wrong, the first
+    acquire fails CLOSED (admission denies) — broken but safe."""
     from .engine import _ACQUIRE
     try:
         sha = await redis.script_load(_ACQUIRE)
     except Exception as e:
+        # T5, BEFORE the hatch: an auth/connection failure re-raises — the
+        # scripting assertion must never convert unreachability into a pass.
+        _reraise_if_unreachable(e, probe="SCRIPT LOAD")
+        observed_reject = "compil" in str(e).lower()
+        if confirmed and not observed_reject:
+            return True, (
+                f"UNVERIFIED — the SCRIPT LOAD probe could not run "
+                f"({type(e).__name__}: {e}); proceeding on the operator's "
+                f"storage.redis_scripting_confirmed assertion. If this Redis "
+                f"cannot in fact run the counter's Lua, the first acquire fails "
+                f"CLOSED (denies), never open.")
         return False, (f"SCRIPT LOAD of the counter's _ACQUIRE script failed ({type(e).__name__}: {e}) "
                        f"— this Redis cannot run the atomic counter")
     if isinstance(sha, (bytes, bytearray)):
@@ -222,7 +332,8 @@ def evaluate_version(version: Optional[str], *,
 async def check_redis_version(redis, *, floor: tuple = REDIS_VERSION_FLOOR) -> Tuple[str, str]:
     try:
         info = await redis.info("server")
-    except Exception:
+    except Exception as e:
+        _reraise_if_unreachable(e, probe="INFO server")  # T5
         return evaluate_version(None, floor=floor)
     version = None
     if isinstance(info, dict):
@@ -270,7 +381,8 @@ def evaluate_memory_headroom(maxmemory, used_memory) -> Tuple[str, str]:
 async def check_memory_headroom(redis) -> Tuple[str, str]:
     try:
         info = await redis.info("memory")
-    except Exception:
+    except Exception as e:
+        _reraise_if_unreachable(e, probe="INFO memory")  # T5
         return evaluate_memory_headroom(None, None)
     if not isinstance(info, dict):
         return evaluate_memory_headroom(None, None)
@@ -318,6 +430,7 @@ async def check_evicted_keys(redis) -> Tuple[Optional[int], str]:
     try:
         info = await redis.info("stats")
     except Exception as e:
+        _reraise_if_unreachable(e, probe="INFO stats")  # T5
         return None, f"INFO stats unavailable ({type(e).__name__})"
     if not isinstance(info, dict):
         return None, "INFO stats unparseable"
@@ -360,7 +473,8 @@ async def check_persist_facts(redis) -> dict:
     """Read `INFO persistence` — the facts a config check cannot see."""
     try:
         info = await redis.info("persistence")
-    except Exception:
+    except Exception as e:
+        _reraise_if_unreachable(e, probe="INFO persistence")  # T5
         return {}
     if not isinstance(info, dict):
         return {}
@@ -416,7 +530,8 @@ def persist_facts_ok(value) -> bool:
 # ---------------------------------------------------------------------------
 
 async def verify_redis_invariants(redis, config: dict, *,
-                                  outbox_on_redis: bool = False) -> Tuple[dict, list]:
+                                  outbox_on_redis: bool = False,
+                                  script_load: bool = True) -> Tuple[dict, list]:
     """D-75 — **"An assumption machine-checked once is an assumption trusted thereafter."**
 
     Every guard we own (D-32 durability, D-71 topology, D-72 eviction, D-73 scripting)
@@ -431,18 +546,42 @@ async def verify_redis_invariants(redis, config: dict, *,
 
         (capability_updates, unsafe) where unsafe = [(capability_key, detail), …]
 
+    GT T5: an UNREACHABLE/UNAUTHENTICATED Redis is reported as the single
+    `redis_reachable` PROBE FAILED finding — never as topology/eviction/
+    scripting/version verdicts (the incident's shape), and never a crash of
+    the D-75 loop.
+
     The caller decides the consequence — at BOOT that is a refusal (`setup_quota`); at
     RUNTIME it is **loud, not fatal**: degrade `/quota/health`, alert, update Capabilities.
     A running service that suddenly refuses is its own outage; the operator decides whether
     to drain.
     """
+    caps: dict = {}
+    unsafe: list = []
+
+    # GT T1/T5 — reachability FIRST; a failed probe is the ONLY finding.
+    ok, kind, detail = await check_redis_reachable(redis)
+    if not ok and kind != "acl":  # NOPERM on PING alone: let the probes decide
+        val = f"{PROBE_FAILED_CAP} [{kind}: {detail}]"
+        return {"redis_reachable": val}, [("redis_reachable", detail)]
+    caps["redis_reachable"] = REACHABLE_OK
+
+    try:
+        return await _verify_redis_invariants_inner(
+            redis, config, caps, unsafe, outbox_on_redis=outbox_on_redis,
+            script_load=script_load)
+    except RedisUnreachableError as e:
+        # a mid-run auth/connection failure (D-75 races): loud, single finding
+        caps["redis_reachable"] = f"{PROBE_FAILED_CAP} [{e.kind}]"
+        return caps, [("redis_reachable", str(e))]
+
+
+async def _verify_redis_invariants_inner(redis, config, caps, unsafe, *,
+                                         outbox_on_redis, script_load):
     from .topology import (
         SINGLE_NODE, capability_value as topo_capability_value,
         check_redis_cluster_topology, confirmed_disabled_from,
     )
-    caps: dict = {}
-    unsafe: list = []
-
     # D-71 topology
     topo, topo_detail = await check_redis_cluster_topology(
         redis, confirmed_disabled=confirmed_disabled_from(config))
@@ -457,11 +596,18 @@ async def verify_redis_invariants(redis, config: dict, *,
     if not ok:
         unsafe.append(("counter_eviction_policy", detail))
 
-    # D-73 scripting (a managed Redis can rename EVAL away under a version upgrade)
-    script_ok, script_detail = await check_redis_script_capability(redis)
-    caps["redis_scripting"] = script_detail if script_ok else f"OFF ({script_detail})"
-    if not script_ok:
-        unsafe.append(("redis_scripting", script_detail))
+    # D-73 scripting (a managed Redis can rename EVAL away under a version upgrade).
+    # `script_load=False` is preflight's --no-script-load escape (T-12 §9.1: the
+    # load is the ONE server-visible write) — reported SKIPPED, never judged.
+    if script_load:
+        script_ok, script_detail = await check_redis_script_capability(
+            redis, confirmed=scripting_confirmed_from(config))
+        caps["redis_scripting"] = script_detail if script_ok else f"OFF ({script_detail})"
+        if not script_ok:
+            unsafe.append(("redis_scripting", script_detail))
+    else:
+        caps["redis_scripting"] = ("SKIPPED (--no-script-load) — not verified here; "
+                                   "boot WILL perform the SCRIPT LOAD")
 
     # D-74 version (a failover can land you on an older node)
     status, ver_detail = await check_redis_version(redis)
@@ -532,13 +678,22 @@ def scripting_error(detail: str) -> ScriptingUnsupportedError:
         "ab0t-quota cannot run its counter on this Redis: every counter operation is an EVAL of a "
         "Lua script (the atomic acquire/incr/decr family), and this server did not accept a "
         "SCRIPT LOAD of the real _ACQUIRE source. Some managed Redis disable or rename the SCRIPT/"
-        "EVAL commands. Remedy: use a Redis with scripting enabled. Refusing here is deliberate: "
-        "the alternative is a service that boots green and fails at its first admission decision. "
-        f"[detail: {detail}]")
+        "EVAL commands. Remedy: use a Redis with scripting enabled — or, if only the SCRIPT "
+        "command is unavailable and you KNOW this Redis runs EVAL, put that assertion on the "
+        "record: storage.redis_scripting_confirmed: true (env: "
+        f"{SCRIPTING_CONFIRM_ENV}=true). The assertion never overrides a script the server "
+        "actually REJECTED (a Lua compile error is a definitive negative; detected by the "
+        "server's 'Error compiling' message text — a disclosed HEURISTIC, and a miss fails "
+        "CLOSED at the first acquire, never open). Refusing here is deliberate: the "
+        "alternative is a service that boots green and fails at its first "
+        f"admission decision. [detail: {detail}]")
 
 
 def version_error(detail: str) -> RedisVersionError:
     floor_s = ".".join(str(x) for x in REDIS_VERSION_FLOOR)
     return RedisVersionError(
         f"ab0t-quota requires Redis >= {floor_s}. Remedy: upgrade the Redis backing "
-        f"storage.redis_url. [detail: {detail}]")
+        f"storage.redis_url. There is deliberately NO assertion flag for this refusal "
+        f"(T-9/GATE-02): the version was OBSERVED below the floor — a definitive negative "
+        f"no operator assertion may override (an UNREADABLE version never refuses; it only "
+        f"degrades the capability). [detail: {detail}]")

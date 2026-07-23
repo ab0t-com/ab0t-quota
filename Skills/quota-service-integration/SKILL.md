@@ -8,15 +8,33 @@ description: Integrate ab0t-quota into a FastAPI microservice. Use when adding q
 ## Integration Checklist
 
 1. Add dependencies to `requirements.txt`
-2. Deploy `quota-config.json` alongside the service (copy from `quota-config.example.json`)
-3. Create `app/quota.py` module (engine init, helpers, lifecycle hooks)
-4. Wire engine startup/shutdown in app lifespan (includes Redis + DynamoDB persistence)
-5. Register service-specific resources
-6. Add quota checks before resource creation
-7. Add counter increments after successful creation
-8. Add counter decrements on resource termination
-9. Add QuotaGuard middleware for API rate limiting
-10. Expose quota API endpoints
+2. **Provision (or pick) the Redis this service will DECLARE** — set
+   `storage.redis_url` in quota-config.json (or export `QUOTA_REDIS_URL`).
+   No Redis in this deployment? Choose `engine_mode: "bridge"`. Requirements
+   (topology, eviction policy, ACL, version): `docs/requirements.md`. The CLI
+   hands you the artifacts instead of you transcribing them:
+   `python -m ab0t_quota provision --emit compose|terraform|acl|iam` (emitted
+   from the same registry the boot gates enforce; never touches your cloud),
+   or `provision --local` for one conforming local dev Redis.
+3. Deploy `quota-config.json` alongside the service (copy from `quota-config.example.json`)
+4. Create `app/quota.py` module (engine init, helpers, lifecycle hooks)
+5. Wire engine startup/shutdown in app lifespan (includes Redis + DynamoDB persistence)
+6. Register service-specific resources
+7. Add quota checks before resource creation
+8. Add counter increments after successful creation
+9. Add counter decrements on resource termination
+10. Add QuotaGuard middleware for API rate limiting
+11. Expose quota API endpoints
+12. **Run `python -m ab0t_quota preflight` in CI** — it validates the config,
+    prints the resolved plan with provenance, and re-runs every startup gate
+    read-only. A refused preflight is a refused deploy, caught early.
+13. **Before go-live, run `python -m ab0t_quota doctor`** — same evaluators,
+    but it grades production POSTURE that "bootable" deliberately lets
+    through (persistence off behind an assertion, PITR asserted-not-observed,
+    already-evicted keys, ACL breadth, encryption). It reports what it could
+    not check as `not_checked` with the reason; `--json` extends the
+    preflight report with a posture section you can hand to an auditor.
+    Full CLI reference: `docs/cli.md`; error codes: `docs/error-codes.md`.
 
 ## Step 1: Dependencies
 
@@ -199,5 +217,5 @@ Config file (`quota-config.json`) controls tiers, limits, features, Stripe mappi
 - Wrap increment/decrement in try/except (non-fatal)
 - Use `QuotaBatchCheckRequest` when creating resources that consume multiple quotas (e.g. GPU sandbox = sandbox.concurrent + sandbox.gpu_instances)
 - The engine reads tier from billing service `GET /billing/{org_id}/tier` (cached 5min in Redis)
-- If engine is not initialized, fall back gracefully (fail-open)
+- If the engine is not initialized, that is a STARTUP defect to fix, not a state to serve from — quota/billing paths fail CLOSED (0.6.1/0.6.2); do not add consumer-side fail-open wrappers around money-path checks
 - DynamoDB persistence is non-fatal — if it fails, Redis-only mode continues

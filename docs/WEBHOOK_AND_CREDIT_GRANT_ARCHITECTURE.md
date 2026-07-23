@@ -403,7 +403,7 @@ payment/output/                                             ← The payment-serv
 │   │       :553-579   handle_subscription_created
 │   │       :652-...   _sync_subscription_tier              ← Belt-and-braces tier flip
 │   ├── config.py                                           ← Env declarations
-│   │   :34       STRIPE_WEBHOOK_SECRET (single, fallback)
+│   │   :34       STRIPE_WEBHOOK_SECRET (payment-service's own variable; single, fallback)
 │   │   :43       STRIPE_WEBHOOK_SECRETS (plural, primary)
 │   │   :59       ENABLE_LEGACY_SUBSCRIPTION_INVOICE_CREDIT
 │   │   :250-...  stripe_webhook_secrets_list (parser)
@@ -458,7 +458,8 @@ resource/output/sandbox-platform/                           ← The CONSUMER ser
 │                     │ STRIPE_MODE                              │ "  (test|live)                          │
 ├─────────────────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
 │ sandbox-platform    │ AB0T_QUOTA_STRIPE_WEBHOOK_SECRET         │ sandbox-platform/production/...env*     │
-│   (& other ab0t-quota│   (falls back to STRIPE_WEBHOOK_SECRET)  │                                         │
+│   (& other ab0t-quota│   (generic STRIPE_WEBHOOK_SECRET fallback│                                         │
+│                     │    REMOVED in 0.7 — never read)          │                                         │
 │    consumers)       │ AB0T_MESH_PAYMENT_URL                    │ "                                       │
 │                     │ AB0T_MESH_PAYMENT_API_KEY                │ "                                       │
 │                     │ AB0T_MESH_BILLING_URL                    │ "                                       │

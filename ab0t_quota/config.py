@@ -21,10 +21,10 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from .errors import QuotaConfigError
 from .models.core import (
     TierConfig, TierLimits, ResourceDef, CounterType, ResetPeriod, EnforcementConfig,
 )
-from .tiers import DEFAULT_TIERS
 
 logger = logging.getLogger("ab0t_quota.config")
 
@@ -92,32 +92,78 @@ def _interpolate_env(value):
     return value
 
 
+def _parse_config_file(p: Path) -> dict:
+    logger.info("Loading quota config from %s", p)
+    try:
+        parsed = _interpolate_env(json.loads(p.read_text()))
+        # T-19: the document's SHAPE is validated before any I/O — an unknown
+        # or mistyped storage key is a config error, never a silent no-op.
+        from .config_schema import validate_config
+        validate_config(parsed)
+        return parsed
+    except json.JSONDecodeError as e:
+        # Malformed was already fatal (uncaught JSONDecodeError); it keeps the
+        # §5 error shape now instead of a bare parser traceback.
+        raise QuotaConfigError(
+            name="quota config file", config_key="(document)", code="QUOTA-CFG-003",
+            state=f"{p}: malformed JSON ({e})", env_names=("QUOTA_CONFIG_PATH",),
+            remedy=f"fix the JSON syntax in {p} (line {e.lineno}, column {e.colno}).",
+            docs_anchor="config",
+        ) from e
+
+
 def load_config(path: Optional[str] = None) -> dict:
     """Load quota config from file. Returns raw dict with QUOTA_* env-var
-    references expanded (see _interpolate_env for the namespace contract)."""
+    references expanded (see _interpolate_env for the namespace contract).
+
+    DECLARED, NOT DISCOVERED (pack 20260721, T-3): a missing config file is a
+    typed config error — never a silent `{}` that boots on invented defaults."""
     search = path or os.getenv("QUOTA_CONFIG_PATH")
     if search:
         p = Path(search)
         if p.exists():
-            logger.info("Loading quota config from %s", p)
-            return _interpolate_env(json.loads(p.read_text()))
-        logger.warning("Quota config not found at %s, using defaults", p)
-        return {}
+            return _parse_config_file(p)
+        raise QuotaConfigError(
+            name="quota config file", config_key="(document)", code="QUOTA-CFG-002",
+            state=f"file missing at {p}", env_names=("QUOTA_CONFIG_PATH",),
+            previously=("versions before 0.7 booted with an empty config and a "
+                        "built-in tier catalog. This version will not invent policy."),
+            remedy=("create quota-config.json at that path, or point "
+                    "QUOTA_CONFIG_PATH at the real file."),
+            docs_anchor="config",
+        )
 
     for candidate in CONFIG_SEARCH_PATHS:
         p = Path(candidate)
         if p.exists():
-            logger.info("Loading quota config from %s", p)
-            return _interpolate_env(json.loads(p.read_text()))
+            return _parse_config_file(p)
 
-    logger.info("No quota config file found, using built-in defaults")
-    return {}
+    raise QuotaConfigError(
+        name="quota config file", config_key="(document)", code="QUOTA-CFG-002",
+        state=f"no file found (searched: {', '.join(CONFIG_SEARCH_PATHS)})",
+        env_names=("QUOTA_CONFIG_PATH",),
+        previously=("versions before 0.7 booted with an empty config and a "
+                    "built-in tier catalog. This version will not invent policy."),
+        remedy=("write a quota-config.json (see quota-config.example.json) in the "
+                "working directory, or set QUOTA_CONFIG_PATH."),
+        docs_anchor="config",
+    )
 
 
 def load_tiers(config: Optional[dict] = None) -> dict[str, TierConfig]:
-    """Load tier definitions from config, falling back to defaults."""
-    if not config or "tiers" not in config:
-        return DEFAULT_TIERS
+    """Load tier definitions from config. The catalog is POLICY: it is never
+    invented (T-3/ENV-03). An explicit empty list is honoured as declared."""
+    if config is None or "tiers" not in config or config["tiers"] is None:
+        raise QuotaConfigError(
+            name="tier catalog", config_key="tiers", code="QUOTA-CFG-004",
+            state="quota-config: declared null" if (config or {}).get("tiers", "x") is None
+                  else "quota-config: key absent",
+            env_names=(),
+            remedy=('add a "tiers" array to quota-config.json (see '
+                    'quota-config.example.json). For tests/local dev only: '
+                    'ab0t_quota.tiers.DEFAULT_TIERS may be passed explicitly.'),
+            docs_anchor="tiers",
+        )
 
     tiers = {}
     for tier_data in config["tiers"]:
@@ -171,6 +217,8 @@ def load_resources(config: Optional[dict] = None) -> list[ResourceDef]:
             service=r["service"],
             resource_key=r["resource_key"],
             display_name=r["display_name"],
+            description=r.get("description"),
+            action_hint=r.get("action_hint"),  # D-CK-1: end-customer 429 copy
             counter_type=CounterType(r["counter_type"]),
             unit=r.get("unit", "units"),
             window_seconds=r.get("window_seconds"),

@@ -2,6 +2,14 @@
 
 Full template for `app/quota.py` in any service integrating ab0t-quota.
 
+> **MIGRATION BANNER (2026-07-21).** Templates before this date taught an
+> ambient-fallback pattern (`… or os.getenv("REDIS_URL", "redis://localhost:6379/0")`)
+> that caused a production outage. If you copied an earlier version, that chain
+> is compiled into YOUR service where no library fix reaches it — run the
+> self-audit in `docs/migrating-from-ambient-resolution.md`. Since 0.7 the
+> library resolves every dependency itself from DECLARED sources only
+> (`storage.redis_url` / `QUOTA_REDIS_URL`); consumer code passes nothing.
+
 ```python
 """Quota integration for {service-name}."""
 
@@ -19,7 +27,6 @@ from ab0t_quota.config import load_config, load_tiers, load_resources
 from ab0t_quota.models.requests import QuotaCheckItem
 from ab0t_quota.providers import JWTTierProvider
 from ab0t_quota.registry import ResourceRegistry
-from ab0t_quota.tiers import DEFAULT_TIERS
 from ab0t_quota.alerts import AlertManager, LogAlertDispatcher
 from ab0t_quota.persistence import QuotaStore
 
@@ -36,10 +43,16 @@ async def startup(redis_url: Optional[str] = None) -> QuotaEngine:
     config = load_config()
     storage_config = config.get("storage", {})
 
-    url = (redis_url
-           or storage_config.get("redis_url")
-           or os.getenv("QUOTA_REDIS_URL")
-           or os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    # DECLARED, NOT DISCOVERED (0.7): the Redis URL comes from your config
+    # (storage.redis_url) or the namespaced QUOTA_REDIS_URL — the library
+    # validates this and refuses with QUOTA-CFG-001 naming both sources if
+    # neither is declared. Never re-add an env or-chain or a localhost
+    # default here; the generic REDIS_URL is never read.
+    url = redis_url or storage_config.get("redis_url") or os.getenv("QUOTA_REDIS_URL")
+    if not url:
+        raise RuntimeError(
+            "no declared Redis: set storage.redis_url in quota-config.json "
+            "or export QUOTA_REDIS_URL (see docs/requirements.md)")
     _redis = Redis.from_url(url, decode_responses=False)
 
     registry = ResourceRegistry()
@@ -50,7 +63,7 @@ async def startup(redis_url: Optional[str] = None) -> QuotaEngine:
     # from ab0t_quota.registry import SANDBOX_RESOURCES
     # registry.register(*SANDBOX_RESOURCES)
 
-    tiers = load_tiers(config) or DEFAULT_TIERS
+    tiers = load_tiers(config)  # tiers are POLICY: declared in your config, never invented
     provider = JWTTierProvider(
         claim_key=config.get("tier_provider", {}).get("jwt_claim_key", "org_tier"),
         default_tier=config.get("tier_provider", {}).get("default_tier", "free"),
@@ -58,7 +71,9 @@ async def startup(redis_url: Optional[str] = None) -> QuotaEngine:
 
     _store = QuotaStore(
         table_name=storage_config.get("dynamodb_table", "ab0t_quota_state"),
-        region=storage_config.get("dynamodb_region", os.getenv("AWS_REGION", "us-east-1")),
+        # region None defers to the AWS SDK's own documented chain
+        # (AWS_REGION/profile/IMDS) — never an invented us-east-1.
+        region=storage_config.get("dynamodb_region"),
         endpoint_url=os.getenv("DYNAMODB_ENDPOINT") or None,
     )
     try:

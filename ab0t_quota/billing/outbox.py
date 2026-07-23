@@ -187,13 +187,15 @@ class DDBOutboxStore:
         self.ddb = ddb_client
         self.table = table_name
 
-    async def ensure_table(self, *, gsi_active_timeout_s: float = 60.0) -> None:
+    async def ensure_table(self, *, gsi_active_timeout_s: float = 60.0,
+                           create: bool = True) -> None:
         """Create the table + `gsi_status` GSI if absent (idempotent), then WAIT
         for both to report ACTIVE. Mirrors QuotaStore.initialize so
         `outbox.store=ddb` works out of the box. The wait matters in PRODUCTION:
         real DynamoDB backfills a GSI asynchronously, so `list_pending` right
         after a fresh create can silently miss rows until the index is ready
-        (DDB Local makes it immediate, so no DDB-Local test catches this)."""
+        (DDB Local makes it immediate, so no DDB-Local test catches this).
+        `create=False` is the T-6/D-3 call-site policy."""
         try:
             await self.ddb.describe_table(TableName=self.table)
             await self._wait_gsi_active(gsi_active_timeout_s)
@@ -202,6 +204,11 @@ class DDBOutboxStore:
             not_found = getattr(getattr(self.ddb, "exceptions", None), "ResourceNotFoundException", ())
             if not (isinstance(e, not_found) or "ResourceNotFound" in type(e).__name__):
                 raise  # a real error (perms, endpoint) — don't mask it
+        if not create:
+            raise RuntimeError(
+                f"outbox table {self.table} does not exist and "
+                f"storage.auto_create_tables is false (the default) — pre-create "
+                f"the table or set storage.auto_create_tables: true (ENV-04)")
         await self.ddb.create_table(
             TableName=self.table,
             KeySchema=[
@@ -223,6 +230,10 @@ class DDBOutboxStore:
                 "Projection": {"ProjectionType": "ALL"},
             }],
             BillingMode="PAY_PER_REQUEST",
+            Tags=[
+                {"Key": "Service", "Value": "ab0t-quota"},
+                {"Key": "ManagedBy", "Value": "ab0t-quota-library"},
+            ],
         )
         logger.info("created lifecycle outbox table %s (+ gsi_status)", self.table)
         await self._wait_gsi_active(gsi_active_timeout_s)

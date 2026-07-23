@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ab0t-quota-ui — the commercial UI layer</title>
+<link rel="stylesheet" href="ab0t-quota-ui.css">
+<link rel="stylesheet" href="demo-page.css">
+<link rel="stylesheet" href="demo-brands.css">
+<style>
+  .hero {
+    padding: var(--ab0t-s8) 0 var(--ab0t-s7);
+    border-bottom: 1px solid var(--ab0t-border);
+    margin-bottom: var(--ab0t-s7);
+  }
+  .hero h1 { max-width: 18ch; }
+  .kpis {
+    display: grid; gap: var(--ab0t-s4); margin-top: var(--ab0t-s6);
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  }
+  .kpi {
+    padding: var(--ab0t-s4); border: 1px solid var(--ab0t-border);
+    border-radius: var(--ab0t-radius); background: var(--ab0t-bg-raised);
+  }
+  .kpi b { display: block; font-size: 1.5rem; letter-spacing: -0.02em; }
+  .kpi span { font-size: var(--ab0t-fs-xs); color: var(--ab0t-fg-muted); }
+
+  .split { display: grid; gap: var(--ab0t-s6); grid-template-columns: 1fr; }
+  @media (min-width: 900px) { .split { grid-template-columns: 320px 1fr; align-items: start; } }
+  .split > aside { position: sticky; top: var(--ab0t-s5); }
+  .split h3 { margin: 0 0 var(--ab0t-s2); font-size: 1rem; letter-spacing: -0.01em; }
+  .split p { margin: 0 0 var(--ab0t-s3); color: var(--ab0t-fg-muted); font-size: 0.9rem; }
+
+  .stagearea {
+    padding: var(--ab0t-s6); border-radius: var(--ab0t-radius-lg);
+    border: 1px solid var(--ab0t-border); background: var(--ab0t-bg-sunken);
+  }
+  .stagelabel {
+    font-size: var(--ab0t-fs-2xs); font-weight: 700; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--ab0t-fg-muted);
+    margin: 0 0 var(--ab0t-s3);
+  }
+  .pages { display: flex; gap: var(--ab0t-s3); flex-wrap: wrap; }
+  .pagecard {
+    flex: 1 1 220px; display: block; text-decoration: none; color: inherit;
+    padding: var(--ab0t-s4); border: 1px solid var(--ab0t-border);
+    border-radius: var(--ab0t-radius); background: var(--ab0t-bg-raised);
+    box-shadow: var(--ab0t-shadow-1);
+    transition: transform var(--ab0t-dur) var(--ab0t-ease),
+                box-shadow var(--ab0t-dur) var(--ab0t-ease);
+  }
+  .pagecard:hover { transform: translateY(-2px); box-shadow: var(--ab0t-shadow-2); }
+  .pagecard:focus-visible { outline: 2px solid var(--ab0t-focus); outline-offset: 2px; }
+  .pagecard b { display: block; margin-bottom: var(--ab0t-s1); }
+  .pagecard span { font-size: var(--ab0t-fs-sm); color: var(--ab0t-fg-muted); }
+  @media (prefers-reduced-motion: reduce) { .pagecard:hover { transform: none; } }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero page-head">
+    <div>
+      <p class="eyebrow">ab0t-quota · commercial UI layer</p>
+      <h1>Usage, limits and billing your customers can actually read.</h1>
+      <p class="lede">
+        Drop-in components for the moments that decide revenue: the meter that warns before the
+        block, the paywall at the 429, the plan comparison, the invoice list. Two files, no
+        build step, no dependencies, no network beyond your own API — and every plan name,
+        resource, unit and sentence comes from <b>your</b> config, never from ours.
+      </p>
+      <div class="kpis">
+        <div class="kpi"><b>2</b><span>files to vendor — one JS, one CSS</span></div>
+        <div class="kpi"><b>0</b><span>dependencies, build steps, external fetches</span></div>
+        <div class="kpi"><b>0</b><span>plan names, prices or currencies in the bundle</span></div>
+        <div class="kpi"><b>AA</b><span>contrast, machine-checked in both themes</span></div>
+      </div>
+    </div>
+    <div class="toolbar">
+      <button class="ctl" type="button" id="theme">Toggle theme</button>
+      <a class="ctl" href="demo.html">Proof harness →</a>
+    </div>
+  </header>
+
+  <!-- ============================ brand switcher ============================ -->
+  <h2>One component set. Any brand.</h2>
+  <p class="lede" style="margin-bottom:var(--ab0t-s4)">
+    The three widgets below are one set of instances. The buttons re-point a single wrapper class —
+    no re-render, no re-fetch, no component variant. Everything that moves is a
+    <code>--ab0t-*</code> token: accent, radius, type stack, density, meter thickness, elevation.
+    Combine it with the theme toggle: each brand carries its own light and dark palette.
+  </p>
+
+  <div class="toolbar" style="margin-bottom:var(--ab0t-s4)" role="group" aria-label="Brand">
+    <button class="ctl" type="button" data-brand="" aria-pressed="true">Default</button>
+    <button class="ctl" type="button" data-brand="brand-atlas" aria-pressed="false">Atlas Press</button>
+    <button class="ctl" type="button" data-brand="brand-quanta" aria-pressed="false">Quanta Systems</button>
+  </div>
+
+  <div class="stagearea" id="stage">
+    <p class="stagelabel" id="stagelabel">Default tokens</p>
+    <div class="grid">
+      <div><div id="w-usage"></div></div>
+      <div><div id="w-paywall"></div></div>
+      <div><div id="w-plans"></div></div>
+    </div>
+  </div>
+
+  <!-- ============================ the widget set ============================ -->
+  <h2>The widget set</h2>
+  <div class="split">
+    <aside>
+      <h3>Built for the states nobody demos</h3>
+      <p>
+        Top-tier customers get <b>no upgrade button at all</b>. Single-plan products get no invented
+        ladder. When the tier catalog is not mounted, the paywall still works from the 429 body
+        alone. Unlimited draws no bar, because a full bar and an empty bar are both lies.
+      </p>
+      <p>
+        Money renders only where a field carries both an amount and an ISO code. Where the contract
+        has no code — the spend summary, the subscription amount — the amount is withheld rather
+        than guessed.
+      </p>
+      <p>
+        Loading is a skeleton, empty is a sentence, an outage is a quiet line with a working retry.
+        No billing surface in this set has a red alarm state.
+      </p>
+    </aside>
+    <div class="grid">
+      <div class="case">
+        <h3>Balance &amp; spend</h3>
+        <p class="why">Two endpoints, two different currency contracts.</p>
+        <div id="w-balance"></div>
+      </div>
+      <div class="case">
+        <h3>Invoices</h3>
+        <p class="why">Per-invoice currency; PDF only where a URL exists.</p>
+        <div id="w-invoices"></div>
+      </div>
+      <div class="case">
+        <h3>Subscription</h3>
+        <p class="why">Plan id printed verbatim — never title-cased into a fake product name.</p>
+        <div id="w-sub"></div>
+      </div>
+      <div class="case">
+        <h3>Loading, empty, outage</h3>
+        <p class="why">The three states a billing widget must not get wrong.</p>
+        <div class="stack">
+          <div id="w-slow"></div>
+          <div id="w-empty"></div>
+          <div id="w-down"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================ hosted pages ============================ -->
+  <h2>Hosted-page compositions</h2>
+  <p class="lede" style="margin-bottom:var(--ab0t-s4)">
+    The same widgets assembled into whole pages. Each is one standalone HTML file that opens with
+    no build step and no server.
+  </p>
+  <div class="pages">
+    <a class="pagecard" href="page-pricing.html">
+      <b>Pricing page →</b>
+      <span>Plan comparison from the tier catalog, for signed-in and anonymous visitors.</span>
+    </a>
+    <a class="pagecard" href="page-upgrade.html">
+      <b>Upgrade page →</b>
+      <span>The paywall moment, with current usage and the plan the customer is moving to.</span>
+    </a>
+    <a class="pagecard" href="page-billing.html">
+      <b>Billing portal →</b>
+      <span>Balance, spend, subscription, invoices and usage in one customer-facing shell.</span>
+    </a>
+  </div>
+
+  <p class="note" style="margin-bottom:var(--ab0t-s7)">
+    <b>Honest footnote.</b> Every payload on this page is a fixture — the literal wire shape of the
+    real endpoints, but not a live service. Nothing here has been rendered in a browser by its
+    authors; the assertions that <i>have</i> run are in <code>node sdk/test_sdk.js</code> and on the
+    <a href="demo.html">proof harness</a>.
+  </p>
+
+</div>
+
+<script src="ab0t-quota-ui.js"></script>
+<script src="demo-fixtures.js"></script>
+<script>
+var F = AB0TDemo.fixtures, transport = AB0TDemo.transport, routes = AB0TDemo.routes, slow = AB0TDemo.slow;
+
+/* The brand stage — three widget instances, mounted once. */
+AB0TQuotaUI.usage(document.getElementById('w-usage'),
+  { fetchImpl: transport(F.A_USAGE, F.A_TIERS) });
+AB0TQuotaUI.paywall(document.getElementById('w-paywall'), F.B_DENIAL,
+  { fetchImpl: transport(null, F.B_TIERS) });
+AB0TQuotaUI.plans(document.getElementById('w-plans'),
+  { fetchImpl: transport(F.D_USAGE, F.D_TIERS) });
+
+/* The vendor widget set. */
+AB0TQuotaUI.balance(document.getElementById('w-balance'),
+  { fetchImpl: routes({ '/billing/balance': F.BALANCE, '/billing/usage/summary': F.SUMMARY }) });
+AB0TQuotaUI.invoices(document.getElementById('w-invoices'),
+  { fetchImpl: routes({ '/payments/invoices': F.INVOICES }) });
+AB0TQuotaUI.subscription(document.getElementById('w-sub'),
+  { fetchImpl: routes({ '/payments/subscriptions': F.SUBS }) });
+
+/* The three states. `slow` delays the transport so the skeleton is actually
+   visible rather than a theoretical claim; it reloads on a timer so a visitor
+   who arrives late still sees it. */
+var slowHost = document.getElementById('w-slow');
+function showSkeleton() {
+  AB0TQuotaUI.invoices(slowHost, {
+    fetchImpl: slow(routes({ '/payments/invoices': F.INVOICES }), 2200)
+  });
+}
+showSkeleton();
+setInterval(showSkeleton, 6000);
+
+AB0TQuotaUI.invoices(document.getElementById('w-empty'),
+  { fetchImpl: routes({ '/payments/invoices': F.INVOICES_EMPTY }) });
+AB0TQuotaUI.subscription(document.getElementById('w-down'),
+  { fetchImpl: routes({ '/payments/subscriptions': null }) });
+
+/* Brand switcher — swaps ONE class on ONE wrapper. */
+var stage = document.getElementById('stage');
+var stagelabel = document.getElementById('stagelabel');
+var LABELS = {
+  '': 'Default tokens',
+  'brand-atlas': 'Atlas Press — serif, pill radius, roomy density, 12px meters, plum accent',
+  'brand-quanta': 'Quanta Systems — monospace, zero radius, compact density, 4px meters, teal accent'
+};
+document.querySelectorAll('[data-brand]').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    var cls = btn.getAttribute('data-brand');
+    stage.className = 'stagearea' + (cls ? ' ' + cls : '');
+    stagelabel.textContent = LABELS[cls];
+    document.querySelectorAll('[data-brand]').forEach(function (b) {
+      b.setAttribute('aria-pressed', String(b === btn));
+    });
+  });
+});
+
+document.getElementById('theme').addEventListener('click', function () {
+  var r = document.documentElement;
+  r.setAttribute('data-theme', r.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+</script>
+</body>
+</html>

@@ -53,7 +53,15 @@ tags = ["password", "redis"]
 [[rules]]
 id = "dynamodb-endpoint-with-creds"
 description = "DynamoDB endpoint with embedded credentials"
-regex = '''(?i)dynamodb.*endpoint.*(?:password|secret|key)\s*[:=]'''
+# Matches what the description says: a URL whose userinfo carries credentials
+# (scheme://user:pass@host) on a line mentioning dynamodb/ddb.
+#
+# The previous regex was '(?i)dynamodb.*endpoint.*(?:password|secret|key)\s*[:=]'.
+# Because `.*` spans the whole line, any line containing "dynamodb", "endpoint"
+# and a later `key=` matched — so `config_key="storage.dynamodb_endpoint"` in
+# resolve.py:236 was flagged as a secret. It tested for the WORD "key", not for
+# a credential. 26 `config_key=` call sites meant this would keep recurring.
+regex = '''(?i)(?:dynamodb|ddb)[^\n]{0,120}?[a-z][a-z0-9+.\-]*://[^\s/@'"]+:[^\s/@'"]+@'''
 tags = ["password", "aws"]
 
 [[rules]]

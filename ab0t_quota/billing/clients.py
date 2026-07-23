@@ -10,6 +10,7 @@ Return types match the models in billing/models.py exactly.
 from __future__ import annotations
 
 import logging
+import os
 from decimal import Decimal
 from typing import Any, Optional
 from uuid import uuid4
@@ -280,12 +281,40 @@ class BillingServiceClient:
     """Async HTTP client for the billing service (port 8002).
 
     Handles: balance, usage, transactions, tier management.
+
+    `service_name` is the CONSUMER's own mesh identity — the default `tool_id`
+    for metering rows. Omit it only if callers pass `tool_id` explicitly or
+    `AB0T_SERVICE_NAME` is set; there is no fallback literal.
     """
 
-    def __init__(self, base_url: str, api_key: str, timeout: float = 15.0):
+    def __init__(self, base_url: str, api_key: str, timeout: float = 15.0,
+                 service_name: Optional[str] = None):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.service_name = (service_name or "").strip() or None
         self.client = httpx.AsyncClient(timeout=timeout)
+
+    def _resolve_tool_id(self, tool_id: Optional[str]) -> str:
+        """Caller identity for a metering row: explicit arg → constructor
+        `service_name` → `AB0T_SERVICE_NAME`. Never a hardcoded consumer name.
+
+        Mirrors setup.py::_resolve_service_name's env knob so a consumer that
+        already declared its identity gets this for free.
+        """
+        for candidate in (tool_id, self.service_name, os.getenv("AB0T_SERVICE_NAME")):
+            if candidate and candidate.strip():
+                return candidate.strip()
+        logger.error(
+            "record_resource_usage has no caller identity: pass tool_id=, "
+            "construct BillingServiceClient(service_name=...), or export "
+            "AB0T_SERVICE_NAME. The row is REFUSED — it will not be filed "
+            "under another consumer's name."
+        )
+        raise ValueError(
+            "record_resource_usage requires a caller identity. Supply one of: "
+            "tool_id= argument, BillingServiceClient(service_name=...), or the "
+            "AB0T_SERVICE_NAME environment variable."
+        )
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}{path}"
@@ -374,7 +403,7 @@ class BillingServiceClient:
         session_id: str = "",
         reservation_id: Optional[str] = None,
         request_id: Optional[str] = None,
-        tool_id: str = "sandbox-platform",
+        tool_id: Optional[str] = None,
         metadata: Optional[dict] = None,
         cost: str = "0",
         platform_fee: str = "0",
@@ -393,9 +422,17 @@ class BillingServiceClient:
         resource_type is an OPEN string (public mesh). action + descriptive
         dimensions go in the metadata channel via UsageMetadata; never put a
         session token in session_id. Best-effort: returns {} on billing error.
+
+        `tool_id` is the CALLER's identity. It used to default to the literal
+        "sandbox-platform", so every other consumer's rows were mis-attributed
+        to one company. It now resolves explicit arg → constructor
+        `service_name` → `AB0T_SERVICE_NAME`, and REFUSES (ValueError, after an
+        ERROR log) if none is available. A row with no identity is dropped
+        loudly, never filed under someone else's name.
         """
+        resolved_tool_id = self._resolve_tool_id(tool_id)
         req = RecordUsageRequest(
-            org_id=org_id, user_id=user_id, tool_id=tool_id,
+            org_id=org_id, user_id=user_id, tool_id=resolved_tool_id,
             session_id=session_id,
             request_id=request_id or f"sbx-{uuid4().hex[:12]}",
             resource_type=resource_type,

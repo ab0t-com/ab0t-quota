@@ -1,0 +1,292 @@
+{
+  "service_name": "sandbox-platform",
+
+  "storage": {
+    "redis_url": null,
+    "dynamodb_table": "${QUOTA_STATE_TABLE:-ab0t_quota_state}",
+    "dynamodb_region": "us-east-1",
+    "persistence_enabled": true,
+    "persistence_sync_interval_seconds": 300
+  },
+
+  "tier_provider": {
+    "type": "mesh",
+    "default_tier": "free",
+    "cache_ttl_seconds": 10
+  },
+
+  "$comment_resources": "Resource definitions — required so the engine knows counter type for each resource_key referenced in tiers + bundles.",
+  "resources": [
+    { "service": "sandbox-platform", "resource_key": "sandbox.concurrent",       "display_name": "Concurrent Sandboxes",         "counter_type": "gauge",       "unit": "sandboxes" },
+    { "service": "sandbox-platform", "resource_key": "sandbox.gpu_instances",    "display_name": "Concurrent GPU Sandboxes",     "counter_type": "gauge",       "unit": "instances" },
+    { "service": "sandbox-platform", "resource_key": "sandbox.browser_sessions", "display_name": "Concurrent Browser Sessions",  "counter_type": "gauge",       "unit": "sessions"  },
+    { "service": "sandbox-platform", "resource_key": "sandbox.desktop_sessions", "display_name": "Concurrent Desktop Sessions",  "counter_type": "gauge",       "unit": "sessions"  },
+    { "service": "sandbox-platform", "resource_key": "sandbox.monthly_cost",     "display_name": "Monthly Compute Spend",        "counter_type": "accumulator", "unit": "USD", "reset_period": "monthly", "precision": 2 },
+    { "service": "sandbox-platform", "resource_key": "sandbox.home_storage_gb",  "display_name": "Persistent Home Storage",      "counter_type": "gauge",       "unit": "GB" }
+  ],
+
+  "$comment_home_storage": "FS ticket 20260703 P2.2 (build leg 3, 2026-07-11). sandbox.home_storage_gb is a GAUGE of an org's MEASURED persistent-home bytes (sum of HOME rows' size_bytes cache, in GB). NOT in any resource_bundle: bundles increment by a fixed +1 (20260615 QUOTA.md) — variable-GB mutations go through app/quota.py's home-storage helpers with generation-scoped idempotency keys (counter:lifecycle:start/end:{computer_id}:{home_generation}), and app/workers/home_accounting.py force-sets the gauge from live truth each pass (PROGRAM_CONTEXT section 5: every gauge ships generation keys + a reconciler in the same change). Quota gates ATTACH (over-quota => next attach read-only); it never kills a running write. KNOWN CONSEQUENCE: database.count_live_quota_usage (the library reconciler's observed_usage_provider) does not yet report this key, so the library reconciler will D-51 skip_and_alert it every pass once the observed-usage lib ships — the worker's own reconcile is the truth source until the database.py owner adds a HOME# (H2) rollup to count_live_quota_usage (recorded follow-up, FS ticket work_log 2026-07-11 leg 3). Tier limits below are P0.3 PLACEHOLDERS sized off D-2026-07-10-E per-computer disk ceilings; pricing sign-off owns final values.",
+
+  "$comment_resource_bundles": "Named dispatch groups: each name → list of resource_keys consumed when that thing is created. Routes call engine.check_for_bundle/increment_for_bundle/decrement_for_bundle by name instead of branching on instance type.",
+  "resource_bundles": {
+    "sandbox":         ["sandbox.concurrent"],
+    "sandbox_gpu":     ["sandbox.concurrent", "sandbox.gpu_instances"],
+    "browser":         ["sandbox.browser_sessions"],
+    "desktop":         ["sandbox.desktop_sessions"]
+  },
+
+  "billing_integration": {
+    "$comment_cost": "Resource key the LifecycleEmitter increments when a resource stops. Auto-records monthly spend so the tier monthly_cost cap actually enforces.",
+    "cost_resource_key": "sandbox.monthly_cost"
+  },
+
+  "alerts": {
+    "enabled": true,
+    "cooldown_seconds": 3600,
+    "dispatchers": ["log"]
+  },
+
+  "enforcement": {
+    "enabled": true,
+    "shadow_mode": false,
+    "global_kill_switch": false
+  },
+
+  "$comment_reconcile": "P4.4: the ab0t-quota library reconciler owns gauge drift-healing. truth.source=provider force-sets each gauge to our observed_usage_provider (database.count_live_quota_usage, wired in app/quota.py:bind_app) — no activation ledger. Replaces sandbox's deleted reconcile_org_gauges + pool_manager loop.",
+  "reconcile": {
+    "truth_source": "provider",
+    "interval_seconds": 900
+  },
+
+  "pricing": {
+    "currency": "USD",
+    "billing_model": "per_minute",
+    "min_billing_seconds": 60,
+    "refund_on_stop": true,
+
+    "surge": {
+      "enabled": true,
+      "multiplier": 1.5,
+      "description": "Applied when enterprise customer exceeds tier allotment"
+    },
+
+    "products": {
+      "browser": {
+        "display_name": "Browser",
+        "description": "Cloud browser (Chrome, Firefox, Headless)",
+        "variants": {
+          "fargate": {
+            "compute": "fargate",
+            "cpu": 1024,
+            "memory": 2048,
+            "cost_per_hour": 0.049,
+            "price_per_hour": 0.10,
+            "allocation_cost": 0.002,
+            "allocation_price": 0.01,
+            "default": true
+          },
+          "warm_pool": {
+            "compute": "fargate_pool",
+            "cpu": 1024,
+            "memory": 2048,
+            "cost_per_hour": 0.049,
+            "price_per_hour": 0.10,
+            "allocation_cost": 0.049,
+            "allocation_price": 0.005,
+            "note": "Pool containers pre-provisioned — allocation cost is amortized idle time"
+          },
+          "eks": {
+            "compute": "eks",
+            "cpu": 1024,
+            "memory": 2048,
+            "cost_per_hour": 0.035,
+            "price_per_hour": 0.08,
+            "allocation_cost": 0.001,
+            "allocation_price": 0.005,
+            "note": "Shared cluster — lower overhead than standalone Fargate"
+          }
+        }
+      },
+
+      "desktop": {
+        "display_name": "Desktop",
+        "description": "Virtual desktop (XFCE, KDE, Windows)",
+        "variants": {
+          "fargate": {
+            "compute": "fargate",
+            "cpu": 2048,
+            "memory": 4096,
+            "cost_per_hour": 0.099,
+            "price_per_hour": 0.20,
+            "allocation_cost": 0.005,
+            "allocation_price": 0.02,
+            "default": true
+          },
+          "warm_pool": {
+            "compute": "fargate_pool",
+            "cpu": 2048,
+            "memory": 4096,
+            "cost_per_hour": 0.099,
+            "price_per_hour": 0.20,
+            "allocation_cost": 0.099,
+            "allocation_price": 0.01
+          }
+        }
+      },
+
+      "ephemeral": {
+        "display_name": "Compute",
+        "description": "Short-lived compute container",
+        "variants": {
+          "fargate": {
+            "compute": "fargate",
+            "cpu": 512,
+            "memory": 1024,
+            "cost_per_hour": 0.025,
+            "price_per_hour": 0.05,
+            "allocation_cost": 0.001,
+            "allocation_price": 0.005,
+            "default": true
+          },
+          "warm_pool": {
+            "compute": "fargate_pool",
+            "cpu": 512,
+            "memory": 1024,
+            "cost_per_hour": 0.025,
+            "price_per_hour": 0.05,
+            "allocation_cost": 0.025,
+            "allocation_price": 0.003
+          }
+        }
+      },
+
+      "sandbox": {
+        "display_name": "Sandbox",
+        "description": "EC2-backed sandbox with SSH access",
+        "variants": {
+          "t3.micro":     {"compute": "ec2", "cost_per_hour": 0.0104, "price_per_hour": 0.02,  "allocation_cost": 0.005, "allocation_price": 0.005},
+          "t3.small":     {"compute": "ec2", "cost_per_hour": 0.0208, "price_per_hour": 0.04,  "allocation_cost": 0.005, "allocation_price": 0.01},
+          "t3.medium":    {"compute": "ec2", "cost_per_hour": 0.0416, "price_per_hour": 0.08,  "allocation_cost": 0.010, "allocation_price": 0.02},
+          "t3.large":     {"compute": "ec2", "cost_per_hour": 0.0832, "price_per_hour": 0.16,  "allocation_cost": 0.020, "allocation_price": 0.03},
+          "t3.xlarge":    {"compute": "ec2", "cost_per_hour": 0.1664, "price_per_hour": 0.34,  "allocation_cost": 0.040, "allocation_price": 0.05},
+          "g4dn.xlarge":  {"compute": "ec2_gpu", "cost_per_hour": 0.526,  "price_per_hour": 1.06,  "allocation_cost": 0.100, "allocation_price": 0.10},
+          "g4dn.2xlarge": {"compute": "ec2_gpu", "cost_per_hour": 0.752,  "price_per_hour": 1.50,  "allocation_cost": 0.150, "allocation_price": 0.15}
+        }
+      },
+
+      "storage": {
+        "display_name": "Persistent Home Storage",
+        "description": "Persistent 'My Computer' home storage, billed per GB-month independent of compute state (storage-billed-while-off — WorkSpaces/Codespaces model). Ticket 20260713_persistence_cost_quota_billing (W1).",
+        "unit": "GB-month",
+        "$comment_storage_pricing": "MONEY-PATH, SHADOW/DARK. price_per_gb_month = cost_basis_per_gb_month × margin_multiplier. cost_basis_per_gb_month = AWS EFS Standard us-west-2 (~$0.30/GB-mo, COST_MODEL.md §1 / E-A1 — RAW untiered basis, NOTED not blended, re-verify on the AWS Pricing Calculator before sign-off). margin_multiplier = owner sign-off 3× (price = 3 × our cost). To reprice, the owner changes ONE number: margin_multiplier. price_per_gb_month below is DERIVED (0.30 × 3.0 = 0.90) and shown for humans only — app/storage_pricing.py recomputes it from basis × multiplier so the two can never drift. billing_live=false ⇒ the live storage emit stays cost=0 and only a SHADOW would_charge is logged; real charging turns on ONLY when an owner sets STORAGE_BILLING_LIVE=true (never flipped here).",
+        "cost_basis_per_gb_month": 0.30,
+        "cost_basis_source": "AWS EFS Standard list price, us-west-2 (~$0.30/GB-month). COST_MODEL.md §1, evidence E-A1. Placeholder — re-verify before owner sign-off.",
+        "margin_multiplier": 3.0,
+        "price_per_gb_month": 0.90,
+        "billing_live": false
+      }
+    }
+  },
+
+  "tiers": [
+    {
+      "tier_id": "free",
+      "display_name": "Free",
+      "description": "For experimentation and evaluation",
+      "sort_order": 0,
+      "billing_model": "consumption_only",
+      "initial_credit": 10.00,
+      "features": ["basic_sandboxes", "browser_sessions"],
+      "upgrade_url": "/billing?upgrade=1",
+      "limits": {
+        "sandbox.concurrent": 1,
+        "sandbox.monthly_cost": 10.00,
+        "sandbox.gpu_instances": 0,
+        "sandbox.browser_sessions": 2,
+        "sandbox.desktop_sessions": 0,
+        "sandbox.home_storage_gb": 40
+      }
+    },
+    {
+      "tier_id": "starter",
+      "display_name": "Starter",
+      "description": "For small teams getting started",
+      "sort_order": 1,
+      "billing_model": "subscription_with_credits",
+      "price": {"amount_per_period": 29.00, "currency": "USD", "period": "month"},
+      "credit_grant": {
+        "trigger": "subscription_invoice_paid",
+        "amount_per_period": 29.00,
+        "currency": "USD",
+        "lifecycle": "use_it_or_lose_it",
+        "destination": "subscription_credit",
+        "reset_on_downgrade": true,
+        "reset_on_upgrade": false
+      },
+      "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access"],
+      "upgrade_url": "/billing?upgrade=1",
+      "limits": {
+        "sandbox.concurrent": 5,
+        "sandbox.monthly_cost": 100.00,
+        "sandbox.gpu_instances": 1,
+        "sandbox.browser_sessions": 10,
+        "sandbox.desktop_sessions": 5,
+        "sandbox.home_storage_gb": 120
+      }
+    },
+    {
+      "tier_id": "pro",
+      "display_name": "Pro",
+      "description": "For growing teams with production workloads",
+      "sort_order": 2,
+      "billing_model": "subscription_with_credits",
+      "price": {"amount_per_period": 99.00, "currency": "USD", "period": "month"},
+      "credit_grant": {
+        "trigger": "subscription_invoice_paid",
+        "amount_per_period": 99.00,
+        "currency": "USD",
+        "lifecycle": "use_it_or_lose_it",
+        "destination": "subscription_credit",
+        "reset_on_downgrade": true,
+        "reset_on_upgrade": false
+      },
+      "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access", "gpu_access", "audit_logs", "priority_support"],
+      "upgrade_url": "/billing?upgrade=1",
+      "limits": {
+        "sandbox.concurrent": 25,
+        "sandbox.monthly_cost": 1000.00,
+        "sandbox.gpu_instances": 5,
+        "sandbox.browser_sessions": 50,
+        "sandbox.desktop_sessions": 25,
+        "sandbox.home_storage_gb": 600
+      }
+    },
+    {
+      "tier_id": "enterprise",
+      "display_name": "Enterprise",
+      "description": "Custom limits, SLA, dedicated support",
+      "sort_order": 3,
+      "billing_model": "subscription_with_credits",
+      "price": {"amount_per_period": 499.00, "currency": "USD", "period": "month"},
+      "credit_grant": {
+        "trigger": "subscription_invoice_paid",
+        "amount_per_period": 499.00,
+        "currency": "USD",
+        "lifecycle": "rollover_capped",
+        "rollover_max_periods": 3,
+        "destination": "subscription_credit",
+        "reset_on_downgrade": true,
+        "reset_on_upgrade": false
+      },
+      "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access", "gpu_access", "audit_logs", "priority_support", "sso", "custom_roles", "sla", "dedicated_support"],
+      "limits": {
+        "sandbox.concurrent": null,
+        "sandbox.monthly_cost": null,
+        "sandbox.gpu_instances": 50,
+        "sandbox.browser_sessions": null,
+        "sandbox.desktop_sessions": null,
+        "sandbox.home_storage_gb": null
+      }
+    }
+  ]
+}

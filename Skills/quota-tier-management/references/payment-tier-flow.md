@@ -46,6 +46,7 @@ setup_quota(
 
 Then in `quota-config.json`:
 
+<!-- doc-exec: fragment (shows ONLY the tier/billing_integration keys this flow adds — merge into your full config, which must declare storage; see docs/requirements.md) -->
 ```jsonc
 {
   "tiers": [{

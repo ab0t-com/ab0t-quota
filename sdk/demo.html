@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ab0t-quota-ui — proof harness</title>
+<link rel="stylesheet" href="ab0t-quota-ui.css">
+<link rel="stylesheet" href="demo-page.css">
+<link rel="stylesheet" href="demo-brands.css">
+<style>
+  /* Page-local chrome for the white-label section only. The brands themselves
+     live in demo-brands.css — read that file, it IS the white-label proof. */
+  .brandbar {
+    display: flex; align-items: baseline; gap: var(--ab0t-s3);
+    margin-bottom: var(--ab0t-s3); flex-wrap: wrap;
+  }
+  .brandbar b { font-size: var(--ab0t-fs-md); }
+  .brandbar span { font-size: var(--ab0t-fs-xs); color: var(--ab0t-fg-muted); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<header class="page-head" style="margin-bottom:var(--ab0t-s6)">
+  <div>
+    <p class="eyebrow">Evidence, not marketing</p>
+    <h1>ab0t-quota-ui — proof harness</h1>
+    <p class="lede">
+      Every panel below is the <b>same SDK code</b> fed a <b>different consumer's config</b>. No
+      scenario shares a tier name, a resource name or a unit with any other. If the SDK contained a
+      hardcoded ladder, cases C–F would render a plan that does not exist — the exact defect removed
+      from the library in 0.6.3. Fixtures are the literal response shapes of
+      <code>/api/quotas/usage</code> (<code>engine.py:1155-1182</code>),
+      <code>/api/quotas/tiers</code> (<code>setup.py:2361-2380</code>),
+      <code>to_api_error()</code> (<code>models/responses.py:103-117</code>) and
+      <code>billing/models.py</code>.
+      The same assertions run headlessly in <code>node sdk/test_sdk.js</code>.
+    </p>
+  </div>
+  <div class="toolbar">
+    <button class="ctl" type="button" id="theme">Toggle theme</button>
+    <a class="ctl" href="showcase.html">Product showcase →</a>
+  </div>
+</header>
+
+<h2>1 · The revenue slice — six catalog shapes</h2>
+<div class="grid" id="grid"></div>
+
+<h2>2 · The vendor widget set — each against 2-tier, 1-tier and no catalog</h2>
+<div class="grid" id="grid2"></div>
+
+<h2>3 · White-label: the same components, two consumers' brands</h2>
+<p class="lede" style="margin-bottom:var(--ab0t-s4)">
+  Nothing below is a fork, a variant component or an override of an SDK selector. Each column is
+  a wrapper <code>&lt;div&gt;</code> that sets <code>--ab0t-*</code> tokens — accent, radius, font
+  stack, density, meter height, elevation — and the identical widget instances inherit them.
+  Toggle the theme: both brands re-declare their own dark values, so neither one breaks.
+</p>
+<div class="grid-2" id="brands"></div>
+
+<div class="scorebar" id="score">running…</div>
+
+<p class="note">
+  <b>What this page does not prove.</b> It asserts DOM structure and copy. Layout, paint, focus
+  order and screen-reader announcement are visible here but not <i>asserted</i> here.
+  Contrast is asserted — but by <code>contrast.js</code> against the stylesheet, not by measuring
+  rendered pixels. See <code>PROOF.md</code> § "Not proven".
+</p>
+
+</div>
+
+<script src="ab0t-quota-ui.js"></script>
+<script src="demo-fixtures.js"></script>
+<script>
+var F = AB0TDemo.fixtures, transport = AB0TDemo.transport, routes = AB0TDemo.routes;
+
+/* ------------------------------------------------------------------ *
+ * Section 1 — the original six. Assertions unchanged from v0.1.0.
+ * ------------------------------------------------------------------ */
+var CASES = [
+  { id: 'A', title: 'A · three-tier catalog, usage view',
+    why: 'Baseline. Media vocabulary: Hobby / Studio / Agency.',
+    expect: 'Warning banner names the worst resource and offers <b>Studio</b> (the next element of ' +
+            'their own array). Three meters, mixed severities, one <b>Custom limit</b> badge.',
+    run: function (host) {
+      AB0TQuotaUI.usage(host, { fetchImpl: transport(F.A_USAGE, F.A_TIERS) });
+      return function () {
+        var t = host.textContent;
+        return assertAll(host, [
+          ['names the consumer next tier', /Upgrade to Studio/.test(t)],
+          ['no foreign plan names', !/Starter|Enterprise|Premium/.test(t)],
+          ['override surfaced', /Custom limit/.test(t)],
+          ['3 meters rendered', host.querySelectorAll('.ab0t-meter').length === 3]
+        ]);
+      };
+    }},
+
+  { id: 'B', title: 'B · TWO tiers, on the bottom — paywall',
+    why: 'The shape that broke the old hardcoded ladder. Logistics vocabulary.',
+    expect: 'CTA must say <b>Upgrade to Pro</b> — never "Starter". Message is rendered verbatim ' +
+            'from the server, including the consumer\'s <code>action_hint</code>.',
+    run: function (host) {
+      AB0TQuotaUI.paywall(host, F.B_DENIAL, { fetchImpl: transport(null, F.B_TIERS) });
+      return function () {
+        var t = host.textContent;
+        return assertAll(host, [
+          ['CTA names Pro', /Upgrade to Pro/.test(t)],
+          ['NO invented Starter tier', !/Starter/.test(t)],
+          ['action_hint preserved verbatim', /Archive a delivered shipment/.test(t)],
+          ['upgrade link present', !!host.querySelector('a.ab0t-btn')]
+        ]);
+      };
+    }},
+
+  { id: 'C', title: 'C · TWO tiers, on the TOP tier — usage',
+    why: 'There is no higher plan to sell. Silence is the correct output.',
+    expect: 'A 94% critical meter, but <b>no upgrade CTA at all</b> — no button, no "contact us", ' +
+            'no dangling sentence.',
+    run: function (host) {
+      AB0TQuotaUI.usage(host, { fetchImpl: transport(F.C_USAGE, F.B_TIERS) });
+      return function () {
+        var t = host.textContent;
+        return assertAll(host, [
+          ['warning banner shown', !!host.querySelector('.ab0t-warn')],
+          ['NO upgrade CTA', !host.querySelector('.ab0t-cta')],
+          ['no dangling upgrade text', !/Upgrade/i.test(t)],
+          ['critical severity surfaced', /Nearly at limit/.test(t)]
+        ]);
+      };
+    }},
+
+  { id: 'D', title: 'D · SINGLE-tier catalog — paywall',
+    why: 'A consumer with exactly one plan. No ladder exists.',
+    expect: 'The limit message only. <b>No CTA, no link, no next plan.</b>',
+    run: function (host) {
+      AB0TQuotaUI.paywall(host, F.D_DENIAL, { fetchImpl: transport(null, F.D_TIERS) });
+      return function () {
+        var t = host.textContent;
+        return assertAll(host, [
+          ['message rendered', /maximum of 25 seats/.test(t)],
+          ['NO CTA element', !host.querySelector('.ab0t-cta')],
+          ['NO link', !host.querySelector('a')],
+          ['no invented plan', !/Pro|Plus|Premium|Upgrade/i.test(t)]
+        ]);
+      };
+    }},
+
+  { id: 'E', title: 'E · bridge mode — /tiers is 404',
+    why: 'setup.py:989 — the tier catalog route is intentionally absent in bridge mode.',
+    expect: 'The paywall stays <b>fully functional from the 429 body alone</b>: plan chip, message, ' +
+            'a working CTA from <code>upgrade_url</code>, and the RATE retry line.',
+    run: function (host) {
+      AB0TQuotaUI.paywall(host, F.E_DENIAL, { fetchImpl: transport(null, null) });
+      return function () {
+        var t = host.textContent;
+        return assertAll(host, [
+          ['renders without a catalog', /50,000 requests/.test(t) || /50000 requests/.test(t)],
+          ['plan chip from 429 body', /Growth/.test(t)],
+          ['generic CTA, no guessed name', /View upgrade options/.test(t)],
+          ['retry_after surfaced', /try again in 30 minutes/.test(t)]
+        ]);
+      };
+    }},
+
+  { id: 'F', title: 'F · unlimited limits, no upgrade_url',
+    why: 'limit === null is legal (engine.py:1152). unit may be empty.',
+    expect: 'The unlimited resource shows an <b>∞ affordance and no bar</b> (a full or empty bar ' +
+            'would both lie). The unit-less resource omits the unit rather than inventing one.',
+    run: function (host) {
+      AB0TQuotaUI.usage(host, { fetchImpl: transport(F.F_USAGE, F.F_TIERS) });
+      return function () {
+        var t = host.textContent;
+        var meters = host.querySelectorAll('.ab0t-meter');
+        return assertAll(host, [
+          ['unlimited affordance shown', !!host.querySelector('.ab0t-unlimited')],
+          ['no bar for unlimited', meters[0].querySelectorAll('.ab0t-track').length === 0],
+          ['no currency invented', !/USD|EUR|GBP/.test(t)],
+          ['no CTA (single tier, no url)', !host.querySelector('.ab0t-cta')]
+        ]);
+      };
+    }}
+];
+
+/* ------------------------------------------------------------------ *
+ * Section 2 — the vendor widget set (T-5/6/7).
+ * ------------------------------------------------------------------ */
+var CASES2 = [
+  { id: 'G', title: 'G · plan comparison — three tiers',
+    why: 'The pricing grid, rendered from /tiers alone.',
+    expect: 'One column per configured tier; the current one ringed and chipped; ' +
+            '<b>the CTA appears once</b>, on the current column, naming the next array element. ' +
+            'Row labels come from /usage — <code>/tiers</code> ships keys, not names.',
+    run: function (host) {
+      AB0TQuotaUI.plans(host, { fetchImpl: transport(F.A_USAGE, F.A_TIERS) });
+      return function () {
+        var t = host.textContent;
+        return assertAll(host, [
+          ['3 columns', host.querySelectorAll('.ab0t-plan').length === 3],
+          ['exactly one current marker', host.querySelectorAll('.ab0t-plan-current').length === 1],
+          ['exactly one CTA', host.querySelectorAll('.ab0t-cta').length === 1],
+          ['names the next tier', /Upgrade to Studio/.test(t)],
+          ['no money — this catalog carries no price', !/[0-9]+\.[0-9]{2}/.test(t)]
+        ]);
+      };
+    }},
+
+  { id: 'H', title: 'H · plan comparison — TWO tiers, on the top',
+    why: 'Same component, nothing left to sell.',
+    expect: 'Two columns, top one marked current, and <b>no CTA anywhere</b>.',
+    run: function (host) {
+      AB0TQuotaUI.plans(host, { fetchImpl: transport(F.C_USAGE, F.B_TIERS) });
+      return function () {
+        var t = host.textContent;
+        return assertAll(host, [
+          ['2 columns', host.querySelectorAll('.ab0t-plan').length === 2],
+          ['NO CTA at all', host.querySelectorAll('.ab0t-cta').length === 0],
+          ['no dangling upgrade text', !/Upgrade/i.test(t)]
+        ]);
+      };
+    }},
+
+  { id: 'I', title: 'I · plan comparison — SINGLE tier / NO catalog',
+    why: 'The two shapes a pricing grid is most likely to get wrong.',
+    expect: 'One column, no CTA. And with <code>/tiers</code> absent the component renders ' +
+            '<b>nothing at all</b> — an empty pricing grid is worse than no pricing grid.',
+    run: function (host) {
+      var one = document.createElement('div'), none = document.createElement('div');
+      host.appendChild(one); host.appendChild(none);
+      AB0TQuotaUI.plans(one, { fetchImpl: transport(F.D_USAGE, F.D_TIERS) });
+      AB0TQuotaUI.plans(none, { fetchImpl: transport(F.C_USAGE, null) });
+      return function () {
+        return assertAll(host, [
+          ['single-tier renders 1 column', one.querySelectorAll('.ab0t-plan').length === 1],
+          ['single-tier has no CTA', one.querySelectorAll('.ab0t-cta').length === 0],
+          ['no catalog renders nothing', !none.querySelector('.ab0t-plans')],
+          ['and no error state either', !none.querySelector('.ab0t-quiet')]
+        ]);
+      };
+    }},
+
+  { id: 'K', title: 'K · plan comparison — price, where a price exists',
+    why: 'TierConfig.price (models/core.py:315) is real config. /tiers does not ' +
+         'serialise it yet — ticket T-14.',
+    expect: 'The tier whose price carries a code renders an amount in <b>that</b> code. ' +
+            'The tier whose price omits the code renders <b>no amount at all</b> — never a ' +
+            'guessed symbol.',
+    run: function (host) {
+      AB0TQuotaUI.plans(host, { fetchImpl: transport(null, F.K_TIERS) });
+      return function () {
+        var t = host.textContent;
+        var prices = host.querySelectorAll('.ab0t-plan-price');
+        return assertAll(host, [
+          ['exactly one price rendered', prices.length === 1],
+          ['uses the payload code', /CHF/.test(prices[0].textContent)],
+          ['code-less price shows no amount', !/99/.test(t)]
+        ]);
+      };
+    }},
+
+  { id: 'L', title: 'L · invoices',
+    why: 'billing/models.py:251-270. Each invoice carries its own code.',
+    expect: 'Amounts formatted per-invoice. The third invoice has <code>currency: null</code> and ' +
+            'so shows <b>no amount</b>. "Amount due" is derived arithmetically, never from the ' +
+            'status word. Status text is upstream vocabulary, rendered verbatim.',
+    run: function (host) {
+      AB0TQuotaUI.invoices(host, { fetchImpl: routes({ '/payments/invoices': F.INVOICES }) });
+      return function () {
+        var t = host.textContent;
+        return assertAll(host, [
+          ['3 rows', host.querySelectorAll('.ab0t-row').length === 3],
+          ['only 2 amounts (one invoice has no code)',
+            host.querySelectorAll('.ab0t-amount').length === 2],
+          ['outstanding row flagged', host.querySelectorAll('.ab0t-row-due').length === 1],
+          ['status verbatim, de-snaked', /paid in full/.test(t)]
+        ]);
+      };
+    }},
+
+  { id: 'M', title: 'M · invoices — empty, auth, outage',
+    why: 'Three states a billing widget must never get wrong.',
+    expect: 'Empty says so plainly. <b>401 renders nothing</b> rather than a broken card. ' +
+            'An outage is a <b>quiet</b> line with a working Retry — never a red alarm on a ' +
+            'billing page.',
+    run: function (host) {
+      var a = document.createElement('div'), b = document.createElement('div'), c = document.createElement('div');
+      [a, b, c].forEach(function (n) { host.appendChild(n); });
+      AB0TQuotaUI.invoices(a, { fetchImpl: routes({ '/payments/invoices': F.INVOICES_EMPTY }) });
+      AB0TQuotaUI.invoices(b, { fetchImpl: routes({ '/payments/invoices': 'auth' }) });
+      AB0TQuotaUI.invoices(c, { fetchImpl: routes({ '/payments/invoices': null }) });
+      return function () {
+        return assertAll(host, [
+          ['empty state', !!a.querySelector('.ab0t-empty')],
+          ['401 renders nothing', !b.querySelector('.ab0t-invoices')],
+          ['outage is quiet', !!c.querySelector('.ab0t-quiet')],
+          ['and offers retry', !!c.querySelector('button.ab0t-link')]
+        ]);
+      };
+    }},
+
+  { id: 'N', title: 'N · balance & spend',
+    why: '/billing/balance carries a code. /billing/usage/summary does NOT.',
+    expect: 'Balance and Available render in the response\'s own code. Spend shows <b>—</b> and ' +
+            '"amount unavailable", because borrowing the balance\'s code for a different ' +
+            'service\'s figure is how customers get shown the wrong currency. Ticket T-16.',
+    run: function (host) {
+      AB0TQuotaUI.balance(host, { fetchImpl: routes({
+        '/billing/balance': F.BALANCE, '/billing/usage/summary': F.SUMMARY }) });
+      return function () {
+        var t = host.textContent;
+        var figs = host.querySelectorAll('.ab0t-figure-value');
+        return assertAll(host, [
+          ['3 figures', figs.length === 3],
+          ['balance uses the response code', /SEK/.test(figs[0].textContent)],
+          ['spend renders no amount', figs[2].textContent === '—'],
+          ['the code is not borrowed', (t.split('SEK').length - 1) === 2]
+        ]);
+      };
+    }},
+
+  { id: 'O', title: 'O · subscription status',
+    why: 'billing/models.py:210-235. plan_id is the ONLY name on the contract.',
+    expect: '<code>growth_annual_v2</code> is printed <b>verbatim</b> — title-casing an id into a ' +
+            'plausible product name is the exact defect removed from billing (§5e). ' +
+            '<code>amount</code> exists but has no code, so no money renders. Non-renewal is ' +
+            'stated with a date.',
+    run: function (host) {
+      var a = document.createElement('div'), b = document.createElement('div');
+      host.appendChild(a); host.appendChild(b);
+      AB0TQuotaUI.subscription(a, { fetchImpl: routes({ '/payments/subscriptions': F.SUBS }) });
+      AB0TQuotaUI.subscription(b, { fetchImpl: routes({ '/payments/subscriptions': F.SUBS_EMPTY }) });
+      return function () {
+        var t = a.textContent;
+        return assertAll(host, [
+          ['plan_id verbatim', /growth_annual_v2/.test(t)],
+          ['no invented plan name', !/Growth Annual/.test(t)],
+          ['amount withheld (no code)', !/1,188|1188/.test(t)],
+          ['non-renewal notice', !!a.querySelector('.ab0t-notice')],
+          ['empty state when there is none', !!b.querySelector('.ab0t-empty')]
+        ]);
+      };
+    }}
+];
+
+/* ------------------------------------------------------------------ *
+ * Section 3 — white-label. Same widgets, two brands, token overrides only.
+ * ------------------------------------------------------------------ */
+var BRANDS = [
+  { cls: 'brand-atlas', name: 'Atlas Press',
+    note: 'serif · pill radius · roomy density · 12px meters · plum accent' },
+  { cls: 'brand-quanta', name: 'Quanta Systems',
+    note: 'monospace · zero radius · compact density · 4px meters · teal accent' }
+];
+
+function buildBrands() {
+  var wrap = document.getElementById('brands');
+  BRANDS.forEach(function (b) {
+    var col = document.createElement('div');
+    col.className = 'case ' + b.cls;
+    var bar = document.createElement('div');
+    bar.className = 'brandbar';
+    var n = document.createElement('b'); n.textContent = b.name;
+    var s = document.createElement('span'); s.textContent = b.note;
+    bar.appendChild(n); bar.appendChild(s);
+    col.appendChild(bar);
+
+    var stack = document.createElement('div');
+    stack.className = 'stack';
+    var u = document.createElement('div');
+    var p = document.createElement('div');
+    var pl = document.createElement('div');
+    stack.appendChild(u); stack.appendChild(p); stack.appendChild(pl);
+    col.appendChild(stack);
+    wrap.appendChild(col);
+
+    // The SAME three widget instances, same fixtures, in both columns.
+    AB0TQuotaUI.usage(u, { fetchImpl: transport(F.A_USAGE, F.A_TIERS) });
+    AB0TQuotaUI.paywall(p, F.B_DENIAL, { fetchImpl: transport(null, F.B_TIERS) });
+    AB0TQuotaUI.plans(pl, { fetchImpl: transport(F.D_USAGE, F.D_TIERS) });
+  });
+}
+
+/* ------------------------------------------------------------------ *
+ * Harness
+ * ------------------------------------------------------------------ */
+function assertAll(host, checks) {
+  var ok = checks.every(function (c) { return c[1]; });
+  var v = document.createElement('div');
+  v.className = 'verdict ' + (ok ? 'pass' : 'fail');
+  v.textContent = (ok ? 'PASS · ' : 'FAIL · ') +
+    checks.map(function (c) { return (c[1] ? '✓ ' : '✗ ') + c[0]; }).join('  ·  ');
+  host.parentNode.appendChild(v);
+  return ok;
+}
+
+var pending = [];
+
+function build(list, gridId) {
+  var grid = document.getElementById(gridId);
+  list.forEach(function (c) {
+    var card = document.createElement('div');
+    card.className = 'case';
+    var h = document.createElement('h3'); h.textContent = c.title; card.appendChild(h);
+    var w = document.createElement('p'); w.className = 'why'; w.textContent = c.why; card.appendChild(w);
+    var e = document.createElement('p'); e.className = 'expect';
+    e.innerHTML = '<b>Expected:</b> ' + c.expect; card.appendChild(e);
+    var host = document.createElement('div'); card.appendChild(host);
+    grid.appendChild(card);
+    pending.push(c.run(host));
+  });
+}
+
+build(CASES, 'grid');
+build(CASES2, 'grid2');
+buildBrands();
+
+document.getElementById('theme').addEventListener('click', function () {
+  var r = document.documentElement;
+  r.setAttribute('data-theme', r.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+
+// The SDK renders synchronously then enriches on promise resolution; assert
+// after the microtask queue drains.
+setTimeout(function () {
+  var results = pending.map(function (fn) { return fn(); });
+  var passed = results.filter(Boolean).length;
+  var bar = document.getElementById('score');
+  bar.className = 'scorebar ' + (results.every(Boolean) ? 'pass' : 'fail');
+  bar.textContent = passed + ' / ' + results.length + ' scenarios pass in the browser · ' +
+                    'run `node sdk/test_sdk.js` for the headless gates';
+  window.__AB0T_RESULT__ = { passed: passed, total: results.length };
+}, 120);
+</script>
+</body>
+</html>

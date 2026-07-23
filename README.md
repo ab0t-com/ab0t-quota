@@ -2,9 +2,27 @@
 
 Shared quota, rate-limiting, and tier enforcement library for the [ab0t mesh network](https://ab0t.com). Any service in the mesh can use this library to enforce usage limits, manage billing tiers, and gate features — without building its own rate-limiting infrastructure.
 
-> **New here?** → **[5-minute quickstart for external clients](docs/quickstart.md)**.
-> One-line FastAPI wiring, two env vars, one config file. Both engine-local
-> and bridge (HTTPS-only) deployment modes covered.
+## Try it in 2 commands
+
+No account, no credential, no cloud, nothing to provision:
+
+```bash
+python -m ab0t_quota provision --local   # starts a conforming local Redis
+AB0T_QUOTA_OFFLINE=true python -m ab0t_quota preflight   # verifies it, contacts nothing
+```
+
+`provision --local` brings up a Redis that satisfies every requirement the
+library enforces at boot; `preflight` re-runs those same checks read-only and
+prints exactly what it resolved and from where. Neither command contacts the
+mesh, creates cloud resources, or needs a mesh credential — **you can evaluate
+this library end-to-end before talking to anyone.**
+
+When you want the full commercial surface (tiers, checkout, invoices, the
+customer portal), that needs a mesh credential — see the quickstart.
+
+> **Ready to integrate?** → **[5-minute quickstart for external clients](docs/quickstart.md)**.
+> One-line FastAPI wiring, one config file. Both engine-local and bridge
+> (HTTPS-only) deployment modes covered.
 
 ## What it does
 
@@ -37,7 +55,23 @@ ab0t-quota @ git+https://github.com/ab0t-com/ab0t-quota.git@v0.5.1
 pip install -e ".[dev]"
 ```
 
-Core dependencies: `redis`, `pydantic`, `fastapi`. That's it.
+Python dependencies: `redis`, `pydantic`, `fastapi`. **Infrastructure
+prerequisites are real — see [docs/requirements.md](docs/requirements.md)**:
+a declared Redis meeting the startup gate contract (or bridge mode), the
+DynamoDB tables (pre-created, or opted-in `storage.auto_create_tables`), and
+mesh credentials. The CLI does the legwork ([docs/cli.md](docs/cli.md)):
+
+```bash
+python -m ab0t_quota provision --emit compose|terraform|acl|iam  # conforming
+                        # infra artifacts, emitted from the enforcing gates —
+                        # applied by YOU; it never touches your cloud
+python -m ab0t_quota preflight   # CI: "would this boot?", read-only, typed exits
+python -m ab0t_quota doctor      # humans/auditors: production POSTURE, graded,
+                                 # honest about what it could not check
+```
+
+Startup refusals carry stable `QUOTA-CFG-nnn` codes shared with the Go
+runtime — [docs/error-codes.md](docs/error-codes.md).
 
 ## Quick start
 
@@ -46,8 +80,12 @@ from fastapi import FastAPI
 from ab0t_quota import setup_quota
 
 app = FastAPI()
-setup_quota(app)        # one line. Done.
+setup_quota(app)        # one line — reads quota-config.json (required)
 ```
+
+Since 0.7 a missing `quota-config.json`, a missing `tiers` array, or an
+undeclared Redis is a **startup error naming the fix** — the library declares
+what it needs and never invents infrastructure or policy.
 
 Plus `quota-config.json` next to your service and two env vars
 (`AB0T_MESH_API_KEY`, `AB0T_CONSUMER_ORG_ID`).
@@ -197,8 +235,11 @@ Alerts fire at WARNING (80%), CRITICAL (95%), and EXCEEDED (100%) thresholds. Co
 
 ## Configuration
 
-Copy `quota-config.example.json` to `quota-config.json` or set `QUOTA_CONFIG_PATH`:
+Copy `quota-config.example.json` to `quota-config.json` or set `QUOTA_CONFIG_PATH`
+(the `redis_url` below is a local-dev example value — declare YOUR Redis; the
+library never invents one):
 
+<!-- doc-exec: fragment (ellipsis shape illustration — the complete, executable config ships as quota-config.example.json, which the execution control runs standalone) -->
 ```json
 {
   "storage": { "redis_url": "redis://localhost:6379/0" },

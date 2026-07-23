@@ -191,12 +191,21 @@ class TestFailureBehavior:
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_get_tier_falls_back_to_free_on_error(self):
+    async def test_get_tier_no_longer_invents_free_on_error(self, monkeypatch):
+        """REPLACES test_get_tier_falls_back_to_free_on_error (§11.2, D-12
+        signed): the old test asserted ENV-17's defect — an outage silently
+        enforcing paid orgs at the invented cheapest tier. Now the outage is a
+        typed refusal under the 0.6.2 fail-closed default. Companion contract
+        tests: tests/test_t21_bridge_tier_20260721.py."""
+        from ab0t_quota.bridge import BridgeUnavailableError
+        monkeypatch.delenv("AB0T_QUOTA_BRIDGE_FAIL_OPEN", raising=False)
+
         async def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("nope")
 
         client = _client_with_handler(handler)
-        assert await client.get_tier("org-1") == "free"
+        with pytest.raises(BridgeUnavailableError):
+            await client.get_tier("org-1")
         await client.close()
 
 

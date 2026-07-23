@@ -39,3 +39,12 @@ coverage.xml
 # Internal dev notes (not for public repo)
 dev/
 .private/
+
+# Ticket packs — internal engineering records. NOT for a public repo.
+# They cite consumer deployments in forensic detail (production compose contents,
+# internal hostnames/ports, network names, env-file layout) and internal absolute
+# paths. That is a CONSUMER's infrastructure profile, not ours to publish.
+# If any of this should be public, publish a SANITISED postmortem instead — the
+# engineering value (the decisions, the defect taxonomy, the verification
+# discipline) survives sanitisation; the consumer's deployment details must not.
+tickets/

@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upgrade — hosted composition</title>
+<link rel="stylesheet" href="ab0t-quota-ui.css">
+<link rel="stylesheet" href="demo-page.css">
+<style>
+  .cols { display: grid; gap: var(--ab0t-s6); grid-template-columns: 1fr; }
+  @media (min-width: 900px) { .cols { grid-template-columns: 1.1fr 1fr; align-items: start; } }
+  .side { display: flex; flex-direction: column; gap: var(--ab0t-s5); }
+  .scenario { display: flex; gap: var(--ab0t-s2); flex-wrap: wrap; margin-bottom: var(--ab0t-s6); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header style="padding:var(--ab0t-s7) 0 var(--ab0t-s5)">
+    <p class="eyebrow">Hosted composition · the 429 moment</p>
+    <h1>You have hit a limit.</h1>
+    <p class="lede">
+      The page a customer lands on when a request is refused. The sentence is the server's,
+      rendered verbatim — it already names their plan, their resource, their unit and their own
+      remediation hint. This page adds structure around it, never words of its own.
+    </p>
+  </header>
+
+  <div class="scenario" role="group" aria-label="Scenario">
+    <button class="ctl" type="button" data-s="bottom" aria-pressed="true">Two plans, on the lower one</button>
+    <button class="ctl" type="button" data-s="single" aria-pressed="false">Single-plan product</button>
+    <button class="ctl" type="button" data-s="bridge" aria-pressed="false">No tier catalog (bridge mode)</button>
+  </div>
+
+  <div class="cols">
+    <div>
+      <div id="paywall"></div>
+      <p class="note" id="explain"></p>
+    </div>
+    <div class="side">
+      <div id="usage"></div>
+      <div id="plans"></div>
+    </div>
+  </div>
+
+  <p class="note" style="margin-top:var(--ab0t-s7);margin-bottom:var(--ab0t-s8)">
+    <b>Fixture data.</b> In a real integration the paywall payload is the 429 body your own endpoint
+    already returns — you pass it straight to <code>AB0TQuotaUI.paywall(el, payload)</code> with no
+    transformation. The usage and plan panels beside it fetch from
+    <code>/api/quotas/*</code> same-origin.
+  </p>
+
+  <div class="toolbar" style="margin-bottom:var(--ab0t-s8)">
+    <button class="ctl" type="button" id="theme">Toggle theme</button>
+    <a class="ctl" href="showcase.html">← Showcase</a>
+  </div>
+
+</div>
+
+<script src="ab0t-quota-ui.js"></script>
+<script src="demo-fixtures.js"></script>
+<script>
+var F = AB0TDemo.fixtures, transport = AB0TDemo.transport;
+
+var S = {
+  bottom: {
+    denial: F.B_DENIAL, usage: F.C_USAGE, tiers: F.B_TIERS,
+    note: 'The customer is on the lower of two plans. The CTA names the plan that is actually next ' +
+          'in their catalog, and the link is the one their config supplied. The side panels show ' +
+          'where they stand and what the other plan allows.'
+  },
+  single: {
+    denial: F.D_DENIAL, usage: F.D_USAGE, tiers: F.D_TIERS,
+    note: 'A single-plan product. There is nothing to sell, so the paywall carries NO CTA, no ' +
+          '"contact us" and no dangling sentence — just the limit, stated once. The plan panel ' +
+          'shows the one plan without pretending a ladder exists.'
+  },
+  bridge: {
+    denial: F.E_DENIAL, usage: null, tiers: null,
+    note: 'Bridge mode: /tiers is not mounted (setup.py:989), so there is no catalog at all. The ' +
+          'paywall is still fully functional from the 429 body alone — plan chip, sentence, a ' +
+          'working link, and the retry line for a rate-limited resource. The side panels stay ' +
+          'silent rather than showing empty shells.'
+  }
+};
+
+var pw = document.getElementById('paywall');
+var us = document.getElementById('usage');
+var pl = document.getElementById('plans');
+var explain = document.getElementById('explain');
+
+function reset(n) { n.__ab0tArea = null; while (n.firstChild) n.removeChild(n.firstChild); }
+
+function show(key) {
+  var s = S[key];
+  [pw, us, pl].forEach(reset);
+  AB0TQuotaUI.paywall(pw, s.denial, { fetchImpl: transport(null, s.tiers) });
+  if (s.usage) AB0TQuotaUI.usage(us, { fetchImpl: transport(s.usage, s.tiers) });
+  AB0TQuotaUI.plans(pl, { fetchImpl: transport(s.usage, s.tiers) });
+  explain.textContent = s.note;
+  document.querySelectorAll('[data-s]').forEach(function (b) {
+    b.setAttribute('aria-pressed', String(b.getAttribute('data-s') === key));
+  });
+}
+
+document.querySelectorAll('[data-s]').forEach(function (b) {
+  b.addEventListener('click', function () { show(b.getAttribute('data-s')); });
+});
+show('bottom');
+
+document.getElementById('theme').addEventListener('click', function () {
+  var r = document.documentElement;
+  r.setAttribute('data-theme', r.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+</script>
+</body>
+</html>

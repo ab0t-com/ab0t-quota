@@ -21,7 +21,8 @@ from .models.core import (
 from .providers import TierProvider, JWTTierProvider, AuthServiceTierProvider, StaticTierProvider
 from .alerts import AlertManager, AlertDispatcher, LogAlertDispatcher, WebhookAlertDispatcher
 from .config import load_config, load_tiers, load_resources, load_resource_bundles
-from .messages import MessageBuilder
+from .errors import QuotaConfigError
+from .messages import MessageBuilder, Templates
 from .persistence import QuotaStore
 from .setup import setup_quota, QuotaContext
 from .bridge import BridgeClient, BridgeContext, RemoteTierProvider
@@ -34,7 +35,7 @@ from .activations import (
 from .reconcile import LibraryReconciler, ReconcileConfig
 from .alerts import DriftAlertManager
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
 __all__ = [
     # Engine & middleware
@@ -74,10 +75,12 @@ __all__ = [
     # Config
     "load_config",
     "load_tiers",
+    "QuotaConfigError",
     "load_resources",
     "load_resource_bundles",
     # Messages
     "MessageBuilder",
+    "Templates",
     # Drop-in setup
     "setup_quota",
     "QuotaContext",

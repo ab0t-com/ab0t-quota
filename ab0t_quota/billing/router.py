@@ -681,26 +681,24 @@ def create_billing_router(
         # service's multi-secret support (T0d) accepts our endpoint's secret
         # alongside its legacy secret, so the forward verifies cleanly.
         #
-        # Env var is namespaced (AB0T_QUOTA_STRIPE_WEBHOOK_SECRET) to avoid
-        # collision with payment-service's same-named STRIPE_WEBHOOK_SECRET
-        # when both services run in the same compose/k8s namespace. Falls
-        # back to STRIPE_WEBHOOK_SECRET for local dev convenience.
+        # Namespaced env ONLY (T-4/ENV-05): the generic STRIPE_WEBHOOK_SECRET
+        # is the payment service's convention — harvesting it made this route
+        # verify with a co-deployed service's secret (400s + silently lost
+        # credit grants). Unset ⇒ refuse as unconfigured; setup logs it loudly.
         import stripe as _stripe  # local import: 'stripe' is in the [billing] extra (T0c)
 
-        secret = (
-            os.getenv("AB0T_QUOTA_STRIPE_WEBHOOK_SECRET")
-            or os.getenv("STRIPE_WEBHOOK_SECRET", "")
-        )
+        secret = os.getenv("AB0T_QUOTA_STRIPE_WEBHOOK_SECRET", "")
         # TODO(public-mesh-ga): Support a comma-separated
         # AB0T_QUOTA_STRIPE_WEBHOOK_SECRETS list for endpoint-secret
         # rotation, mirroring payment-service cutover behavior. Backlink:
         # audit: 2026-05-16 public-mesh-ga readiness pass
         if not secret:
             logger.error(
-                "AB0T_QUOTA_STRIPE_WEBHOOK_SECRET unset (and STRIPE_WEBHOOK_SECRET "
-                "fallback also empty) — cannot verify Stripe signature. Configure "
-                "this in your sandbox-platform/.env.production before Stripe "
-                "Dashboard cuts over to this endpoint."
+                "AB0T_QUOTA_STRIPE_WEBHOOK_SECRET unset — cannot verify Stripe "
+                "signature; webhook refused. (The generic STRIPE_WEBHOOK_SECRET is "
+                "no longer read — it belongs to the payment service.) Set "
+                "AB0T_QUOTA_STRIPE_WEBHOOK_SECRET in this service's environment "
+                "before Stripe Dashboard cuts over to this endpoint."
             )
             raise HTTPException(status_code=500, detail="Server config error")
 

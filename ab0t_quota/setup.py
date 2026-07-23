@@ -70,6 +70,16 @@ from .config import (
 )
 from .engine import QuotaEngine
 from .middleware import QuotaGuard
+from .resolve import (
+    Requirement,
+    check_deprecated_generic_env,
+    offline_mode,
+    resolve_ddb_endpoint,
+    resolve_ddb_region,
+    resolve_dependencies,
+    resolve_dependency,
+    strip_url_password,
+)
 from .models.requests import QuotaCheckRequest
 from .persistence import QuotaStore
 from .providers import (
@@ -244,6 +254,10 @@ def setup_quota(
     if not enforcement.get("enabled", True):
         logger.warning("quota enforcement disabled in config")
 
+    # D-10: loud startup call-out for deprecated generic env names left behind
+    # by the 0.7 harvest removal (presence-only; runs for every mode).
+    check_deprecated_generic_env(config)
+
     # ----- Mode selection ---------------------------------------------------
     # Resolution order: explicit kwarg → config.engine_mode → "local"
     resolved_mode = (mode or config.get("engine_mode") or "local").lower()
@@ -252,6 +266,22 @@ def setup_quota(
         resolved_mode = "local"
 
     if resolved_mode == "bridge":
+        # K-9/D-KS-8: bridge mode does not consume the keyspace state (its
+        # counters live server-side) — a declared state must refuse, not no-op.
+        _st = config.get("storage") or {}
+        if _st.get("keyspace_version") == 2 or _st.get("keyspace_dual_write") is True:
+            from .errors import QuotaConfigError
+            raise QuotaConfigError(
+                name="counter keyspace version", config_key="storage.keyspace_version",
+                code="QUOTA-CFG-006",
+                state="storage.keyspace_version/keyspace_dual_write declared in "
+                      "bridge mode",
+                env_names=(),
+                remedy="bridge mode does not consume the keyspace declaration — "
+                       "counters live in the billing service's Redis; remove the "
+                       "keys (the server side owns its keyspace migration)",
+                docs_anchor="keyspace",
+            )
         return _setup_quota_bridge(
             app, config=config, org_extractor=org_extractor,
             auth_dependency=auth_dependency, enable_quota_api=enable_quota_api,
@@ -266,26 +296,47 @@ def setup_quota(
     #    connection), registry, tier definitions, bundles. Engine itself
     #    is constructed later so handlers can capture it via app.state.quota.
 
-    redis_url = (
-        storage.get("redis_url")
-        or os.getenv("QUOTA_REDIS_URL")
-        or os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    )
-    # Honor REDIS_PASSWORD env (matches the convention used by every other
-    # ab0t service — billing, payment, auth — so consumers don't have to
-    # embed credentials in REDIS_URL just for this library). The kwarg
-    # overrides any URL-embedded password, so URL-embedded creds still
-    # work for callers that prefer that style.
-    redis_password = (
-        storage.get("redis_password")
-        or os.getenv("QUOTA_REDIS_PASSWORD")
-        or os.getenv("REDIS_PASSWORD")
-    )
-    redis = Redis.from_url(
-        redis_url,
-        password=redis_password or None,
-        decode_responses=False,
-    )
+    # DECLARED, NOT DISCOVERED (pack 20260721, T-1/T-2): every dependency is
+    # resolved ONCE, from declared sources only (config / namespaced env),
+    # before any client object exists. No generic env var, no invented default.
+    plan = resolve_dependencies(config, mode=resolved_mode)
+    app.state.quota_resolution_plan = plan
+    logger.info("%s", plan.provenance_block())
+
+    # T-5 (ENV-07/08/11): the outbound inventory — every target this process
+    # may contact, stated BEFORE any of them is contacted — and the offline
+    # ("contact nobody") switch that suppresses them all.
+    offline = offline_mode(config)
+    if offline:
+        logger.warning(
+            "AB0T_QUOTA OFFLINE MODE — contacting nobody: tier-catalog publish, "
+            "auth auto-subscribe, webhook alerts, paid-tier client wiring and DDB "
+            "self-provisioning (state store, activation ledger, outbox) are OFF "
+            "for this process")
+    logger.info(
+        "OUTBOUND TARGETS this process may contact:%s\n"
+        "  billing  %s   (tier-catalog PUT, credit grants)\n"
+        "  payment  %s   (checkout proxy)\n"
+        "  (offline mode: AB0T_QUOTA_OFFLINE=true suppresses all of the above)",
+        " [OFFLINE — all suppressed]" if offline else "",
+        _mesh_url("billing"), _mesh_url("payment"))
+
+    redis_url = plan["redis_url"].value
+    pw_row = plan["redis_password"]
+    redis_kwargs: dict = {"decode_responses": False}
+    if pw_row.declared:
+        # D-5(a): a separately-declared redis_password BEATS a URL-embedded one
+        # (both runtimes). redis-py's from_url merges URL options OVER kwargs
+        # (E-03 — the old comment here claimed the reverse), so implement the
+        # precedence explicitly: strip the URL password, pass the declared field.
+        redis_url, url_pw = strip_url_password(redis_url)
+        if url_pw is not None and url_pw != pw_row.value:
+            logger.warning(
+                "redis password declared in TWO places and they differ: %s wins; "
+                "the URL-embedded password is dropped. Remove the stale copy "
+                "(ENV-02's assembled-pair hazard).", pw_row.source)
+        redis_kwargs["password"] = pw_row.value
+    redis = Redis.from_url(redis_url, **redis_kwargs)
 
     registry = ResourceRegistry()
     for r in load_resources(config):
@@ -294,6 +345,27 @@ def setup_quota(
     tiers = load_tiers(config)
     bundles = load_resource_bundles(config)
     provider = _build_tier_provider(config, redis)
+
+    # K-9 (keyspace spec §3.2): the declared keyspace state, from the resolved
+    # rows + the declared service identity. Default (1,false) = pre-K-1 bytes.
+    from .keyspace import Keyspace, KeyspaceScopeError
+    _ksv = int(plan["keyspace_version"].value)
+    _ksd = bool(plan["keyspace_dual_write"].value)
+    _ks_service = _resolve_service_name(config, registry)
+    try:
+        keyspace = Keyspace(service=_ks_service, version=_ksv, dual_write=_ksd)
+    except KeyspaceScopeError:
+        if _ksv == 1 and not _ksd:
+            # v1 keys carry no scope: an odd service_name must not break a
+            # drop-in upgrade. Loud, and the marker boot-guard is scope-less.
+            logger.warning(
+                "service_name %r cannot be a keyspace scope (charset guard) — "
+                "keeping the unscoped v1 keyspace; fix it before any v2 migration",
+                _ks_service)
+            keyspace = Keyspace()
+        else:
+            raise
+    app.state.quota_keyspace = keyspace
 
     # Engine without an override loader yet — set after store init in the lifespan
     # D-37/D-39: the activation LEDGER is authoritative for identity+cost (D-33) —
@@ -317,12 +389,13 @@ def setup_quota(
         # actually behave (previously read at :226 and only logged).
         enforcement=load_enforcement(config),
         activation_store=resolved_activation_store,
+        keyspace=keyspace,  # K-9: counters/reconciler/recent-guard inherit it
     )
 
     # Alert manager: log dispatcher always; webhook if configured
     dispatchers = [LogAlertDispatcher()]
     alerts_cfg = config.get("alerts", {})
-    if alerts_cfg.get("webhook_url"):
+    if alerts_cfg.get("webhook_url") and not offline:
         try:
             from .alerts import WebhookAlertDispatcher
             dispatchers.append(WebhookAlertDispatcher(url=alerts_cfg["webhook_url"]))
@@ -365,8 +438,10 @@ def setup_quota(
             templates_dir=paid_templates_dir,
             route_prefix=paid_route_prefix,
             tiers=tiers,  # T0b — pass already-loaded TierConfig dict to the billing router
-        ) if enable_paid else None
+        ) if enable_paid and not offline else None
     )
+    if enable_paid and offline:
+        logger.warning("offline mode: paid-tier surface NOT wired (no mesh clients constructed)")
 
     # === ASYNC PHASE — composed into the app's lifespan =======================
 
@@ -374,6 +449,11 @@ def setup_quota(
 
     @asynccontextmanager
     async def composed_lifespan(_app: FastAPI):
+        # GT T2 (the incident's fix) — REACHABILITY FIRST. The first gate to
+        # touch Redis owns the diagnosis; unreachable/unauthenticated must own
+        # it as itself, never as a topology/eviction/scripting verdict.
+        await _gate_redis_reachable(_app, redis, config, plan)
+
         # D-71 — machine-check the Redis TOPOLOGY before ANYTHING touches the
         # counter. The counter's Lua scripts are multi-key and CROSSSLOT on a
         # Redis Cluster (D-23, observed at the server); our prod is single-node,
@@ -389,16 +469,42 @@ def setup_quota(
         # at runtime, behind a green health check. (D-71 at least refuses loudly.)
         await _gate_redis_counter_store(_app, redis, config)
 
+        # K-9 (spec §3.3): keyspace boot guards — QUOTA-CFG-011 (version
+        # regression against a completed migration) and QUOTA-CFG-012
+        # (brownfield v2 over live v1 keys). Typed refusals, deliberately
+        # UNWRAPPED (fatal): both worlds silently zero/orphan counters.
+        from .keyspace_migration import check_boot_keyspace
+        _ks_marker = await check_boot_keyspace(redis, keyspace)
+        _ks_phase = (_ks_marker or {}).get("phase", "none")
+        _app.state.quota_keyspace_state = {
+            "service": keyspace.service, "version": keyspace.version,
+            "dual_write": keyspace.dual_write,
+            "migration_phase": _ks_phase, "marker": _ks_marker,
+        }
+
         # Inner: existing user lifespan (if any), wrapped by our async init/teardown
         store: Optional[QuotaStore] = None
-        if storage.get("persistence_enabled", True):
+        # T-6/D-3: table-creation policy, decided ONCE here and passed to every
+        # self-provision call site. Default false — nothing is created in a
+        # consumer's cloud without the explicit opt-in (ENV-04).
+        auto_create = bool(storage.get("auto_create_tables", False))
+        # Gate-C re-gate (T-5): offline gates the state store too — this was the
+        # third, ungated DDB self-provision path (describe_table + CreateTable).
+        if storage.get("persistence_enabled", True) and offline:
+            logger.warning("offline mode: state-store DDB persistence init SKIPPED — "
+                           "no session constructed, no seed/sync, no CreateTable")
+        if storage.get("persistence_enabled", True) and not offline:
             try:
+                # Region is SDK-kind: declared config wins; otherwise region=None
+                # defers to boto3's own documented chain (AWS_REGION/profile/IMDS)
+                # — never a hardcoded us-east-1 (ENV-04). Endpoint is declared-or-
+                # unset, allowlist-validated at resolve time (ENV-14).
                 store = QuotaStore(
                     table_name=storage.get("dynamodb_table", "ab0t_quota_state"),
-                    region=storage.get("dynamodb_region", os.getenv("AWS_REGION", "us-east-1")),
-                    endpoint_url=os.getenv("DYNAMODB_ENDPOINT") or None,
+                    region=plan["dynamodb_region"].value,
+                    endpoint_url=plan["dynamodb_endpoint"].value,
                 )
-                await store.initialize()
+                await store.initialize(create=auto_create)
             except Exception as e:
                 logger.warning("quota persistence init failed (non-fatal): %s", e)
                 store = None
@@ -416,7 +522,8 @@ def setup_quota(
 
             # Seed Redis from DynamoDB if requested
             try:
-                restored = await store.seed_redis(redis, registry)
+                restored = await store.seed_redis(redis, registry,
+                                                  keyspace=keyspace)
                 if restored:
                     logger.info("seeded %d quota counters from DynamoDB", restored)
             except Exception as e:
@@ -452,13 +559,20 @@ def setup_quota(
         # ResourceNotFoundException at their FIRST auth webhook, in production. It stayed
         # invisible for the most instructive reason (D-78): the only thing that had ever
         # exercised it was a fake — and a fake never notices, because a fake creates nothing.
+        # GATE-06/T-17 — DELIBERATE ASYMMETRY, on the record: this block is UNWRAPPED
+        # (fatal) while the activation path below degrades. The ledger runs only when the
+        # consumer EXPLICITLY wired it (opt-in via app.state.quota_handler_ledger + a ddb
+        # client); a wired-but-broken ledger silently degrading is exactly the D-82 incident
+        # again. The activation store may degrade because it has a machine-checked Redis
+        # fallback; the ledger has none.
         _ledger = getattr(_app.state, "quota_handler_ledger", None)
         if (_ledger is not None and hasattr(_ledger, "ensure_table")
                 and getattr(_ledger, "ddb", None) is not None):
-            await _ledger.ensure_table()
+            await _ledger.ensure_table(create=auto_create)
             await _preflight_ddb_store(
                 _app, config, _ledger, cap_key="ddb_handler_ledger",
-                table=_ledger.table, ttl_attr="ttl")
+                table=_ledger.table, ttl_attr="ttl",
+                required_gsis=("gsi1", "gsi2"))  # query_by_user / query_by_status (ENV-16)
 
         # Start heartbeat monitor if paid-tier wired one up
         heartbeat_task = None
@@ -539,7 +653,7 @@ def setup_quota(
                 caps_now = dict(getattr(_app.state, "quota_capabilities", {}) or {})
                 try:
                     client = next(iter(ddb_targets.values()))[0]
-                    tables = {k: (t, a) for k, (_c, t, a) in ddb_targets.items()}
+                    tables = {k: (t, a) for k, (_c, t, a, _g) in ddb_targets.items()}
                     ddb_caps, ddb_unsafe = await verify_ddb_tables(
                         client, tables, pitr_confirmed=pitr_confirmed_from(config))
                 except Exception as e:
@@ -598,7 +712,7 @@ def setup_quota(
         # (`/billing/{org}/tier/limits`) reflect the consumer's actual limits
         # instead of library defaults. Best-effort.
         service_name = _resolve_service_name(config, registry)
-        if service_name and enable_paid:
+        if service_name and enable_paid and not offline:
             await _publish_tier_catalog(
                 service_name, tiers, registry=registry, bundles=bundles,
             )
@@ -659,7 +773,7 @@ def setup_quota(
         # Best-effort: failures log a warning, never block startup.
         try:
             from . import auth_events as _ae
-            if _ae.registered_event_types():
+            if _ae.registered_event_types() and not offline:
                 async def _do_subscribe():
                     try:
                         await _ae.subscribe_on_startup()
@@ -723,6 +837,31 @@ def setup_quota(
 # Internal builders
 # ---------------------------------------------------------------------------
 
+def resolve_bridge_identity(config) -> tuple:
+    """Bridge mode's REQUIRED identity — ONE resolver spec shared by boot
+    (`_setup_quota_bridge`) and preflight (T-12 §2.5: never two chains).
+    Returns the two Resolved rows; raises QuotaConfigError 007/008."""
+    mesh_key_row = resolve_dependency(
+        config, name="mesh API key (bridge mode)", config_key="(env-only)",
+        env=("AB0T_MESH_API_KEY",), requirement=Requirement.REQUIRED, secret=True,
+        code="QUOTA-CFG-007",
+        previously=lambda: ("versions before 0.7 booted anyway; every quota op then "
+                            "FAILED CLOSED (deny, 429) at request time"),
+        remedy="export AB0T_MESH_API_KEY — bridge mode cannot enforce without it.",
+        docs_anchor="bridge",
+    )
+    service_row = resolve_dependency(
+        config, name="service name (bridge mode)", config_key="service_name",
+        env=("AB0T_SERVICE_NAME",), requirement=Requirement.REQUIRED,
+        code="QUOTA-CFG-008",
+        previously=lambda: ("versions before 0.7 booted anyway; every quota op then "
+                            "FAILED CLOSED (deny, 429) at request time"),
+        remedy="set service_name in quota-config.json (or export AB0T_SERVICE_NAME).",
+        docs_anchor="bridge",
+    )
+    return mesh_key_row, service_row
+
+
 def _setup_quota_bridge(
     app: FastAPI,
     *,
@@ -745,18 +884,12 @@ def _setup_quota_bridge(
     from .bridge import BridgeClient, BridgeContext
     from .caches import CachedBridgeClient
 
-    mesh_key = os.getenv("AB0T_MESH_API_KEY", "")
-    if not mesh_key:
-        logger.error("bridge mode requires AB0T_MESH_API_KEY — quota ops will fail-open")
-
-    service_name = (
-        os.getenv("AB0T_SERVICE_NAME")
-        or config.get("service_name")
-        or ""
-    )
-    if not service_name:
-        logger.error("bridge mode requires service_name (config.service_name or "
-                     "AB0T_SERVICE_NAME env) — quota ops will fail-open")
+    # T-20 (ENV-01 class, bridge branch): bridge mode HARD-REQUIRES its mesh
+    # identity. Booting without it shipped a service whose every quota op
+    # failed closed (deny, 429) at request time — an outage with extra steps.
+    mesh_key_row, service_row = resolve_bridge_identity(config)
+    mesh_key = mesh_key_row.value
+    service_name = service_row.value
 
     tier_cfg = config.get("tier_provider", {})
     cache_cfg = config.get("bridge_cache", {})
@@ -1102,6 +1235,21 @@ def _emit_capabilities_snapshot(app, engine, config, *, enable_paid: bool) -> di
     caps.setdefault("outbox", "none" if not enable_paid else "unknown")
     caps.setdefault("billing", "OFF (paid disabled)" if not enable_paid else "unknown")
 
+    # K-9: the active counter key shape + migration phase, from the one boot
+    # read (app.state.quota_keyspace_state) — operators must be able to SEE
+    # which shape a live process reads/writes.
+    ksstate = getattr(app.state, "quota_keyspace_state", None)
+    if ksstate is not None:
+        caps["keyspace"] = (
+            f"v{ksstate['version']}"
+            + ("+dual" if ksstate["dual_write"] else "")
+            + f"(phase={ksstate['migration_phase']})")
+    else:
+        ksobj = getattr(app.state, "quota_keyspace", None)
+        if ksobj is not None:
+            caps.setdefault("keyspace", f"v{ksobj.version}"
+                            + ("+dual" if ksobj.dual_write else ""))
+
     # D-40: activation mode is a real, readable value — never `unknown(owned:…)`.
     # The durable-store detail is reported separately as `activation_store` by the
     # reconciler block (D-39); this field is the on/off rollback toggle.
@@ -1143,7 +1291,8 @@ _MONEY_CRITICAL_CAPS = ("billing", "reconciler")
 #:   counter_evictions_observed (D-80) — the FACT, not the policy: a server that has ALREADY
 #:                                    evicted keys passes every policy check we own, while an
 #:                                    evicted gauge sits UNDER-counted in the counter.
-_INFRA_CRITICAL_CAPS = ("redis_topology", "counter_eviction_policy", "redis_scripting",
+_INFRA_CRITICAL_CAPS = ("redis_reachable", "redis_topology",
+                        "counter_eviction_policy", "redis_scripting",
                         "counter_evictions_observed")
 
 #: Every capability the probe judges. Ordered: money first, then infrastructure.
@@ -1203,8 +1352,14 @@ def required_money_loops(config: dict, *, enable_paid: bool) -> set:
     # it): if the counter lives on Redis, that Redis's invariants MUST be re-verified — and a
     # required-but-absent loop degrades /quota/health. Turning the reconciler off is now a
     # visible, on-the-record degradation, not a quiet loss of the guarantee.
-    storage = config.get("storage", {}) or {}
-    if storage.get("redis_url") or _os.getenv("QUOTA_REDIS_URL") or _os.getenv("REDIS_URL"):
+    # One resolution path (T-1/ENV-09): the same resolver the connection was
+    # built from — OPTIONAL here so tier-less/store-less configs can still ask.
+    # No generic env is consulted; an undeclared store creates no requirement.
+    row = resolve_dependency(
+        config, name="Redis counter store URL", config_key="storage.redis_url",
+        env=("QUOTA_REDIS_URL",), requirement=Requirement.OPTIONAL,
+    )
+    if row.declared:
         required.add("preflight_reverification")
     return required
 
@@ -1406,6 +1561,16 @@ def _register_capability_routes(app) -> None:
         app.add_api_route("/quota/health", _health, methods=["GET"])
 
 
+def _plan_ddb_values(app, config):
+    """(region, endpoint) from the setup ResolutionPlan; direct callers (tests,
+    tools) without a plan resolve the same specs — one resolution path, never
+    an ambient read (T-1). region None defers to the AWS SDK's own chain."""
+    plan = getattr(getattr(app, "state", None), "quota_resolution_plan", None)
+    if plan is not None and "dynamodb_region" in plan:
+        return plan["dynamodb_region"].value, plan["dynamodb_endpoint"].value
+    return resolve_ddb_region(config).value, resolve_ddb_endpoint(config).value
+
+
 async def _provision_activation_store(app, engine, *, redis, config, storage, injected):
     """D-39 — resolve a DURABLE activation ledger and set it on the engine. The
     ledger is authoritative for IDENTITY and COST (D-33); it must not live in an
@@ -1427,7 +1592,9 @@ async def _provision_activation_store(app, engine, *, redis, config, storage, in
     table = act_cfg.get("ddb_table", "ab0t_quota_activations")
 
     # (1) Prefer DDB — a real durable store for identity+cost.
-    if store_pref != "redis":
+    if store_pref != "redis" and offline_mode(config):
+        logger.warning("offline mode: activation-ledger DDB self-provision SKIPPED — using Redis under the durability machine-check")
+    if store_pref != "redis" and not offline_mode(config):
         from .activations import DDBActivationStore, connect_ddb_activation_store
         ddb_close = None
         try:
@@ -1435,17 +1602,19 @@ async def _provision_activation_store(app, engine, *, redis, config, storage, in
             if override is not None:
                 store = DDBActivationStore(override, table_name=table)
             else:
-                region = storage.get("dynamodb_region", _os.getenv("AWS_REGION", "us-east-1"))
-                endpoint = _os.getenv("DYNAMODB_ENDPOINT") or None
+                region, endpoint = _plan_ddb_values(app, config)
                 store, ddb_close = await connect_ddb_activation_store(
                     region=region, endpoint_url=endpoint, table_name=table)
-            await store.ensure_table()   # includes the GSI-ACTIVE wait
+            # T-6/D-3 call-site policy: creation only under the explicit opt-in.
+            await store.ensure_table(
+                create=bool((config.get("storage") or {}).get("auto_create_tables", False)))
             # D-76: the ledger is authoritative for identity + cost (D-33) and lives in a
             # table nobody ever checked. Verify it (ACTIVE, GSIs ACTIVE, TTL on the attribute
             # we actually write, PITR on) and REFUSE to start if it is unsafe. Registered for
             # D-75 re-verification too — a table's config can change under us.
             await _preflight_ddb_store(app, config, store, cap_key="ddb_activations",
-                                       table=table, ttl_attr="ttl")
+                                       table=table, ttl_attr="ttl",
+                                       required_gsis=("GSI1",))  # open-rows scan
             engine._activation_store = store
             logger.info("activation ledger on DDB (durable) table=%s", table)
             return ddb_close
@@ -1464,6 +1633,50 @@ async def _provision_activation_store(app, engine, *, redis, config, storage, in
     from .activations import RedisActivationStore
     engine._activation_store = RedisActivationStore(redis)
     return None
+
+
+async def _gate_redis_reachable(app, redis, config, plan) -> None:
+    """GT T1/T2 — PING, classified, BEFORE any other gate. The capability is
+    written before the refusal so /quota/capabilities and /quota/health show
+    the cause. D-2: bounded retry (storage.connect_retry_seconds, default 30s,
+    0 = fail immediately) absorbs transient boot blips — for the UNREACHABLE
+    kind only; auth/ACL failures do not heal by waiting."""
+    import asyncio as _aio
+    import time as _t
+
+    from .redis_preflight import (
+        PROBE_FAILED_CAP, REACHABLE_OK, check_redis_reachable, reachability_error,
+    )
+    from .resolve import redact_url
+
+    storage_cfg = (config or {}).get("storage", {}) or {}
+    budget = float(storage_cfg.get("connect_retry_seconds", 30))
+    deadline = _t.monotonic() + max(0.0, budget)
+    delay = 0.5
+    while True:
+        ok, kind, detail = await check_redis_reachable(redis, timeout=5.0)
+        if ok:
+            break
+        if kind == "unreachable" and _t.monotonic() + delay <= deadline:
+            logger.warning("declared Redis unreachable — retrying within the D-2 "
+                           "budget (%.0fs): %s", budget, detail)
+            await _aio.sleep(delay)
+            delay = min(delay * 2, 5.0)
+            continue
+        caps = dict(getattr(app.state, "quota_capabilities", {}) or {})
+        caps["redis_reachable"] = f"{PROBE_FAILED_CAP} [{kind}: {detail}]"
+        app.state.quota_capabilities = caps
+        row = plan["redis_url"]
+        err = reachability_error(kind, detail,
+                                 url_display=redact_url(row.value or ""),
+                                 source=row.source)
+        logger.error("DECLARED REDIS UNREACHABLE/UNAUTHENTICATED (GT T1) — "
+                     "refusing to start: %s", err)
+        raise err
+    caps = dict(getattr(app.state, "quota_capabilities", {}) or {})
+    caps["redis_reachable"] = REACHABLE_OK
+    app.state.quota_capabilities = caps
+    logger.info("redis reachability verified (GT T1): PING ok")
 
 
 async def _gate_redis_topology(app, redis, config) -> None:
@@ -1494,7 +1707,13 @@ async def _gate_redis_topology(app, redis, config) -> None:
     if topo == SINGLE_NODE:
         logger.info("redis topology verified (D-71): %s", detail)
         return
-    logger.error("REDIS TOPOLOGY UNSUPPORTED/UNVERIFIED (D-71) — refusing to start: %s", detail)
+    from .topology import PROBE_FAILED
+    if topo == PROBE_FAILED:
+        # GT T4: a failed probe refuses as REACHABILITY (never a topology verdict)
+        logger.error("REDIS PROBE FAILED (reachability/credentials) — refusing "
+                     "to start: %s", detail)
+    else:
+        logger.error("REDIS TOPOLOGY UNSUPPORTED/UNVERIFIED (D-71) — refusing to start: %s", detail)
     raise topology_error(topo, detail)
 
 
@@ -1580,7 +1799,7 @@ def _ddb_client_of(store):
 
 
 async def _preflight_ddb_store(app, config, store, *, cap_key: str, table: str,
-                               ttl_attr: str) -> None:
+                               ttl_attr: str, required_gsis: tuple = ()) -> None:
     """D-76 boot gate + D-75 registration for one provisioned DDB store."""
     client = _ddb_client_of(store)
     if client is None:
@@ -1590,16 +1809,17 @@ async def _preflight_ddb_store(app, config, store, *, cap_key: str, table: str,
         logger.info("DDB preflight skipped for %s: the store exposes no DynamoDB client "
                     "(consumer-injected store)", cap_key)
         return
-    _register_ddb_preflight_target(app, cap_key, client, table, ttl_attr)
-    await _gate_ddb_stores(app, config, clients={cap_key: (client, table, ttl_attr)})
+    _register_ddb_preflight_target(app, cap_key, client, table, ttl_attr, required_gsis)
+    await _gate_ddb_stores(app, config,
+                           clients={cap_key: (client, table, ttl_attr, required_gsis)})
 
 
-def _register_ddb_preflight_target(app, cap_key: str, client, table: str, ttl_attr: str) -> None:
+def _register_ddb_preflight_target(app, cap_key: str, client, table: str, ttl_attr: str, required_gsis: tuple = ()) -> None:
     """D-75/D-76 — remember every DDB table we depend on, so the periodic re-verification
     (riding the reconciler loop) can re-check them too. A boot-time check that is never
     repeated is exactly the caveat D-75 exists to close."""
     targets = dict(getattr(app.state, "quota_ddb_preflight_targets", {}) or {})
-    targets[cap_key] = (client, table, ttl_attr)
+    targets[cap_key] = (client, table, ttl_attr, required_gsis)
     app.state.quota_ddb_preflight_targets = targets
 
 
@@ -1615,9 +1835,10 @@ async def _gate_ddb_stores(app, config, *, clients) -> None:
 
     caps = dict(getattr(app.state, "quota_capabilities", {}) or {})
     confirmed = pitr_confirmed_from(config)
-    for cap_key, (client, table, ttl_attr) in clients.items():
+    for cap_key, (client, table, ttl_attr, required_gsis) in clients.items():
         value, fatal, warn = await verify_ddb_table(
-            client, table, ttl_attribute=ttl_attr, pitr_confirmed=confirmed)
+            client, table, ttl_attribute=ttl_attr, pitr_confirmed=confirmed,
+            required_gsis=tuple(required_gsis))
         caps[cap_key] = value
         app.state.quota_capabilities = caps
         if warn:
@@ -1655,7 +1876,8 @@ async def _gate_redis_counter_store(app, redis, config) -> None:
     """
     from .redis_preflight import (
         check_redis_counter_eviction, check_redis_script_capability, check_redis_version,
-        counter_eviction_error, durability_confirmed_from, scripting_error, version_error,
+        counter_eviction_error, durability_confirmed_from, scripting_confirmed_from,
+        scripting_error, version_error,
     )
     caps = dict(getattr(app.state, "quota_capabilities", {}) or {})
 
@@ -1669,8 +1891,10 @@ async def _gate_redis_counter_store(app, redis, config) -> None:
         raise counter_eviction_error(detail)
     logger.info("counter eviction policy verified (D-72): %s", detail)
 
-    # --- D-73: scripting ---
-    script_ok, script_detail = await check_redis_script_capability(redis)
+    # --- D-73: scripting (T-9 hatch: assertion covers the unrunnable-probe
+    # case only; an observed Lua compile rejection is never overridable) ---
+    script_ok, script_detail = await check_redis_script_capability(
+        redis, confirmed=scripting_confirmed_from(config))
     caps["redis_scripting"] = script_detail if script_ok else f"OFF ({script_detail})"
     app.state.quota_capabilities = caps
     if not script_ok:
@@ -1736,22 +1960,27 @@ async def _resolve_outbox_durability(app, emitter, *, redis, config, storage, en
     # DDB blip is retried; an ABSENCE (retries exhausted) falls through — and, for
     # a paid service, ultimately stops startup. app.state.ddb_client is an OPTIONAL
     # override, never a precondition.
-    if store_pref != "redis":
+    if store_pref != "redis" and offline_mode(config):
+        logger.warning("offline mode: outbox DDB self-provision SKIPPED — "
+                       "falling to the Redis outbox under the durability machine-check")
+    if store_pref != "redis" and not offline_mode(config):
         for attempt in range(1, attempts + 1):
             try:
                 override = getattr(app.state, "ddb_client", None)
                 if override is not None:
                     store = DDBOutboxStore(override, table_name=ddb_table)
                 else:
-                    region = storage.get("dynamodb_region", _os.getenv("AWS_REGION", "us-east-1"))
-                    endpoint = _os.getenv("DYNAMODB_ENDPOINT") or None
+                    region, endpoint = _plan_ddb_values(app, config)
                     store, ddb_close = await connect_ddb_outbox_store(
                         region=region, endpoint_url=endpoint, table_name=ddb_table,
                     )
-                await store.ensure_table()   # includes the GSI-ACTIVE wait
+                # T-6/D-3 call-site policy: creation only under the explicit opt-in.
+                await store.ensure_table(
+                    create=bool((storage or {}).get("auto_create_tables", False)))
                 # D-76: the outbox holds MONEY events nothing can reconstruct. Same gate.
                 await _preflight_ddb_store(app, config, store, cap_key="ddb_outbox",
-                                           table=ddb_table, ttl_attr="ttl")
+                                           table=ddb_table, ttl_attr="ttl",
+                                           required_gsis=("gsi_status",))  # drain scan
                 emitter.set_outbox_store(store)
                 durable, detail = True, "DDB"
                 break
@@ -1814,9 +2043,10 @@ async def _resolve_outbox_durability(app, emitter, *, redis, config, storage, en
         f"enable_paid=True but NO durable outbox store is available ({detail}). A paid service that "
         f"cannot durably record billing must not start (D-34): serving billable workloads for free "
         f"is the leak, not availability. Fix: make DDB reachable (outbox.store=ddb + DYNAMODB "
-        f"endpoint/creds, or app.state.ddb_client), or provide a durable Redis (persistence + a "
-        f"non-evicting policy, or outbox.redis_durability_confirmed=true), or set "
-        f"outbox.allow_ephemeral=true to start with billing DISABLED (dev only)."
+        f"endpoint/creds, or app.state.ddb_client; on a FRESH environment also pre-create the "
+        f"outbox table or opt in with storage.auto_create_tables=true, T-6), or provide a durable "
+        f"Redis (persistence + a non-evicting policy, or outbox.redis_durability_confirmed=true), "
+        f"or set outbox.allow_ephemeral=true to start with billing DISABLED (dev only)."
     )
 
 
@@ -2056,7 +2286,12 @@ def _wire_paid_tier_sync(
                 or os.getenv("AB0T_MESH_API_KEY", "")
             )
             mesh_api_key = os.getenv("AB0T_MESH_API_KEY", "") or billing_api_key
-            auth_url_for_pin = os.getenv("AB0T_AUTH_AUTH_URL", "") or os.getenv("AUTH_SERVICE_URL", "")
+            # T-1/ENV-08: declared/namespaced only — the generic AUTH_SERVICE_URL
+            # read is gone. Unset ⇒ the PIN path is off (logged in the plan).
+            auth_url_for_pin = resolve_dependency(
+                config, name="auth service URL (tier-pinning)", config_key="auth.url",
+                env=("AB0T_AUTH_AUTH_URL",), requirement=Requirement.OPTIONAL,
+            ).value or ""
 
             default_handler = _ae._build_default_credit_grant_handler(
                 initial_credits=legacy_initial_credits,

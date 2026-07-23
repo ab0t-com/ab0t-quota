@@ -68,14 +68,15 @@ class LifecycleEmitter:
         outbox_store: Any = None,
         settlement_client: Any = None,
     ):
-        # Topic ARN: prefer the mesh-namespaced name (consumer-facing
-        # convention from setup_quota); fall back to the legacy name for
-        # backward compat with services on older configs.
-        self._topic_arn = (
-            sns_topic_arn
-            or os.getenv("AB0T_MESH_SNS_LIFECYCLE_TOPIC_ARN")
-            or os.getenv("SNS_LIFECYCLE_TOPIC_ARN")
-        )
+        # Topic ARN via the one resolver (T-4/ENV-06): kwarg > namespaced env >
+        # the library's OWN legacy name (documented TRANSITION — resolver warns
+        # loudly; removing it outright would silently stop money events).
+        from ..resolve import resolve_sns_topic
+        _row = resolve_sns_topic(None, kwarg=sns_topic_arn)
+        self._topic_arn = _row.value
+        if self._topic_arn is None:
+            logger.info("lifecycle SNS publishing OFF (no sns_topic_arn kwarg, no "
+                        "AB0T_MESH_SNS_LIFECYCLE_TOPIC_ARN) — events will not be published")
         self._endpoint = aws_endpoint_url or os.getenv("AWS_ENDPOINT_URL")
         self._client = None
 

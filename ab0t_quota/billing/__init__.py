@@ -24,7 +24,7 @@ from __future__ import annotations
 from .clients import PaymentServiceClient, PaymentServiceError, BillingServiceClient, BillingServiceError
 from .models import RecordUsageRequest, UsageMetadata
 from .lifecycle import LifecycleEmitter
-from .budget import BudgetChecker
+from .budget import BudgetChecker, PricingAmbiguousError, PricingNotDeclaredError
 from .heartbeat import HeartbeatMonitor
 from .config import load_pricing
 from .auth_helpers import (
@@ -55,6 +55,8 @@ __all__ = [
     "UsageMetadata",
     "LifecycleEmitter",
     "BudgetChecker",
+    "PricingAmbiguousError",
+    "PricingNotDeclaredError",
     "HeartbeatMonitor",
     "load_pricing",
     "make_reader_dep",

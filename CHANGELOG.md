@@ -1,5 +1,132 @@
 # Changelog
 
+## [0.6.3] — DECLARED, NOT DISCOVERED
+
+### THE CONFIG IS KING — end-customer messages are config-driven
+
+**Behaviour change, no action required** (ticket 20260722, D-CK-1…D-CK-5).
+
+* `messages.py` no longer carries **any** consumer's vocabulary. The two
+  lookup tables are DELETED: `ACTION_HINTS` (copy keyed on sandbox-platform's
+  resource keys) and `UPGRADE_TIER_MAP` (a fixed free → Starter → Pro →
+  Enterprise ladder). A consumer whose plans are `free`/`pro` was previously
+  told to *"upgrade to Starter"* — a plan that does not exist in their product
+  — and got a dangling *"Or"* when no ladder row matched.
+* The upgrade prompt now names **the next tier in YOUR OWN `tiers[]`**, found
+  by `sort_order` and printed as its `display_name`, and only when that tier
+  genuinely grants more of the resource in question. No higher tier ⇒ **the
+  clause is omitted entirely**; the sentence reads correctly with and without
+  it. The tier's own `upgrade_url` is rendered as the CTA.
+* **New optional resource field `action_hint`** — end-customer remediation
+  copy shown in 429 responses ("Archive a project to free up a slot."),
+  distinct from `description` (admin-facing prose). Absent ⇒ the sentence is
+  omitted rather than invented.
+* Units **pluralise**: `1 widget` / `2 widgets` (was `1 widgets`). Declare
+  `unit` in its plural form; the library prints the singular at exactly one.
+* **Thresholds are config everywhere**: `QuotaState.severity` and the warning
+  wording now read the configured `warning_threshold`/`critical_threshold`,
+  the same values the enforcement path already used. A consumer with custom
+  thresholds previously got correct enforcement beside a wrong severity.
+* Copy lives in an overridable `Templates` dataclass (the shape the Go runtime
+  had from day one). There is deliberately **no `messages` config section**
+  (D-CK-2): config supplies the facts, the library owns the sentence.
+* `quota-config.example.json` is rebuilt around **neutral generic-SaaS
+  vocabulary** with a populated, annotated `resources[]` section (every
+  `counter_type` demonstrated once), plus `engine_mode`, `shadow_mode`, burst,
+  thresholds and per-user sub-quotas shown doing real work. It previously
+  declared **zero resources** while its tier limits referenced `sandbox.*`
+  keys it never defined — it only "worked" because the library had been taught
+  that one consumer's vocabulary.
+* **Permanent control:** the key/const census now forbids any
+  consumer-specific identifier — resource key, tier name, service name — from
+  library LOGIC (`tests/test_declared_not_discovered_20260721.py`, D-CK-5).
+
+
+**⚠️ Breaking, action-required — shipped as a PATCH by operator decision.**
+D-1 originally set this release at `0.7.0` on this file's own stated policy
+("a change that requires you to do something to keep working is at least a
+MINOR"). The operator — who owns publishing and was given an explicit veto on
+that point — chose a patch bump, consistent with standing practice for this
+library. **The version number is therefore NOT a reliable signal of breakage
+for this release; the migration note is.** Recorded in DECISIONS.md D-1
+(amended). Note that consumers install `git+…@main`, so no version number
+reaches them today either way — see the pinned-releases follow-up.
+**Read `docs/migrating-from-ambient-resolution.md`
+before upgrading** and run the new `python -m ab0t_quota preflight` in CI —
+it reproduces every startup verdict read-only, before any deploy.
+
+* The library resolves every dependency from **declared sources only**
+  (config / namespaced `QUOTA_*`/`AB0T_*` env). Generic `REDIS_URL`,
+  `REDIS_PASSWORD`, `STRIPE_WEBHOOK_SECRET`, `AUTH_SERVICE_URL` are **never
+  read**; a leftover generic name logs a startup ERROR naming the
+  replacement. No value is ever invented (no `redis://localhost:6379/0`, no
+  default region, no default tier catalog).
+* Missing `quota-config.json`, missing `tiers`, undeclared
+  `storage.redis_url` (local/byo_redis): **fatal, typed errors**
+  (QUOTA-CFG-001…006) naming the fix and what pre-0.7 would have used.
+* Config is schema-validated before any I/O; `null` ≠ absent ≠ invalid;
+  unknown/mistyped storage keys are errors; custom `storage.redis_key_prefix`
+  is refused (announced in 0.6.x; was silently ignored).
+* **Table creation is opt-in**: `storage.auto_create_tables` (default false).
+  Existing environments unaffected; fresh deploys pre-create or opt in. All
+  self-created tables are tagged. Pre-0.7 self-created handler-ledger tables
+  must add `gsi1`/`gsi2` online before upgrading (they now refuse boot).
+* Startup logs the RESOLVED DEPENDENCIES plan (with provenance, secrets
+  redacted) and the OUTBOUND TARGETS inventory before contacting anything;
+  `AB0T_QUOTA_OFFLINE=true` boots contacting nothing (dev/CI).
+* The Stripe webhook route mounts/verifies only with
+  `AB0T_QUOTA_STRIPE_WEBHOOK_SECRET`; unset ⇒ loud refusal (was: silently
+  used the generic name — a co-deployed service's secret 400s every webhook
+  and credit grants never land).
+* Bridge mode hard-requires `AB0T_MESH_API_KEY` + `service_name`
+  (QUOTA-CFG-007/008). Bridge tier/usage reads never invent `"free"`: a
+  billing outage raises a typed `BridgeUnavailableError` (default,
+  fail-closed) or reports tier UNKNOWN under `AB0T_QUOTA_BRIDGE_FAIL_OPEN`.
+* The 2026-07-21 incident's fix: an unreachable or unauthenticated Redis now
+  refuses with a typed reachability error naming the credential/network cause
+  and WHICH declared source supplied the URL — never a Redis Cluster topology
+  verdict (the misdiagnosis that opened the incident is structurally
+  impossible; no `*_confirmed_*` assertion masks it). Transient boot blips are
+  absorbed by a bounded retry (`storage.connect_retry_seconds`, default 30s,
+  0 = immediate); auth failures never consume the budget. Topology is now
+  probed primarily on the DATA PLANE (a multi-key op in the library's own
+  keyspace), so a least-privilege ACL user needs no `INFO`/`CLUSTER`/`CONFIG`
+  privileges — see docs/requirements.md for the minimal ACL.
+* New: `python -m ab0t_quota preflight` (`check` alias) — schema, resolved
+  plan + provenance, every startup gate read-only, exit codes separating
+  config (2) / gate refusal (1) / unreachable-or-credentials (3).
+  `--check-mesh` is opt-in and read-only; the only server-visible write is
+  the counter's SCRIPT LOAD (skippable).
+* New operator assertions: `storage.redis_scripting_confirmed` (D-73's hatch
+  for an unrunnable SCRIPT probe — never overrides a rejected script);
+  documented provider notes for CONFIG-less managed Redis.
+* New CLI verbs (names are contract, shared with Go's `quotactl`;
+  `docs/cli.md`): **`doctor`** — grades production POSTURE (persistence
+  behind assertions, PITR asserted-not-observed, eviction facts, ACL/IAM
+  breadth, encryption, retention) over the same evaluators boot uses,
+  reports what it could not check as `not_checked`, `--json` extends
+  `preflight-report/v1` with a posture section; **`provision`** — emits
+  conforming infra artifacts (`--emit compose|terraform|acl|iam`) generated
+  from the enforcing gate registry, or `--local` for one verified local dev
+  Redis. Never creates cloud resources.
+* New `storage` keys (schema-strict, all optional): `connect_retry_seconds`
+  (D-2 boot-retry budget, default 30); `keyspace_version` /
+  `keyspace_dual_write` — counter key shape v1/v2 + migration dual-write.
+  **Defaults are v1 / no-dual: an existing consumer changing nothing is
+  unaffected.** Declaring v2/dual is refused by `setup_quota` until the
+  setup wiring lands (`docs/keyspace.md`); boot guards QUOTA-CFG-011/012
+  protect a migrated keyspace either way.
+* `QUOTA-CFG-nnn` is now ONE registry shared byte-identically with the Go
+  runtime (`conformance/quota-cfg-registry.json`, D-13); every code is
+  documented with its remedy in `docs/error-codes.md`.
+* Billing mesh API: tier-limit reads and per-org overrides accept
+  `?service=` — an override can bind to one mesh service; omitted stays
+  org-wide (pre-existing overrides keep their org-wide meaning). See
+  `docs/mesh-quota-api.md`.
+* New docs: `docs/requirements.md` (the prerequisites contract),
+  `docs/migrating-from-ambient-resolution.md` (self-audit + renames),
+  `docs/cli.md`, `docs/error-codes.md`, `docs/keyspace.md`.
+
 ## [0.6.2] — 2026-07-13
 
 ### ⚠️ Breaking (bridge mode) — bridge now FAILS CLOSED by default

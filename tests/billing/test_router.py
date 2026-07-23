@@ -488,9 +488,14 @@ class TestStripeWebhookProxySignatureVerify:
         assert r.status_code == 200, r.text
         assert r.json() == {"ok": True}
 
-    def test_fallback_secret_env_var(self, webhook_secret, signed_event_payload, monkeypatch):
-        """STRIPE_WEBHOOK_SECRET fallback works when AB0T_QUOTA_STRIPE_WEBHOOK_SECRET
-        isn't set (dev/local convenience path)."""
+    def test_generic_fallback_secret_no_longer_read(
+            self, webhook_secret, signed_event_payload, monkeypatch):
+        """REPLACES test_fallback_secret_env_var (T-4/ENV-05, pack 20260721):
+        the old test encoded the DEFECT — the generic STRIPE_WEBHOOK_SECRET
+        (the payment service's convention) verifying this route's webhooks.
+        The generic name is no longer read: a request signed with it must be
+        refused as UNCONFIGURED. Companion contract test:
+        tests/test_phase2_ambient_20260721.py::test_stripe_secret_not_harvested."""
         monkeypatch.delenv("AB0T_QUOTA_STRIPE_WEBHOOK_SECRET", raising=False)
         monkeypatch.setenv("STRIPE_WEBHOOK_SECRET", webhook_secret)
 
@@ -514,7 +519,9 @@ class TestStripeWebhookProxySignatureVerify:
             content=payload,
             headers={"Stripe-Signature": header},
         )
-        assert r.status_code == 200, r.text
+        assert r.status_code == 500, r.text
+        assert "config error" in r.text.lower(), \
+            "generic-secret-signed webhook must be refused as unconfigured"
 
     def test_namespaced_env_var_takes_precedence(
         self, webhook_secret, signed_event_payload, monkeypatch,

@@ -15,32 +15,45 @@ class RateCounter(Counter):
     TTL: auto-pruned on each read/write (entries older than window)
     """
 
-    def __init__(self, redis, org_id: str, resource_key: str, window_seconds: int):
-        super().__init__(redis, org_id, resource_key)
+    def __init__(self, redis, org_id: str, resource_key: str, window_seconds: int,
+                 keyspace=None):
+        super().__init__(redis, org_id, resource_key, keyspace=keyspace)
         self._window = window_seconds
 
     @property
     def _redis_key(self) -> str:
-        return f"{self._key_prefix}:rate"
+        return self._ks.rate_key(self._org_id, self._resource_key)
+
+    def _redis_key2(self):
+        """Secondary-shape window during dual-write, else None. Rate windows
+        are dual-WRITTEN, never copied — the flip gate outwaits the window
+        (keyspace spec §6.1), so no member-copy and no doubled burst."""
+        if not self._sv:
+            return None
+        return self._ks.rate_key(self._org_id, self._resource_key, version=self._sv)
 
     async def get(self) -> float:
         now = time.time()
         cutoff = now - self._window
         await self._redis.zremrangebyscore(self._redis_key, "-inf", cutoff)
+        if self._sv:
+            await self._redis.zremrangebyscore(self._redis_key2(), "-inf", cutoff)
         count = await self._redis.zcard(self._redis_key)
         return float(count)
 
     async def increment(self, delta: float, idempotency_key: Optional[str] = None) -> float:
         now = time.time()
         cutoff = now - self._window
+        keys = [self._redis_key] + ([self._redis_key2()] if self._sv else [])
 
         pipe = self._redis.pipeline()
-        pipe.zremrangebyscore(self._redis_key, "-inf", cutoff)
-        # Add `delta` entries (usually 1) with current timestamp
         member = idempotency_key or f"{now}:{id(self)}"
-        for i in range(int(delta)):
-            pipe.zadd(self._redis_key, {f"{member}:{i}": now})
-        pipe.expire(self._redis_key, self._window + 60)  # TTL safety margin
+        for key in keys:
+            pipe.zremrangebyscore(key, "-inf", cutoff)
+            # Add `delta` entries (usually 1) with current timestamp
+            for i in range(int(delta)):
+                pipe.zadd(key, {f"{member}:{i}": now})
+            pipe.expire(key, self._window + 60)  # TTL safety margin
         pipe.zcard(self._redis_key)
         results = await pipe.execute()
         return float(results[-1])
@@ -50,6 +63,8 @@ class RateCounter(Counter):
 
     async def reset(self, value: float = 0.0) -> None:
         await self._redis.delete(self._redis_key)
+        if self._sv:
+            await self._redis.delete(self._redis_key2())
 
     async def seconds_until_slot(self) -> Optional[int]:
         """Seconds until the oldest entry expires (for retry_after header)."""

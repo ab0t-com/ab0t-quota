@@ -5,6 +5,22 @@ description: Diagnose and fix ab0t-quota issues in production. Use when debuggin
 
 # Quota Troubleshooting
 
+## First moves: `preflight`, then `doctor`
+
+Before hand-diagnosing, let the library reproduce its own verdicts:
+
+```bash
+python -m ab0t_quota preflight   # "would this boot?" — every startup gate,
+                                 # read-only; exit 2=config, 1=gate, 3=unreachable
+python -m ab0t_quota doctor      # "is this production-grade?" — grades posture
+                                 # (persistence, PITR, eviction facts, ACL breadth);
+                                 # says what it could NOT check and why
+```
+
+A startup refusal always carries a `QUOTA-CFG-nnn` code — look it up in
+`docs/error-codes.md` (one registry for both the Python and Go runtimes);
+each code has a remedy. Full flag reference: `docs/cli.md`.
+
 ## Quick Diagnosis
 
 **"User is getting 429 but shouldn't be"**
@@ -120,11 +136,11 @@ aws dynamodb get-item --table ab0t_quota_state \
 Symptoms: Service logs "Quota engine not initialized" or quota endpoints return errors.
 
 Common causes:
-- **Redis unreachable**: Check `QUOTA_REDIS_URL` or `REDIS_URL` env var, verify Redis is running
+- **Redis unreachable**: Check the **declared** source — `storage.redis_url` in quota-config.json, or `QUOTA_REDIS_URL`. The library never reads the generic `REDIS_URL` (0.7). The startup log's RESOLVED DEPENDENCIES block names which source won — quote it in any support request. Then verify that Redis is running.
 - **DynamoDB permission denied**: Check IAM policy has access to `ab0t_quota_state` table
 - **Config file parse error**: Check `QUOTA_CONFIG_PATH` or `quota-config.json` for JSON syntax errors
 
-The engine is designed to be non-fatal: if DynamoDB persistence fails, Redis-only mode continues. If Redis fails, the engine doesn't start and enforcement is skipped (fail-open).
+If DynamoDB persistence fails, Redis-only mode continues (degraded, loudly). If Redis is unreachable or fails a startup machine-check (topology/eviction/scripting/version, D-71…D-74), `setup_quota` refuses to start — since 0.6.1 enforcement fails CLOSED and is never silently skipped.
 
 ## Emergency Kill Switch
 

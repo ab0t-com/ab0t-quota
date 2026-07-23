@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plans — hosted pricing page</title>
+<link rel="stylesheet" href="ab0t-quota-ui.css">
+<link rel="stylesheet" href="demo-page.css">
+<style>
+  .center { text-align: center; }
+  .center .lede { margin-left: auto; margin-right: auto; }
+  /* max-width + wrap: three fixed-width controls in an inline-flex row cannot
+     shrink, so on a narrow phone the group overflows the page. */
+  .segmented {
+    display: inline-flex; gap: 0; margin: var(--ab0t-s5) auto 0;
+    max-width: 100%; flex-wrap: wrap;
+    border: 1px solid var(--ab0t-border-strong);
+    border-radius: var(--ab0t-radius-sm); overflow: hidden;
+  }
+  .segmented .ctl { border: none; border-radius: 0; }
+  .segmented .ctl + .ctl { border-left: 1px solid var(--ab0t-border-strong); }
+  .faq { margin-top: var(--ab0t-s8); }
+  .faq dt { font-weight: 650; margin-top: var(--ab0t-s4); }
+  .faq dd { margin: var(--ab0t-s1) 0 0; color: var(--ab0t-fg-muted); font-size: 0.92rem; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="center" style="padding:var(--ab0t-s8) 0 var(--ab0t-s6)">
+    <p class="eyebrow">Hosted composition · pricing</p>
+    <h1>Choose the plan that fits.</h1>
+    <p class="lede">
+      Every plan, limit and feature on this page is read live from the tier catalog at
+      <code>GET /api/quotas/tiers</code>. Nothing is written into the page.
+    </p>
+
+    <div class="segmented" role="group" aria-label="Visitor state">
+      <button class="ctl" type="button" data-view="signed-in" aria-pressed="true">Signed in</button>
+      <button class="ctl" type="button" data-view="anonymous" aria-pressed="false">Anonymous</button>
+      <button class="ctl" type="button" data-view="single" aria-pressed="false">Single-plan product</button>
+      <button class="ctl" type="button" data-view="none" aria-pressed="false">No catalog</button>
+    </div>
+  </header>
+
+  <div id="plans"></div>
+
+  <p class="note" id="explain"></p>
+
+  <dl class="faq wrap-narrow">
+    <dt>Why does only one plan have a button?</dt>
+    <dd>
+      The tier contract has exactly one link per tier — <code>upgrade_url</code>, meaning "where to
+      go to upgrade <i>from</i> this plan". There is no per-plan checkout URL in the contract, so
+      the page puts the CTA where the contract actually supports one: on the plan the customer is
+      on. Inventing a link for every column would send people somewhere the consumer never
+      configured. Tracked as ticket T-15.
+    </dd>
+    <dt>Why are there no prices?</dt>
+    <dd>
+      <code>TierConfig</code> holds a <code>price</code> (amount, ISO code, period), but the
+      <code>/tiers</code> endpoint does not serialise it yet. The renderer already handles it — see
+      case K on the <a href="demo.html">proof harness</a> — and shows a price the moment a real
+      field carries one. It will never show a price the config did not supply. Ticket T-14.
+    </dd>
+    <dt>What happens with only one plan?</dt>
+    <dd>
+      One column, no comparison, no upgrade CTA and no invented second plan. Try the
+      "Single-plan product" view above.
+    </dd>
+  </dl>
+
+  <p class="note" style="margin-bottom:var(--ab0t-s8)">
+    <b>Fixture data.</b> This page talks to an in-page fake transport, not a live service.
+  </p>
+
+  <div class="toolbar" style="margin-bottom:var(--ab0t-s8)">
+    <button class="ctl" type="button" id="theme">Toggle theme</button>
+    <a class="ctl" href="showcase.html">← Showcase</a>
+  </div>
+
+</div>
+
+<script src="ab0t-quota-ui.js"></script>
+<script src="demo-fixtures.js"></script>
+<script>
+var F = AB0TDemo.fixtures, transport = AB0TDemo.transport;
+
+var VIEWS = {
+  'signed-in': {
+    usage: F.A_USAGE, tiers: F.A_TIERS,
+    note: 'Signed in on the lowest of three plans. The current column is ringed and chipped; the ' +
+          'CTA names the NEXT element of the catalog array — not a plan this SDK decided existed.'
+  },
+  'anonymous': {
+    usage: null, tiers: F.A_TIERS,
+    note: 'No session, so /usage 401s. The grid still renders every plan — it simply marks none as ' +
+          'current and offers no CTA, because with no current plan there is no upgrade to point at.'
+  },
+  'single': {
+    usage: F.D_USAGE, tiers: F.D_TIERS,
+    note: 'A product with exactly one plan. One column, no ladder, no CTA, and no second plan ' +
+          'conjured to fill the grid.'
+  },
+  'none': {
+    usage: F.C_USAGE, tiers: null,
+    note: 'Bridge mode: /tiers is not mounted (setup.py:989). The component renders NOTHING rather ' +
+          'than an empty pricing grid or an error — the rest of the page is still perfectly usable.'
+  }
+};
+
+var host = document.getElementById('plans');
+var explain = document.getElementById('explain');
+
+function show(key) {
+  var v = VIEWS[key];
+  host.__ab0tArea = null;            // fresh mount for the demo switch
+  while (host.firstChild) host.removeChild(host.firstChild);
+  AB0TQuotaUI.plans(host, { fetchImpl: transport(v.usage, v.tiers) });
+  explain.textContent = v.note;
+  document.querySelectorAll('[data-view]').forEach(function (b) {
+    b.setAttribute('aria-pressed', String(b.getAttribute('data-view') === key));
+  });
+}
+
+document.querySelectorAll('[data-view]').forEach(function (b) {
+  b.addEventListener('click', function () { show(b.getAttribute('data-view')); });
+});
+show('signed-in');
+
+document.getElementById('theme').addEventListener('click', function () {
+  var r = document.documentElement;
+  r.setAttribute('data-theme', r.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+</script>
+</body>
+</html>

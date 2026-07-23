@@ -91,6 +91,9 @@ AUDITED_SCRIPTS: dict[str, str] = {
     "activations._TRANSITION": activations_mod._TRANSITION,
     "handler_ledger.RedisLedgerStore._CAS_RECLAIM":
         handler_ledger_mod.RedisLedgerStore._CAS_RECLAIM,
+    # K-5: the migration backfill's seed-if-absent (keyspace spec §5 phase 2)
+    "keyspace_migration._SEED": __import__(
+        "ab0t_quota.keyspace_migration", fromlist=["_SEED"])._SEED,
 }
 
 
@@ -111,7 +114,15 @@ class TestLuaKeysAllDeclaredQI09:
         """COMPLETENESS NET: every `redis.call` in the ab0t_quota package source
         must be accounted for by the audited inventory above. If this fails, a
         Lua script was added (or grew a call) without being registered for the
-        QI-09 audit — register it in AUDITED_SCRIPTS."""
+        QI-09 audit — register it in AUDITED_SCRIPTS.
+
+        K-3 / D-KS-7 (tickets/20260721_keyspace_versioning/DECISIONS.md): the
+        counter scripts are COMPOSED from base._HELPERS (one home for the
+        dual-write law), so the shared helper block appears once in source but
+        once per composed script in the audited inventory. The identity is
+        composition-aware, and test_every_composed_script_is_registered closes
+        the helper-only-body corner the raw count could no longer see."""
+        from ab0t_quota.counters import base as base_mod
         pkg_dir = pathlib.Path(ab0t_quota.__file__).parent
         source_calls = 0
         per_file: dict[str, int] = {}
@@ -121,11 +132,35 @@ class TestLuaKeysAllDeclaredQI09:
                 per_file[str(py.relative_to(pkg_dir))] = n
                 source_calls += n
         audited_calls = sum(s.count("redis.call") for s in AUDITED_SCRIPTS.values())
-        assert audited_calls == source_calls, (
+        helper_calls = base_mod._HELPERS.count("redis.call")
+        composed = sum(1 for s in AUDITED_SCRIPTS.values() if base_mod._HELPERS in s)
+        assert composed > 0, "no audited script embeds base._HELPERS — wiring broken?"
+        expected = source_calls + (composed - 1) * helper_calls
+        assert audited_calls == expected, (
             f"redis.call count mismatch: audited scripts contain {audited_calls} "
-            f"call sites but the package source contains {source_calls} "
-            f"({per_file}). A Lua script is dodging the QI-09 audit — add it to "
-            "AUDITED_SCRIPTS in this file."
+            f"call sites but the package source accounts for {expected} "
+            f"(source={source_calls}, {composed} composed scripts sharing "
+            f"{helper_calls} helper calls; {per_file}). A Lua script is dodging "
+            "the QI-09 audit — add it to AUDITED_SCRIPTS in this file."
+        )
+
+    def test_every_composed_script_is_registered(self):
+        """D-KS-7 census: each `dual_lua(` composition site in package source
+        must map to a registered audited script — a composed script whose body
+        adds no redis.call of its own cannot dodge the audit."""
+        from ab0t_quota.counters import base as base_mod
+        pkg_dir = pathlib.Path(ab0t_quota.__file__).parent
+        sites = 0
+        for py in sorted(pkg_dir.rglob("*.py")):
+            src = py.read_text()
+            if py.name == "base.py":
+                continue  # the definition site, not a composition site
+            sites += len(re.findall(r"\bdual_lua\s*\(", src))
+        composed = sum(1 for s in AUDITED_SCRIPTS.values() if base_mod._HELPERS in s)
+        assert sites == composed, (
+            f"{sites} dual_lua() composition site(s) in source but {composed} "
+            "composed scripts registered in AUDITED_SCRIPTS — a composed script "
+            "is dodging the QI-09 audit (D-KS-7)."
         )
 
 

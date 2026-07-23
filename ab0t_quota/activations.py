@@ -325,14 +325,15 @@ class DDBActivationStore:
     def _ttl_epoch(self) -> int:
         return int(time.time()) + self._ttl
 
-    async def ensure_table(self, *, gsi_active_timeout_s: float = 60.0) -> None:
+    async def ensure_table(self, *, gsi_active_timeout_s: float = 60.0,
+                           create: bool = True) -> None:
         """Create the table + GSI1 (the ORGOPEN open-index) if absent (idempotent),
         then WAIT for both to report ACTIVE — so a self-provisioned DDB activation
         ledger works out of the box (D-39). Mirrors DDBOutboxStore.ensure_table.
         The wait matters in PRODUCTION: real DynamoDB backfills a GSI asynchronously,
         so a list_open right after a fresh create can silently miss OPEN rows until
         the index is ready (DDB Local makes it immediate, so no DDB-Local test
-        catches this)."""
+        catches this). `create=False` is the T-6/D-3 call-site policy."""
         try:
             await self._ddb.describe_table(TableName=self.table)
             await self._wait_gsi_active(gsi_active_timeout_s)
@@ -342,6 +343,11 @@ class DDBActivationStore:
                                 "ResourceNotFoundException", ())
             if not (isinstance(e, not_found) or "ResourceNotFound" in type(e).__name__):
                 raise  # a real error (perms, endpoint) — don't mask it
+        if not create:
+            raise RuntimeError(
+                f"activation ledger table {self.table} does not exist and "
+                f"storage.auto_create_tables is false (the default) — pre-create "
+                f"the table or set storage.auto_create_tables: true (ENV-04)")
         await self._ddb.create_table(
             TableName=self.table,
             KeySchema=[
@@ -363,6 +369,10 @@ class DDBActivationStore:
                 "Projection": {"ProjectionType": "ALL"},
             }],
             BillingMode="PAY_PER_REQUEST",
+            Tags=[
+                {"Key": "Service", "Value": "ab0t-quota"},
+                {"Key": "ManagedBy", "Value": "ab0t-quota-library"},
+            ],
         )
         logger.info("created activation ledger table %s (+ GSI1)", self.table)
         await self._wait_gsi_active(gsi_active_timeout_s)

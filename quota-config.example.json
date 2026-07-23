@@ -1,8 +1,13 @@
 {
   "$schema": "quota-config-schema.json",
-  "$comment": "Copy to quota-config.json and customize. Changes take effect on service restart.",
+  "$comment": "Copy to quota-config.json and customize. Changes take effect on service restart. THE CONFIG IS KING: the library uses exactly what this file (plus the documented QUOTA_*/AB0T_* env vars) declares — it never invents a tier, a limit, a resource, or a noun in a customer-facing sentence. The vocabulary below is deliberately GENERIC SaaS; replace every resource_key, tier and limit with your own.",
+  "service_name": "your-service",
+
+  "$comment_engine_mode": "local = your own Redis, this process enforces (the default). byo_redis = the same, stated explicitly. bridge = you run no Redis at all; enforcement is delegated to the hosted quota service over the mesh (zero-infra onboarding). See docs/deployment.md.",
+  "engine_mode": "local",
 
   "storage": {
+    "$_comment_redis_url": "local-dev EXAMPLE value (doc-lint:allow R2) — declare YOUR Redis here or via QUOTA_REDIS_URL; since 0.7 the library never invents an endpoint",
     "redis_url": "redis://localhost:6379/0",
     "redis_key_prefix": "quota",
     "dynamodb_table": "ab0t_quota_state",
@@ -14,7 +19,16 @@
     "_comment_redis_durability_confirmed": "D-72: the COUNTER is the admission gate, not a cache. An `allkeys-*` maxmemory-policy lets Redis EVICT a live gauge — the counter then reads zero for a resource that is still running and the library silently over-admits. The policy is machine-checked at startup via CONFIG GET; an evicting Redis REFUSES to start. Set this to true ONLY if your Redis cannot report its CONFIG (some managed Redis disable it) AND you know it does not evict — an operator assertion on the record. It never overrides an allkeys-* policy the server actually reported.",
     "redis_durability_confirmed": false,
     "_comment_ddb_pitr_confirmed": "D-76: the activation ledger and the billing outbox live in DynamoDB — state the library cannot reconstruct. At startup (and on every reconcile pass, D-75) the table is verified: ACTIVE, every GSI ACTIVE, TTL enabled on the `ttl` attribute the library writes, and PITR enabled. Set this to true ONLY if your control plane cannot report PITR (DynamoDB Local answers UnknownOperationException) AND you know backups are on — an operator assertion on the record.",
-    "ddb_pitr_confirmed": false
+    "ddb_pitr_confirmed": false,
+    "_comment_redis_scripting_confirmed": "D-73: set true ONLY when the SCRIPT command itself is unavailable/denied while EVAL works. Never overrides a script the server REJECTED — recognised by the 'compil' substring of the server's error, a disclosed heuristic, not an exact match; an unproven script fails CLOSED at first acquire.",
+    "redis_scripting_confirmed": false,
+    "_comment_connect_retry_seconds": "D-2: boot-retry budget for a DECLARED but unreachable Redis, then a typed refusal (0 = fail immediately). Auth failures never retry; never degrades to in-memory.",
+    "connect_retry_seconds": 30,
+    "_comment_auto_create_tables": "D-3: table creation is OPT-IN (default false). Pre-create the four tables (`provision --emit terraform`) or set true once; self-created tables are tagged.",
+    "auto_create_tables": false,
+    "_comment_keyspace": "K-1: counter key shape. Absent/1 = today's v1 keys — an existing consumer changing nothing is unaffected. 2 / dual_write=true drive the v1→v2 migration (docs/keyspace.md).",
+    "keyspace_version": 1,
+    "keyspace_dual_write": false
   },
 
   "tier_provider": {
@@ -28,11 +42,14 @@
     "enabled": true,
     "cooldown_seconds": 3600,
     "webhook_url": null,
-    "dispatchers": ["log"]
+    "dispatchers": [
+      "log"
+    ]
   },
 
   "enforcement": {
     "enabled": true,
+    "$comment_shadow_mode": "true = evaluate and alert, never deny. The safe first week in production: you see exactly who WOULD have been blocked before anyone actually is.",
     "shadow_mode": false,
     "global_kill_switch": false
   },
@@ -43,91 +60,142 @@
     "auto_correct": true
   },
 
+  "$comment_resources": "REQUIRED, and the section that matters most: nothing is enforced for a resource you have not declared here, and every customer-facing sentence is built from these fields. `display_name`, `unit` and `action_hint` are the words YOUR END CUSTOMER reads in a 429 — the library owns the sentence, you own every noun in it. `description` is different: admin-facing prose for dashboards and docs, never shown to the end customer. Pick counter_type by how usage behaves: GAUGE = a live count that goes up and down (things that currently exist); RATE = events inside a rolling window (window_seconds required); ACCUMULATOR = a total that only grows until reset_period (spend, volume).",
+  "resources": [
+    {
+      "$comment": "GAUGE — tracks a lifecycle: increment on create, decrement on delete.",
+      "service": "your-service",
+      "resource_key": "projects.active",
+      "display_name": "Active Projects",
+      "description": "Projects that currently exist in the workspace (admin-facing).",
+      "action_hint": "Archive a project to free up a slot.",
+      "counter_type": "gauge",
+      "unit": "projects"
+    },
+    {
+      "$comment": "GAUGE — seats. Declare `unit` in its PLURAL form; the library prints the singular at exactly one (\"1 seat\", \"2 seats\").",
+      "service": "your-service",
+      "resource_key": "seats.active",
+      "display_name": "Team Seats",
+      "action_hint": "Remove an existing member first.",
+      "counter_type": "gauge",
+      "unit": "seats"
+    },
+    {
+      "$comment": "RATE — rolling window; window_seconds is REQUIRED and the counter self-expires. There is no decrement: events age out.",
+      "service": "your-service",
+      "resource_key": "api.requests_per_hour",
+      "display_name": "API Requests",
+      "action_hint": "Wait a moment and try again.",
+      "counter_type": "rate",
+      "unit": "requests",
+      "window_seconds": 3600
+    },
+    {
+      "$comment": "ACCUMULATOR — grows until reset_period (daily|weekly|monthly). `precision` sets decimal places; use it for money and fractional volume.",
+      "service": "your-service",
+      "resource_key": "storage.gb_months",
+      "display_name": "Storage",
+      "action_hint": "Delete unused files, or wait until next month when your allowance resets.",
+      "counter_type": "accumulator",
+      "unit": "GB-months",
+      "reset_period": "monthly",
+      "precision": 2
+    },
+    {
+      "$comment": "ACCUMULATOR — spend. `unit` is printed verbatim, so a currency code stays a currency code.",
+      "service": "your-service",
+      "resource_key": "compute.monthly_spend",
+      "display_name": "Monthly Compute Spend",
+      "action_hint": "Wait until next month when your spending limit resets.",
+      "counter_type": "accumulator",
+      "unit": "USD",
+      "reset_period": "monthly",
+      "precision": 2
+    }
+  ],
+
   "$comment_resource_bundles": "Optional. Generic dispatch layer: name → list of resource_keys consumed when one of these is created. The library has no opinion on what bundles represent — pick whatever names suit your domain (instance types, plan tiers, product variants, anything). Use engine.check_for_bundle / increment_for_bundle / decrement_for_bundle in your routes instead of writing per-shape branching logic.",
   "resource_bundles": {
-    "default":   ["sandbox.concurrent"],
-    "with_gpu":  ["sandbox.concurrent", "sandbox.gpu_instances"],
-    "browser":   ["sandbox.browser_sessions"],
-    "desktop":   ["sandbox.desktop_sessions"]
+    "standard_project": [
+      "projects.active"
+    ],
+    "project_with_storage": [
+      "projects.active",
+      "storage.gb_months"
+    ]
   },
 
+  "$comment_tiers": "Every limit key MUST be a resource_key declared in `resources[]` above. `sort_order` is what the library climbs to find the next plan up when it writes an upgrade prompt — it never names a tier you did not declare, and when there is no higher tier it says nothing rather than something false. `upgrade_url` is the CTA rendered with that prompt.",
   "tiers": [
     {
       "tier_id": "free",
       "display_name": "Free",
       "description": "For experimentation and evaluation",
       "sort_order": 0,
-      "features": ["basic_sandboxes", "browser_sessions"],
+      "features": [
+        "core_api"
+      ],
       "upgrade_url": "/billing/upgrade",
       "limits": {
-        "sandbox.concurrent": 1,
-        "sandbox.monthly_cost": 10.00,
-        "sandbox.gpu_instances": 0,
-        "sandbox.browser_sessions": 2,
-        "sandbox.desktop_sessions": 0,
-        "resource.cpu_cores": 4,
-        "resource.allocations": 3,
-        "auth.users_per_org": 5,
-        "api.requests_per_hour": 1000
-      }
-    },
-    {
-      "tier_id": "starter",
-      "display_name": "Starter",
-      "description": "For small teams getting started",
-      "sort_order": 1,
-      "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access"],
-      "upgrade_url": "/billing/upgrade",
-      "$comment_per_user": "default_per_user_fraction caps any single user at this fraction of the org limit. Prevents one team member from exhausting the org quota. Applied to GAUGE resources only when no explicit per_user_limit is set on the resource.",
-      "default_per_user_fraction": 0.5,
-      "limits": {
-        "sandbox.concurrent": 5,
-        "sandbox.monthly_cost": 100.00,
-        "sandbox.gpu_instances": 1,
-        "sandbox.browser_sessions": 10,
-        "sandbox.desktop_sessions": 5,
-        "resource.cpu_cores": 32,
-        "resource.allocations": 20,
-        "auth.users_per_org": 25,
-        "api.requests_per_hour": 10000
+        "projects.active": 1,
+        "seats.active": 2,
+        "api.requests_per_hour": 1000,
+        "storage.gb_months": 5.0,
+        "compute.monthly_spend": 10.0
       }
     },
     {
       "tier_id": "pro",
       "display_name": "Pro",
       "description": "For growing teams with production workloads",
-      "sort_order": 2,
-      "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access", "gpu_access", "audit_logs", "priority_support"],
+      "sort_order": 1,
+      "features": [
+        "core_api",
+        "audit_logs",
+        "priority_support"
+      ],
       "upgrade_url": "/billing/upgrade",
-      "default_per_user_fraction": 0.4,
+      "$comment_per_user": "default_per_user_fraction caps any single user at this fraction of the org limit. Prevents one team member from exhausting the org quota. Applied to GAUGE resources only when no explicit per_user_limit is set on the resource.",
+      "default_per_user_fraction": 0.5,
+      "$comment_billing_model": "A tier may also carry `billing_model` (capacity_only by default — limits with no money side-effects), `price`, and `credit_grant` (what a signup or an invoice-paid event grants). See BILLING_MODELS_GUIDE.md before enabling any of them: they move money.",
+      "$comment_limits_long_form": "A limit is either a plain number or an object carrying the per-resource knobs: `limit`; `warning_threshold`/`critical_threshold` (the utilisation at which the library warns — enforcement AND the wording of the message both read these values); `burst_allowance` (temporary headroom above the limit, reported as overage rather than denied); `per_user_limit` (a hard per-user sub-quota that overrides the fraction above).",
       "limits": {
-        "sandbox.concurrent": 25,
-        "sandbox.monthly_cost": 1000.00,
-        "sandbox.gpu_instances": 5,
-        "sandbox.browser_sessions": 50,
-        "sandbox.desktop_sessions": 25,
-        "resource.cpu_cores": 256,
-        "resource.allocations": 100,
-        "auth.users_per_org": 100,
-        "api.requests_per_hour": 50000
+        "projects.active": 25,
+        "seats.active": 25,
+        "api.requests_per_hour": {
+          "limit": 50000,
+          "warning_threshold": 0.75,
+          "critical_threshold": 0.9,
+          "burst_allowance": 5000
+        },
+        "storage.gb_months": 500.0,
+        "compute.monthly_spend": {
+          "limit": 1000.0,
+          "per_user_limit": 200.0
+        }
       }
     },
     {
       "tier_id": "enterprise",
       "display_name": "Enterprise",
       "description": "Custom limits, SLA, dedicated support",
-      "sort_order": 3,
-      "features": ["basic_sandboxes", "browser_sessions", "desktop_sessions", "api_access", "gpu_access", "audit_logs", "priority_support", "sso", "custom_roles", "sla", "dedicated_support"],
+      "sort_order": 2,
+      "features": [
+        "core_api",
+        "audit_logs",
+        "priority_support",
+        "sso",
+        "custom_roles",
+        "sla"
+      ],
+      "$comment_null_limit": "null = unlimited (the resource is not enforced on this tier).",
       "limits": {
-        "sandbox.concurrent": null,
-        "sandbox.monthly_cost": null,
-        "sandbox.gpu_instances": 50,
-        "sandbox.browser_sessions": null,
-        "sandbox.desktop_sessions": null,
-        "resource.cpu_cores": 1000,
-        "resource.allocations": 500,
-        "auth.users_per_org": 10000,
-        "api.requests_per_hour": 100000
+        "projects.active": null,
+        "seats.active": 10000,
+        "api.requests_per_hour": 500000,
+        "storage.gb_months": null,
+        "compute.monthly_spend": null
       }
     }
   ],
@@ -135,8 +203,6 @@
   "billing_integration": {
     "$comment": "Maps Stripe price IDs to quota tiers (mesh resolver). Stripe events flow: Stripe Dashboard -> POST /api/webhooks/stripe (lib verifies HMAC against AB0T_QUOTA_STRIPE_WEBHOOK_SECRET) -> forwards to payment-service -> payment-service dispatches subscription/invoice events to lib handlers -> lib resolves price_id to tier_id via THIS mapping -> lib reads tier.credit_grant + applies. Library is the policy authority; payment-service is just Stripe state. See BILLING_INTEGRATION.md.",
     "stripe_price_to_tier": {
-      "price_starter_monthly": "starter",
-      "price_starter_annual": "starter",
       "price_pro_monthly": "pro",
       "price_pro_annual": "pro",
       "price_enterprise": "enterprise"

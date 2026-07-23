@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Billing — hosted portal shell</title>
+<link rel="stylesheet" href="ab0t-quota-ui.css">
+<link rel="stylesheet" href="demo-page.css">
+<style>
+  .shell { display: grid; gap: var(--ab0t-s6); grid-template-columns: 1fr; }
+  @media (min-width: 980px) { .shell { grid-template-columns: 200px 1fr; align-items: start; } }
+  .nav { display: flex; flex-direction: column; gap: 2px; position: sticky; top: var(--ab0t-s5); }
+  .nav a {
+    display: block; padding: var(--ab0t-s2) var(--ab0t-s3);
+    border-radius: var(--ab0t-radius-sm); text-decoration: none;
+    color: var(--ab0t-fg-muted); font-size: var(--ab0t-fs-md); font-weight: 600;
+  }
+  .nav a:hover { background: var(--ab0t-bg-raised); color: var(--ab0t-fg); }
+  .nav a:focus-visible { outline: 2px solid var(--ab0t-focus); outline-offset: 2px; }
+  .nav a[aria-current="true"] { background: var(--ab0t-bg-raised); color: var(--ab0t-fg); }
+  @media (max-width: 979px) { .nav { flex-direction: row; flex-wrap: wrap; position: static; } }
+  section[id] { scroll-margin-top: var(--ab0t-s5); }
+  .row2 { display: grid; gap: var(--ab0t-s5); grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="page-head" style="padding:var(--ab0t-s7) 0 var(--ab0t-s6)">
+    <div>
+      <p class="eyebrow">Hosted composition · customer billing portal</p>
+      <h1>Billing</h1>
+      <p class="lede">
+        Everything a customer needs to answer "what am I paying for, what have I used, and what do
+        I owe" — assembled from five widgets, each reading a real endpoint.
+      </p>
+    </div>
+    <div class="toolbar">
+      <button class="ctl" type="button" id="theme">Toggle theme</button>
+      <button class="ctl" type="button" id="reload">Reload all</button>
+      <a class="ctl" href="showcase.html">← Showcase</a>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav class="nav" aria-label="Billing sections">
+      <a href="#overview" aria-current="true">Overview</a>
+      <a href="#plan">Plan &amp; usage</a>
+      <a href="#invoices">Invoices</a>
+    </nav>
+
+    <main class="stack">
+      <section id="overview">
+        <h2 style="margin-top:0">Overview</h2>
+        <div class="row2">
+          <div id="w-balance"></div>
+          <div id="w-sub"></div>
+        </div>
+      </section>
+
+      <section id="plan">
+        <h2>Plan &amp; usage</h2>
+        <div class="row2">
+          <div id="w-usage"></div>
+          <div id="w-plans"></div>
+        </div>
+      </section>
+
+      <section id="invoices">
+        <h2>Invoices</h2>
+        <div id="w-invoices"></div>
+      </section>
+
+      <p class="note">
+        <b>Read the money carefully.</b> The balance figures render in the code the balance
+        response itself carries. <b>Spend this period</b> shows no amount — the usage-summary
+        contract has a <code>total_cost</code> but no currency field, and borrowing the balance's
+        code for a different service's number is how a customer ends up looking at the wrong
+        currency. The subscription <code>amount</code> is withheld for the same reason. Both gaps
+        are ticketed (T-16) rather than filled in by the client.
+      </p>
+      <p class="note" style="margin-bottom:var(--ab0t-s8)">
+        <b>Fixture data.</b> This page talks to an in-page fake transport, not a live service.
+      </p>
+    </main>
+  </div>
+
+</div>
+
+<script src="ab0t-quota-ui.js"></script>
+<script src="demo-fixtures.js"></script>
+<script>
+var F = AB0TDemo.fixtures, transport = AB0TDemo.transport, routes = AB0TDemo.routes, slow = AB0TDemo.slow;
+
+var billingRoutes = routes({
+  '/billing/balance': F.BALANCE,
+  '/billing/usage/summary': F.SUMMARY,
+  '/payments/subscriptions': F.SUBS,
+  '/payments/invoices': F.INVOICES
+});
+
+var MOUNTS = [
+  ['w-balance',  function (n) { AB0TQuotaUI.balance(n, { fetchImpl: slow(billingRoutes, 350) }); }],
+  ['w-sub',      function (n) { AB0TQuotaUI.subscription(n, { fetchImpl: slow(billingRoutes, 550) }); }],
+  ['w-usage',    function (n) { AB0TQuotaUI.usage(n, { fetchImpl: slow(transport(F.A_USAGE, F.A_TIERS), 450) }); }],
+  ['w-plans',    function (n) { AB0TQuotaUI.plans(n, { fetchImpl: slow(transport(F.A_USAGE, F.A_TIERS), 700) }); }],
+  ['w-invoices', function (n) { AB0TQuotaUI.invoices(n, { fetchImpl: slow(billingRoutes, 900) }); }]
+];
+
+/* Staggered delays are deliberate: a real portal's panels do not land at the
+   same instant, and the skeletons are what keep the page from jumping while
+   they arrive. */
+function mountAll() {
+  MOUNTS.forEach(function (m) {
+    var n = document.getElementById(m[0]);
+    n.__ab0tArea = null;
+    while (n.firstChild) n.removeChild(n.firstChild);
+    m[1](n);
+  });
+}
+mountAll();
+document.getElementById('reload').addEventListener('click', mountAll);
+
+/* Nav highlight follows the section actually in view. */
+if (window.IntersectionObserver) {
+  var links = {};
+  document.querySelectorAll('.nav a').forEach(function (a) {
+    links[a.getAttribute('href').slice(1)] = a;
+  });
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        Object.keys(links).forEach(function (k) {
+          links[k].setAttribute('aria-current', String(k === e.target.id));
+        });
+      }
+    });
+  }, { rootMargin: '-10% 0px -70% 0px' });
+  document.querySelectorAll('section[id]').forEach(function (s) { io.observe(s); });
+}
+
+document.getElementById('theme').addEventListener('click', function () {
+  var r = document.documentElement;
+  r.setAttribute('data-theme', r.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+</script>
+</body>
+</html>

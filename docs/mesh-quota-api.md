@@ -119,6 +119,31 @@ POST /billing/quota/{service}/{org_id}/decrement/{resource_key}
 Only valid for GAUGE counters. Floors at zero. Rate counters and
 accumulators reject decrement.
 
+### Tier limits, scoped to a consumer's catalog (`?service=`)
+
+```
+GET /billing/{org_id}/tier/limits?service=<service_name>
+```
+
+Pass `?service=` to read limits from that consumer's **published tier
+catalog** (auto-published by `setup_quota()` at startup) — the authoritative
+limits that consumer actually enforces. Omitted, the response falls back to
+library defaults, which may not match any deployed service.
+
+### Per-org overrides are service-scoped too (`?service=`)
+
+```
+PUT    /billing/{org_id}/tier/overrides/{resource_key}?service=<name>
+DELETE /billing/{org_id}/tier/overrides/{resource_key}?service=<name>
+```
+
+Since 2026-07-21, an override can bind to ONE mesh service (F-4 tenancy
+scoping): `?service=` names it; **omitted = org-WIDE**, applying to every
+service that shares the `resource_key`. A service-scoped override wins over
+an org-wide one for that service. Overrides created before the change are
+org-wide, which is what they always declared. Setting or removing overrides
+requires platform-admin; a suspended admin is refused on the write path.
+
 ### Full usage report
 
 ```
@@ -239,10 +264,12 @@ Cap recovery: rate counters auto-expire on a sliding window (default
 
 ## Cache and consistency
 
-- Tier reads inside billing are direct DynamoDB GetItem (no cache).
-  Tier changes via `PUT /billing/{org_id}/tier` are visible to the
-  next quota check immediately.
-- Override reads are direct DynamoDB; same immediate visibility.
+- Tier reads inside billing are cached in Redis (`quota:tier:{org}`);
+  `PUT /billing/{org_id}/tier` deletes that key, so a tier change is
+  visible to the next quota check on every replica immediately.
+- Override reads use a short in-process cache (30s TTL) that is
+  invalidated on every override write — a change is immediate on the
+  replica that took the write and ≤30s elsewhere.
 - Counter writes are atomic (Redis INCRBYFLOAT or sorted-set ZADD).
   No cross-bridge consistency issue: the counter IS the source of truth.
 

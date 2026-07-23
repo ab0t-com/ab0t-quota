@@ -26,7 +26,21 @@ from ab0t_quota.billing import (
 
 def _client():
     # base_url/api_key are unused because we never hit the network here.
-    return BillingServiceClient(base_url="http://billing.invalid", api_key="x")
+    #
+    # §11.2 REPLACEMENT (ticket 20260722_end_customer_experience_defects,
+    # TICKET_config_is_king.md §5c row 2): this fixture used to construct the
+    # client with NO identity and the suite asserted the wire body carried
+    # tool_id == "sandbox-platform" — i.e. it pinned the leaked default
+    # argument as if it were the contract. `tool_id` now resolves from the
+    # CALLER (explicit arg → service_name → AB0T_SERVICE_NAME) and refuses
+    # when absent, so the fixture states an identity like any real consumer.
+    # Every other assertion in this file (the cost/platform_fee/reservation_id
+    # trio, request_id shape and uniqueness, the metadata channel) is
+    # unchanged — only the invented identity moved.
+    return BillingServiceClient(
+        base_url="http://billing.invalid", api_key="x",
+        service_name="test-consumer",
+    )
 
 
 async def _capture(client):
@@ -86,7 +100,9 @@ async def test_record_resource_usage_sends_metering_defaults():
     assert body["platform_fee"] == "0"
     assert body["reservation_id"] == "resv-9"
     # section 3: identity fields
-    assert body["tool_id"] == "sandbox-platform"
+    # identity is the CALLER's, resolved from the client's service_name —
+    # never a consumer name baked into the library (§5c row 2).
+    assert body["tool_id"] == "test-consumer"
     assert body["org_id"] == "org-1"
     assert body["user_id"] == "user-1"
     assert body["session_id"] == "sbx-1234567890ab"

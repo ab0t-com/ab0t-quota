@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ab0t-quota"
-version = "0.6.2"
+version = "0.6.3"
 description = "Shared quota, rate-limit, and tier enforcement for ab0t platform services"
 requires-python = ">=3.11"
 license = {text = "Proprietary"}
@@ -40,3 +40,11 @@ include = ["ab0t_quota*"]
 
 [tool.setuptools.package-data]
 "ab0t_quota.billing" = ["templates/*.html"]
+
+[tool.pytest.ini_options]
+# T-28: the default invocation collects BOTH trees. The retry-contract
+# binding lives in conformance/ (the shared spine's home); a `pytest tests/`
+# invocation silently skipped it — a test that is never collected is
+# indistinguishable from one that passes. CI and every recorded suite figure
+# use the bare `pytest` default from here on (re-baselined in the work log).
+testpaths = ["tests", "conformance"]

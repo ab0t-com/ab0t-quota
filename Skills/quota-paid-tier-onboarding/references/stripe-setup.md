@@ -47,7 +47,11 @@ Payment service reads this in `core/quota.py:resolve_price_to_tier()`.
    - `invoice.paid`
    - `invoice.payment_succeeded` (older Stripe API versions; safe to also enable — lib accepts both)
    - `invoice.payment_failed`
-4. Copy webhook signing secret to `STRIPE_WEBHOOK_SECRET` env var
+4. Copy webhook signing secret to **`AB0T_QUOTA_STRIPE_WEBHOOK_SECRET`** env var.
+   (Before 0.7 the generic `STRIPE_WEBHOOK_SECRET` was consulted as a fallback;
+   it no longer is — see `docs/migrating-from-ambient-resolution.md`. If your
+   webhooks 400 and credits stop landing after upgrading, this rename is why;
+   startup logs an ERROR naming both variables when the old name is still set.)
 
 ## Test Cards
 

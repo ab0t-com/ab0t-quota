@@ -3,38 +3,33 @@
 Integrity note (ticket 20260709, task P1.1): the idempotency claim, the counter
 mutation, and the floor-at-zero are performed in ONE atomic Lua script per op
 (QI-01 claim-then-mutate crash window; QI-02 non-atomic floor read-modify-write).
-Keys, values, and the 24h idem TTL are UNCHANGED — wire-compatible with the live
-fleet and with the Go port's counter semantics.
+Keys, values, and the 24h idem TTL are UNCHANGED in v1 single mode — wire-
+compatible with the live fleet and with the Go port's counter semantics.
 
 Phase-2 integrity (task P2.2 / P2.3, QI-03 + QI-05):
 
 * ``try_increment`` / ``try_increment_user`` fold the LIMIT check and the spend
-  into ONE atomic Lua op — an admission decision under concurrency (QI-03: the
-  old check()->increment() TOCTOU let two racers both pass a read-only check and
-  both spend). At the limit, the loser is refused *inside the same script* that
-  would have spent, so the gauge can never exceed the limit.
+  into ONE atomic Lua op (QI-03 TOCTOU kill). At the limit, the loser is
+  refused *inside the same script* that would have spent.
 
-* ``decrement_user`` now scopes a caller-supplied idempotency key by a
-  library-managed per-(org,user,resource) CREATE generation (``seq``). This
-  retires the reused-resource-id collision (QI-05.1): two DISTINCT activations of
-  the same reused id release under distinct generations, so the second teardown's
-  decrement is no longer suppressed by the first's already-claimed key — WITHOUT
-  widening the TTL or special-casing any key (both recorded REJECTED approaches).
-  The generation is minted by the library, not the caller: this is the
-  "implicit activation" of P2.3. The fully retry-safe path is
-  ``engine.acquire``/``engine.release`` keyed on a minted ``activation_id``; this
-  counter-level shim is best-effort under the adversarial timing noted in
-  ``activations.py`` (a teardown retry that lands AFTER a new create of a reused
-  id). See DECISIONS D-10 and information_phase2_activation_20260710.md.
+* ``decrement_user`` scopes a caller-supplied idempotency key by a
+  library-managed per-(org,user,resource) CREATE generation (``seq``) —
+  QI-05.1. See DECISIONS D-10 and information_phase2_activation_20260710.md.
+
+K-3 (keyspace spec §3.2/§6.2): every script is dual-capable. During a keyspace
+migration the same atomic op seeds the v2 twin from v1, checks the idempotency
+LATCH on BOTH shapes, claims BOTH, and mutates BOTH — a retry first claimed
+pre-dual is still recognised across the flip (the double-charge trap, K-3).
 """
 
 from __future__ import annotations
 
 import math
 from typing import Optional
-from .base import Counter, finite_magnitude
+from .base import Counter, finite_magnitude, dual_lua
 
 # Idempotency-key TTL (seconds). Unchanged from the pre-Lua implementation.
+# The migration flip gate must outwait this (keyspace spec §3.3).
 _IDEM_TTL = 86400
 
 # --- Atomic Lua scripts -----------------------------------------------------
@@ -42,103 +37,100 @@ _IDEM_TTL = 86400
 #   ARGV[1] = magnitude (always a non-negative number; decrements negate it)
 #   ARGV[2] = idem TTL seconds
 #   ARGV[3] = '1' if an idempotency key is supplied (claim it), else '0'
-# When the idem claim fails (duplicate), the script mutates NOTHING and returns
-# the current value — identical observable behaviour to the old two-call path,
-# but now atomic with the mutation so a crash cannot claim-without-mutating.
+# On duplicate the script mutates NOTHING and returns the current value.
+# Dual convention (base.dual_lua): KEYS doubled, dual/v2p flags appended.
 
-# org-only increment: KEYS[1]=idem, KEYS[2]=org
-_INCR = """
+# org-only increment: KEYS[1]=idem, KEYS[2]=org ; ARGV[4]=dual [5]=v2p
+_INCR = dual_lua("2", 4, """
+seedv2(2)
 if ARGV[3] == '1' then
-  if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
+  if idem_dup(1) then
     local c = redis.call('GET', KEYS[2]); if c then return c else return '0' end
   end
+  idem_claim(1)
 end
-return redis.call('INCRBYFLOAT', KEYS[2], ARGV[1])
-"""
+return incrboth(2, ARGV[1])
+""")
 
-# org-only decrement + floor: KEYS[1]=idem, KEYS[2]=org
-_DECR = """
+# org-only decrement + floor: KEYS[1]=idem, KEYS[2]=org ; ARGV[4]=dual [5]=v2p
+_DECR = dual_lua("2", 4, """
+seedv2(2)
 if ARGV[3] == '1' then
-  if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
+  if idem_dup(1) then
     local c = redis.call('GET', KEYS[2]); if c then return c else return '0' end
   end
+  idem_claim(1)
 end
-local v = redis.call('INCRBYFLOAT', KEYS[2], '-'..ARGV[1])
-if tonumber(v) < 0 then redis.call('SET', KEYS[2], '0'); v = '0' end
-return v
-"""
+return incrfloorboth(2, '-'..ARGV[1])
+""")
 
 # per-user increment (org total + user partition):
 # KEYS[1]=idem, KEYS[2]=org, KEYS[3]=user, KEYS[4]=create-generation seq
-# A non-duplicate create bumps the per-(org,user,resource) generation so a later
-# teardown can scope its idempotency key by it (QI-05.1). Returns the user value.
-_INCR_USER = """
+# A non-duplicate create bumps the per-(org,user,resource) generation (QI-05.1).
+_INCR_USER = dual_lua("4", 4, """
+seedv2(2); seedv2(3); seedv2(4)
 if ARGV[3] == '1' then
-  if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
+  if idem_dup(1) then
     local u = redis.call('GET', KEYS[3]); if u then return u else return '0' end
   end
+  idem_claim(1)
 end
-redis.call('INCR', KEYS[4])
-redis.call('INCRBYFLOAT', KEYS[2], ARGV[1])
-return redis.call('INCRBYFLOAT', KEYS[3], ARGV[1])
-"""
+incrintboth(4)
+incrboth(2, ARGV[1])
+return incrboth(3, ARGV[1])
+""")
 
-# per-user decrement + floor both (org total + user partition):
+# per-user decrement + floor both:
 # KEYS[1]=idem-generation HASH, KEYS[2]=org, KEYS[3]=user, KEYS[4]=create-gen seq
-# The idempotency CLAIM is scoped by the current create generation (KEYS[4]) so a
-# caller key reused across two distinct activations (QI-05.1) claims two DISTINCT
-# generations and neither teardown is suppressed. A genuine retry of the SAME
-# teardown (before the next create bumps the generation) still collides -> no-op.
-# QI-09: the generation is a HASH FIELD of the DECLARED KEYS[1], NOT a key suffix.
-# The old code did `SET KEYS[1]..':gen:'..gen` — a key COMPUTED inside Lua and never
-# declared in KEYS. fakeredis tolerates it; real Redis Cluster REJECTS an undeclared
-# key access outright. HSETNX(KEYS[1], gen, 1) is the same claim semantics with every
-# accessed key declared (fields need no declaration). Returns the floored user value.
-_DECR_USER = """
+# The claim is scoped by the current create generation (QI-05.1) as a HASH FIELD
+# of the DECLARED KEYS[1] (QI-09). Dual: gen checked/claimed on BOTH hashes; the
+# generation VALUE migrates with the seeded seq key (spec §6.2).
+_DECR_USER = dual_lua("4", 4, """
+seedv2(2); seedv2(3); seedv2(4)
 if ARGV[3] == '1' then
   local gen = redis.call('GET', KEYS[4]); if not gen then gen = '0' end
-  if redis.call('HSETNX', KEYS[1], gen, '1') == 0 then
+  local dup = redis.call('HEXISTS', KEYS[1], gen) == 1
+  if DUAL and redis.call('HEXISTS', KEYS[NK+1], gen) == 1 then dup = true end
+  if dup then
     local u = redis.call('GET', KEYS[3]); if u then return u else return '0' end
   end
+  redis.call('HSETNX', KEYS[1], gen, '1')
   redis.call('EXPIRE', KEYS[1], ARGV[2])
+  if DUAL then
+    redis.call('HSETNX', KEYS[NK+1], gen, '1')
+    redis.call('EXPIRE', KEYS[NK+1], ARGV[2])
+  end
 end
-local o = redis.call('INCRBYFLOAT', KEYS[2], '-'..ARGV[1])
-if tonumber(o) < 0 then redis.call('SET', KEYS[2], '0') end
-local u = redis.call('INCRBYFLOAT', KEYS[3], '-'..ARGV[1])
-if tonumber(u) < 0 then redis.call('SET', KEYS[3], '0'); u = '0' end
-return u
-"""
+incrfloorboth(2, '-'..ARGV[1])
+return incrfloorboth(3, '-'..ARGV[1])
+""")
 
 # --- Atomic check-and-spend (QI-03: admission decision, not read-only check) ---
-# The limit check and the increment are ONE op, so two racers at limit-1 cannot
-# both be admitted. Returns {value, admitted} where admitted is '1'/'0'.
-# An empty ARGV[4]/ARGV[5] means "unlimited / no per-user limit" (skip that check).
+# Limit checks read the PRIMARY (authoritative) side, post-seed.
 
-# org-only: KEYS[1]=idem, KEYS[2]=org ; ARGV[1]=delta [2]=ttl [3]=has_idem [4]=limit
-_TRY_INCR = """
+# org-only: KEYS[1]=idem, KEYS[2]=org
+# ARGV[1]=delta [2]=ttl [3]=has_idem [4]=limit [5]=dual [6]=v2p
+_TRY_INCR = dual_lua("2", 5, """
+seedv2(2)
 local cur = redis.call('GET', KEYS[2]); if not cur then cur = '0' end
-if ARGV[3] == '1' and redis.call('GET', KEYS[1]) then
+if ARGV[3] == '1' and idem_dup(1) then
   return {cur, '1'}
 end
 if ARGV[4] ~= '' and (tonumber(cur) + tonumber(ARGV[1])) > tonumber(ARGV[4]) then
   return {cur, '0'}
 end
-if ARGV[3] == '1' then
-  if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
-    local c = redis.call('GET', KEYS[2]); if not c then c = '0' end
-    return {c, '1'}
-  end
-end
-local v = redis.call('INCRBYFLOAT', KEYS[2], ARGV[1])
+if ARGV[3] == '1' then idem_claim(1) end
+local v = incrboth(2, ARGV[1])
 return {v, '1'}
-"""
+""")
 
 # per-user: KEYS[1]=idem, KEYS[2]=org, KEYS[3]=user, KEYS[4]=seq
-# ARGV[1]=delta [2]=ttl [3]=has_idem [4]=org_limit [5]=user_limit
-_TRY_INCR_USER = """
+# ARGV[1]=delta [2]=ttl [3]=has_idem [4]=org_limit [5]=user_limit [6]=dual [7]=v2p
+_TRY_INCR_USER = dual_lua("4", 6, """
+seedv2(2); seedv2(3); seedv2(4)
 local o = redis.call('GET', KEYS[2]); if not o then o = '0' end
 local u = redis.call('GET', KEYS[3]); if not u then u = '0' end
-if ARGV[3] == '1' and redis.call('GET', KEYS[1]) then
+if ARGV[3] == '1' and idem_dup(1) then
   return {u, '1', 'dup'}
 end
 if ARGV[4] ~= '' and (tonumber(o) + tonumber(ARGV[1])) > tonumber(ARGV[4]) then
@@ -147,93 +139,97 @@ end
 if ARGV[5] ~= '' and (tonumber(u) + tonumber(ARGV[1])) > tonumber(ARGV[5]) then
   return {u, '0', 'user'}
 end
-if ARGV[3] == '1' then
-  if not redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[2]) then
-    local cu = redis.call('GET', KEYS[3]); if not cu then cu = '0' end
-    return {cu, '1', 'dup'}
-  end
-end
-redis.call('INCR', KEYS[4])
-redis.call('INCRBYFLOAT', KEYS[2], ARGV[1])
-local nu = redis.call('INCRBYFLOAT', KEYS[3], ARGV[1])
+if ARGV[3] == '1' then idem_claim(1) end
+incrintboth(4)
+incrboth(2, ARGV[1])
+local nu = incrboth(3, ARGV[1])
 return {nu, '1', 'ok'}
-"""
+""")
 
 
 class GaugeCounter(Counter):
     """Bidirectional counter: increment on create, decrement on destroy.
 
-    Redis key: quota:{org_id}:{resource_key}:gauge
-    Per-user:  quota:{org_id}:{resource_key}:gauge:user:{user_id}
-    Type: string (INCRBYFLOAT)
-    TTL: none (persists until explicitly reset)
+    v1 key: quota:{org_id}:{resource_key}:gauge (+ :gauge:user:{uid} etc.)
+    v2 key: quota:v2:{svc/org}:{resource_key}:gauge (keyspace spec §2.1)
+    Type: string (INCRBYFLOAT); TTL: none.
     """
 
     @property
     def _redis_key(self) -> str:
-        return f"{self._key_prefix}:gauge"
+        return self._ks.gauge_key(self._org_id, self._resource_key)
 
     def _user_key(self, user_id: str) -> str:
-        return f"{self._key_prefix}:gauge:user:{user_id}"
+        return self._ks.user_key(self._org_id, self._resource_key, user_id)
 
     def _seq_user_key(self, user_id: str) -> str:
-        """Per-(org, user, resource) CREATE generation. Bumped on each create so
-        a teardown can scope its idempotency key by it (QI-05.1)."""
-        return f"{self._key_prefix}:gauge:seq:user:{user_id}"
+        """Per-(org, user, resource) CREATE generation (QI-05.1)."""
+        return self._ks.seq_user_key(self._org_id, self._resource_key, user_id)
 
     def _idem_key(self, key: Optional[str]) -> str:
-        # Real key when claiming; an unused placeholder when not (never touched
-        # because the script's has_idem flag is '0').
-        return f"{self._key_prefix}:idem:{key}" if key else f"{self._key_prefix}:idem:__unused__"
+        return self._ks.idem_key(self._org_id, self._resource_key, key)
 
     def _idem_gen_key(self, key: Optional[str]) -> str:
-        # Generation-scoped teardown claim: a HASH whose fields are create
-        # generations (QI-05.1). Distinct `:idemgen:` namespace so it never collides
-        # (type-wise) with the string `:idem:` create-claim keys. DECLARED in KEYS
-        # (QI-09) — the generation is a field, not a computed key suffix.
-        return f"{self._key_prefix}:idemgen:{key}" if key else f"{self._key_prefix}:idemgen:__unused__"
+        """Generation-scoped teardown claim HASH (QI-05.1/QI-09)."""
+        return self._ks.idem_gen_key(self._org_id, self._resource_key, key)
+
+    # Secondary-shape twins (only meaningful during dual-write).
+    def _keys2(self, *kinds) -> list:
+        """Secondary-shape keys for (kind, *args) tuples, [] when not dual."""
+        sv = self._sv
+        if not sv:
+            return []
+        out = []
+        for kind, *args in kinds:
+            fn = getattr(self._ks, kind)
+            out.append(fn(self._org_id, self._resource_key, *args, version=sv))
+        return out
 
     async def get_user(self, user_id: str) -> float:
-        """Get a specific user's usage within this org gauge."""
+        """Get a specific user's usage within this org gauge (dual-read)."""
         val = await self._redis.get(self._user_key(user_id))
+        if val is None and self._sv:
+            val = await self._redis.get(self._ks.user_key(
+                self._org_id, self._resource_key, user_id, version=self._sv))
         return float(val) if val else 0.0
 
     async def _claim_idempotency(self, key: str) -> bool:
         """Atomically claim an idempotency key (SET NX). Retained for backward
         compatibility; the primary ops now claim inside their Lua script."""
         result = await self._redis.set(
-            f"{self._key_prefix}:idem:{key}", "1", ex=_IDEM_TTL, nx=True,
+            self._idem_key(key), "1", ex=_IDEM_TTL, nx=True,
         )
         return result is not None
 
     async def increment_user(self, user_id: str, delta: float, idempotency_key: Optional[str] = None) -> float:
-        """Increment both the org-level gauge AND the user partition (atomic).
-        Bumps the per-user CREATE generation so a later teardown can scope its
-        idempotency key by it (QI-05.1)."""
+        """Increment both the org-level gauge AND the user partition (atomic);
+        bumps the CREATE generation (QI-05.1)."""
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
         idem_key = f"{user_id}:{idempotency_key}" if idempotency_key else None
         has_idem = "1" if idem_key else "0"
+        keys = [self._idem_key(idem_key), self._redis_key,
+                self._user_key(user_id), self._seq_user_key(user_id)]
+        keys += self._keys2(("idem_key", idem_key), ("gauge_key",),
+                            ("user_key", user_id), ("seq_user_key", user_id))
         result = await self._redis.eval(
-            _INCR_USER, 4,
-            self._idem_key(idem_key), self._redis_key, self._user_key(user_id),
-            self._seq_user_key(user_id),
-            delta, _IDEM_TTL, has_idem,
+            _INCR_USER, len(keys), *keys,
+            delta, _IDEM_TTL, has_idem, *self._dual_argv(),
         )
         return float(result)
 
     async def decrement_user(self, user_id: str, delta: float, idempotency_key: Optional[str] = None) -> float:
-        """Decrement both the org-level gauge AND the user partition, flooring
-        each at zero — all atomic (QI-02). A caller-supplied idempotency key is
-        scoped by the current CREATE generation so a reused resource-id does not
-        collide across two distinct activations (QI-05.1)."""
+        """Decrement org gauge AND user partition, flooring both at zero —
+        atomic (QI-02); claim scoped by the CREATE generation (QI-05.1)."""
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
         idem_key = f"{user_id}:{idempotency_key}" if idempotency_key else None
         has_idem = "1" if idem_key else "0"
+        keys = [self._idem_gen_key(idem_key), self._redis_key,
+                self._user_key(user_id), self._seq_user_key(user_id)]
+        keys += self._keys2(("idem_gen_key", idem_key), ("gauge_key",),
+                            ("user_key", user_id), ("seq_user_key", user_id))
         result = await self._redis.eval(
-            _DECR_USER, 4,
-            self._idem_gen_key(idem_key), self._redis_key, self._user_key(user_id),
-            self._seq_user_key(user_id),
-            delta, _IDEM_TTL, has_idem,
+            _DECR_USER, len(keys), *keys,
+            delta, _IDEM_TTL, has_idem, *self._dual_argv(),
         )
         return float(result)
 
@@ -242,9 +238,7 @@ class GaugeCounter(Counter):
         """'' means unlimited / no-limit (the Lua skips that check).
 
         W-T3/ET-01 (D-31): a NaN limit makes every Lua comparison false and
-        ADMITS everything — a corrupted limit silently widening to infinity.
-        Refuse it loudly here. (+inf compares like 'unlimited' and -inf denies
-        everything — both mathematically consistent, both left alone.)"""
+        ADMITS everything. Refuse it loudly here."""
         if limit is None:
             return ""
         lim = float(limit)
@@ -259,14 +253,14 @@ class GaugeCounter(Counter):
         self, delta: float, limit: Optional[float], idempotency_key: Optional[str] = None,
     ) -> tuple[float, bool]:
         """Atomic check-and-spend at the org level (QI-03). Returns
-        (new_or_current_value, admitted). If admitting would exceed `limit`, the
-        gauge is NOT mutated and admitted=False."""
+        (new_or_current_value, admitted)."""
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
         has_idem = "1" if idempotency_key else "0"
+        keys = [self._idem_key(idempotency_key), self._redis_key]
+        keys += self._keys2(("idem_key", idempotency_key), ("gauge_key",))
         res = await self._redis.eval(
-            _TRY_INCR, 2,
-            self._idem_key(idempotency_key), self._redis_key,
-            delta, _IDEM_TTL, has_idem, self._fmt_limit(limit),
+            _TRY_INCR, len(keys), *keys,
+            delta, _IDEM_TTL, has_idem, self._fmt_limit(limit), *self._dual_argv(),
         )
         value, admitted = res[0], res[1]
         return float(value), (admitted in (b"1", "1", 1))
@@ -281,44 +275,57 @@ class GaugeCounter(Counter):
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
         idem_key = f"{user_id}:{idempotency_key}" if idempotency_key else None
         has_idem = "1" if idem_key else "0"
+        keys = [self._idem_key(idem_key), self._redis_key,
+                self._user_key(user_id), self._seq_user_key(user_id)]
+        keys += self._keys2(("idem_key", idem_key), ("gauge_key",),
+                            ("user_key", user_id), ("seq_user_key", user_id))
         res = await self._redis.eval(
-            _TRY_INCR_USER, 4,
-            self._idem_key(idem_key), self._redis_key, self._user_key(user_id),
-            self._seq_user_key(user_id),
+            _TRY_INCR_USER, len(keys), *keys,
             delta, _IDEM_TTL, has_idem,
             self._fmt_limit(org_limit), self._fmt_limit(user_limit),
+            *self._dual_argv(),
         )
         value, admitted = res[0], res[1]
         return float(value), (admitted in (b"1", "1", 1))
 
     async def get(self) -> float:
         val = await self._redis.get(self._redis_key)
+        if val is None and self._sv:
+            val = await self._redis.get(self._ks.gauge_key(
+                self._org_id, self._resource_key, version=self._sv))
         return float(val) if val else 0.0
 
     async def increment(self, delta: float, idempotency_key: Optional[str] = None) -> float:
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
         has_idem = "1" if idempotency_key else "0"
+        keys = [self._idem_key(idempotency_key), self._redis_key]
+        keys += self._keys2(("idem_key", idempotency_key), ("gauge_key",))
         result = await self._redis.eval(
-            _INCR, 2,
-            self._idem_key(idempotency_key), self._redis_key,
-            delta, _IDEM_TTL, has_idem,
+            _INCR, len(keys), *keys,
+            delta, _IDEM_TTL, has_idem, *self._dual_argv(),
         )
         return float(result)
 
     async def decrement(self, delta: float, idempotency_key: Optional[str] = None) -> float:
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
         has_idem = "1" if idempotency_key else "0"
+        keys = [self._idem_key(idempotency_key), self._redis_key]
+        keys += self._keys2(("idem_key", idempotency_key), ("gauge_key",))
         result = await self._redis.eval(
-            _DECR, 2,
-            self._idem_key(idempotency_key), self._redis_key,
-            delta, _IDEM_TTL, has_idem,
+            _DECR, len(keys), *keys,
+            delta, _IDEM_TTL, has_idem, *self._dual_argv(),
         )
         return float(result)
 
     async def reset(self, value: float = 0.0) -> None:
         await self._redis.set(self._redis_key, value)
+        if self._sv:
+            await self._redis.set(self._ks.gauge_key(
+                self._org_id, self._resource_key, version=self._sv), value)
 
     async def reset_user(self, user_id: str, value: float = 0.0) -> None:
-        """Force-set a user partition (admin/reconciliation). Used by
-        converge_gauge to DERIVE per-user partitions from the ledger (P2.5)."""
+        """Force-set a user partition (admin/reconciliation, P2.5)."""
         await self._redis.set(self._user_key(user_id), value)
+        if self._sv:
+            await self._redis.set(self._ks.user_key(
+                self._org_id, self._resource_key, user_id, version=self._sv), value)

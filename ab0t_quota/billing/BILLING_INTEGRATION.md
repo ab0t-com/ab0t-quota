@@ -61,10 +61,15 @@ from ab0t_quota.billing import (
 # Load pricing from config
 pricing = load_pricing("quota-config.json")
 
-# Create clients
+# Create clients.
+# `service_name` is YOUR mesh service identity — it becomes the default
+# `tool_id` on metering rows. Omit it only if you always pass `tool_id=`
+# explicitly or you export AB0T_SERVICE_NAME; `record_resource_usage`
+# REFUSES (ValueError + ERROR log) rather than guess a name.
 billing = BillingServiceClient(
     base_url=os.getenv("BILLING_SERVICE_URL"),
     api_key=os.getenv("BILLING_SERVICE_API_KEY"),
+    service_name=os.getenv("AB0T_SERVICE_NAME", "my-service"),
 )
 budget = BudgetChecker(billing, pricing)
 emitter = LifecycleEmitter()  # reads SNS_LIFECYCLE_TOPIC_ARN from env
@@ -96,6 +101,9 @@ resource.reservation_id = reservation_id
 await db.save(resource)
 
 # AFTER provisioning succeeds:
+# Accepts a product id, a variant name, or the qualified "product:variant"
+# form. Use the qualified form when two products share a variant name —
+# ambiguous bare names are refused rather than mispriced.
 costs = budget.get_costs("my_resource")
 await emitter.resource_started(
     org_id=org_id, user_id=user_id,

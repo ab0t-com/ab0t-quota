@@ -2,7 +2,7 @@
   "conformance_version": "1",
   "reference_runtime": "python (shared/ab0t-quota, executed on fakeredis)",
   "generated_by": "conformance/generate_scenarios.py",
-  "generated_at": "2026-07-12T03:14:47.475517+00:00",
+  "generated_at": "2026-07-21T23:50:00.779438+00:00",
   "ticket": "20260709_ab0t_quota_systemic_integrity_redesign (D-43)",
   "normalization_rules": {
     "gate_error": "an error/exception at an admission gate is a NON-admission (fail-closed)",
@@ -80,13 +80,16 @@
         "CLUSTER INFO unavailable/unparseable => UNKNOWN => REFUSE TO START, unless storage.redis_cluster_confirmed_disabled is explicitly true (an operator assertion on the record).",
         "An operator assertion NEVER overrides a positive cluster_enabled:1 \u2014 a definitive negative is not overridable (the allkeys-* eviction analogue, D-32).",
         "cluster_enabled:0 => single-node => start (the guard is not a blanket reject).",
-        "The verdict is published as capability `redis_topology` and a non-single-node verdict FAILS the money-aware health probe (D-40/D-49/D-51)."
+        "The verdict is published as capability `redis_topology` and a non-single-node verdict FAILS the money-aware health probe (D-40/D-49/D-51).",
+        "A probe AUTH/CONNECTION failure is NEVER a topology verdict: unreachable or unauthorised reports as a reachability/credentials error stating the probe never ran, and NO operator assertion masks it (the 2026-07-21 incident, pinned).",
+        "The data-plane CROSSSLOT probe (multi-key op inside the library's own keyspace) is a DEFINITIVE cluster signal requiring no admin privileges; its SUCCESS is not proof of single-node (a key-splitting proxy can mask a cluster) \u2014 success still defers to the control-plane answer or the operator assertion."
       ],
       "capability_key": "redis_topology",
       "capability_values": [
         "single-node",
         "CLUSTER (unsupported)",
-        "unknown"
+        "unknown",
+        "PROBE FAILED (reachability/credentials \u2014 not a topology verdict)"
       ],
       "config_key": "storage.redis_cluster_confirmed_disabled",
       "env_key": "AB0T_QUOTA_REDIS_CLUSTER_CONFIRMED_DISABLED",
@@ -100,6 +103,11 @@
       "unknown_error_must_contain": [
         "CROSSSLOT",
         "redis_cluster_confirmed_disabled"
+      ],
+      "auth_failure_error_must_contain": [
+        "credential",
+        "NOT a topology verdict",
+        "never ran"
       ],
       "roadmap": "cluster SUPPORT (hash-tagged quota:{org} keyspace, storage.keyspace_version + dual-read/write) is gated future work (D-23). v1 ships an honest refusal."
     },
@@ -369,6 +377,185 @@
       "dedup_is_durable_no_ttl": true,
       "contract_vector_table": "settlement_contract_vectors_20260712.json",
       "unsettleable_still_voids_and_alerts": true
+    },
+    {
+      "id": "ST-RESOLVE-1",
+      "title": "Every dependency is DECLARED, never discovered: one resolver, one precedence, no invented values",
+      "decision_refs": [
+        "D-5",
+        "D-9",
+        "D-10",
+        "D-12"
+      ],
+      "ticket": "20260721_shared_lib_declared_not_discovered (T-1/T-G1/T-13)",
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "setup",
+      "why_not_a_scenario": "resolution runs in setup_quota / quota.Setup before an engine exists; the engine replayer has no boot verb.",
+      "contract": [
+        "Clause 1: an undeclared REQUIRED dependency (key absent OR explicit null, with no namespaced env set) is a typed CONFIG ERROR naming the config key AND the namespaced env name. Never a generic env read, never an invented value (no localhost URL, no default region, no default tier catalog).",
+        "Clause 2: null != absent != invalid. Config reads are three-way membership checks, never truthiness; an explicit null is a declaration.",
+        "Clause 3: a set, NAMESPACED env declaration (QUOTA_*/AB0T_*) beats an explicit config null. Full precedence: kwarg > config non-null > namespaced env > deprecated legacy env (documented transition, WARNS naming the replacement) > terminal (REQUIRED=typed error / OPTIONAL=feature off, logged / SDK=defer to the SDK chain, logged / INTERNAL=documented default).",
+        "Clause 4: in-memory counters exist only by EXPLICIT declaration. Go: redis_url \"memory://\". Python: refuses \"memory://\" with a typed error pointing at bridge mode \u2014 a documented divergence (D-5(b)), not a parity gap.",
+        "Clause 5: a separately-declared redis password field BEATS a URL-embedded one in BOTH runtimes; when both are set and differ, a WARNING names the winning source (D-5(a)).",
+        "Clause 6: the REQUIRED-dependency refusal states what versions before 0.7 would have used (the `previously` line), secrets redacted (D-9's licensed report-only read).",
+        "Clause 7: a DECLARED but unreachable store RETRIES within storage.connect_retry_seconds (default 30; 0 = fail immediately; backoff 0.5s doubling, capped at 5s) then REFUSES with a typed reachability error \u2014 never a silent in-memory fallback (D-2/GO-10). The budget applies to the UNREACHABLE kind ONLY: an authentication failure refuses immediately and never consumes it (retrying a wrong password is a slower wrong password). The numbers below are the CONTRACT, bound per-runtime (T-27): agreement by having-diffed-the-other-runtime is PAR-01 rebuilt inside its own fix."
+      ],
+      "config_key": "storage.redis_url",
+      "env_key": "QUOTA_REDIS_URL",
+      "required_error_must_contain": [
+        "storage.redis_url",
+        "QUOTA_REDIS_URL",
+        "previously"
+      ],
+      "retry_contract": {
+        "config_key": "storage.connect_retry_seconds",
+        "default_seconds": 30,
+        "zero_means": "fail immediately",
+        "backoff_initial_seconds": 0.5,
+        "backoff_cap_seconds": 5,
+        "retries_kind": "unreachable",
+        "auth_never_consumes_budget": true
+      }
+    },
+    {
+      "id": "ST-CLI-1",
+      "title": "The CLI verb triad \u2014 provision / doctor / preflight \u2014 shares one evaluator set, one exit taxonomy, one report schema, in both runtimes",
+      "decision_refs": [
+        "D-4",
+        "D-6",
+        "D-8",
+        "D-14"
+      ],
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "cli",
+      "why_not_a_scenario": "these are CLI contracts, not engine ops; the engine replayer has no CLI. Declared structurally; bound by tests/test_tool_doctor_20260721.py and tests/test_tool_provision_20260721.py (python) and cmd/quotactl/st_cli_1_binding_test.go (go).",
+      "contract": [
+        "Verb names (ticket 20260721_setup_and_doctor_verbs \u00a76.1, DECIDED): `provision` \u2014 NOT `setup`: setup_quota()/quota.Setup is the library's own entry point and the collision would land in the docs \u2014 `doctor`, `preflight`.",
+        "provision NEVER creates cloud resources: it emits compose/terraform/acl/iam artifacts generated FROM the enforcing gate registry (one source with the boot gates, so artifact and gate cannot drift); --local may create ONE local Docker container, loudly, and only when asked (D-3's opt-in rule).",
+        "doctor grades POSTURE over the SAME evaluator set boot/preflight use; its exit code IS the boot verdict unless --fail-on-risk. Posture grades are remediation advice, never a second judgement of bootability.",
+        "A dimension doctor could not observe is reported not_checked WITH the reason. AccessDenied/NOPERM is a PERMISSION answer, never a missing-resource verdict (D-8).",
+        "Exit taxonomy shared by both runtimes: 0 ok / 1 gate refusal / 2 config (nothing contacted) / 3 unreachable-or-credentials / 4 internal.",
+        "doctor --json EXTENDS ab0t-quota/preflight-report/v1 additively with an ab0t-quota/doctor-posture/v1 section \u2014 v1 consumers keep working.",
+        "The honest asymmetry is DECLARED, not papered over (D-8): Python's doctor performs only the disclosed SCRIPT LOAD; Go's doctor runs full quota.Setup (which may create declared tables and load scripts) and therefore never claims read-only. Each runtime's doctor STATES its own side effects in its own output."
+      ],
+      "python_verbs": [
+        "preflight",
+        "doctor",
+        "provision"
+      ],
+      "go_verbs": [
+        "doctor",
+        "provision"
+      ],
+      "go_preflight_equivalent": "capabilities (runs Setup; its help text says so \u2014 D-8)",
+      "exit_taxonomy": {
+        "0": "ok \u2014 boot would start",
+        "1": "gate refusal",
+        "2": "config error (nothing contacted)",
+        "3": "unreachable / credentials / not-permitted",
+        "4": "internal error (a bug in the library)"
+      },
+      "report_schema": "ab0t-quota/preflight-report/v1",
+      "posture_schema": "ab0t-quota/doctor-posture/v1",
+      "emit_kinds": [
+        "compose",
+        "terraform",
+        "acl",
+        "iam"
+      ],
+      "emit_must_contain": {
+        "compose": [
+          "noeviction",
+          "--appendonly"
+        ],
+        "acl": [
+          "~quota:*",
+          "+@scripting"
+        ],
+        "terraform": [
+          "ab0t_quota_state",
+          "ab0t_quota_outbox",
+          "ab0t_quota_activations",
+          "ab0t_quota_handler_ledger",
+          "point_in_time_recovery"
+        ],
+        "iam": [
+          "dynamodb:DescribeTable",
+          "dynamodb:DescribeContinuousBackups"
+        ]
+      },
+      "side_effects": {
+        "python": "doctor/preflight write nothing except the disclosed SCRIPT LOAD (skippable with --no-script-load); provision --emit writes nothing",
+        "go": "doctor runs full quota.Setup \u2014 connects to the declared stores, may CREATE declared tables, loads the counter script; it must SAY so and never claim read-only (D-8)"
+      }
+    },
+    {
+      "id": "ST-KEYSPACE-1",
+      "title": "Counter keyspace is VERSIONED; v2 shape quota:v2:{svc/org}:\u2026 is a cross-runtime byte contract",
+      "decision_refs": [
+        "D-23",
+        "D-13",
+        "D-14"
+      ],
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "keyspace",
+      "why_not_a_scenario": "key shape is a construction-time property of every counter op, not a replayable engine verb; the oracle is the vector file, asserted by each runtime's builder test.",
+      "contract": [
+        "v1 shape quota:{org}:{rk}<suffix> is FROZEN (no new key kinds); v2 shape is quota:v2:{<svc>/<org>}:{rk}<suffix> with the braces LITERAL (a Redis hash tag), suffixes byte-identical to v1 (spec \u00a72.1).",
+        "storage.keyspace_version (1|2) names the READ-AUTHORITATIVE shape; storage.keyspace_dual_write maintains BOTH shapes. Exactly four legal states: (1,false)\u2192(1,true)\u2192(2,true)\u2192(2,false), monotonic.",
+        "Both builders reproduce every row of conformance/keyspace_v2_vectors.json byte-identically, including :idem:__unused__ placeholders.",
+        "CO-SLOT LAW: every KEYS entry of every multi-key counter script under v2 carries the identical literal {svc/org} tag \u2014 one cluster slot, no CROSSSLOT.",
+        "CHARSET GUARD: service/org values containing '{', '}', '/', ':' \u2014 or org ids matching ^v[0-9]+$ \u2014 are REFUSED loudly at the boundary, never mangled into a key.",
+        "Migration marker quota:keyspace:meta:<svc> (JSON: high_water, phase, dual_since). A v1/dual config against a marker recording high_water=v2-final REFUSES to boot [QUOTA-CFG-011]; not operator-overridable.",
+        "A (2,false) config with live v1 counter keys and NO completed migration REFUSES to boot [QUOTA-CFG-012]; an empty keyspace + no marker boots greenfield v2."
+      ],
+      "vector_file": "keyspace_v2_vectors.json",
+      "config_keys": [
+        "storage.keyspace_version",
+        "storage.keyspace_dual_write"
+      ],
+      "regression_error_must_contain": [
+        "QUOTA-CFG-011",
+        "v2-final",
+        "zero"
+      ],
+      "brownfield_error_must_contain": [
+        "QUOTA-CFG-012",
+        "v1 counter keys",
+        "migration"
+      ]
+    },
+    {
+      "id": "ST-KEYSPACE-2",
+      "title": "Keyspace migration semantics: seed-if-absent, dual-claimed latches, gated flip, guarded reap",
+      "decision_refs": [
+        "D-23",
+        "D-27",
+        "D-31",
+        "D-14"
+      ],
+      "runtimes": [
+        "python",
+        "go"
+      ],
+      "level": "keyspace",
+      "why_not_a_scenario": "migration is a multi-phase operator flow over live storage; each runtime's integrity test drives the state machine with planted offenders (spec \u00a79-V3).",
+      "contract": [
+        "During dual, every counter mutation SEEDS the v2 twin from v1 inside the same atomic script (seed-if-absent, never seed-then-add) \u2014 no counter reads zero while its v1 twin holds a value.",
+        "The idempotency latches (:idem:, :idemgen:, gauge seq) are CHECKED on BOTH shapes and CLAIMED on BOTH during dual \u2014 a retry first claimed pre-dual is recognised across the flip (no double-charge).",
+        "Reads are dual-read during dual: authoritative shape first, fall back to the other on absence. Rate windows are dual-WRITTEN, never copied.",
+        "The flip is machine-gated: dual_since must exceed max(idem TTL 86400s, longest configured rate window_seconds) AND verify must have passed in the same run.",
+        "Reap is the ONLY irreversible step: verify-in-run required, marker set to v2-final BEFORE the first delete, and (shared-Redis) an explicit on-the-record confirmation that no other scope still reads the unscoped v1 keys."
+      ]
     }
   ],
   "scenarios": [

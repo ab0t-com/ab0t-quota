@@ -1,0 +1,101 @@
+{
+  "schema": "ab0t-quota/quota-cfg-registry/v1",
+  "ticket": "20260721_shared_lib_declared_not_discovered (T-25, D-13)",
+  "rule": "QUOTA-CFG-nnn is ONE namespace shared by both runtimes. This file is the single source, mirrored byte-identically into ab0t-quota-go/conformance/. Allocation is append-only; neither runtime allocates a code without adding it here in the same change. A code is a consumer-facing contract: it is what a consumer greps for, alerts on, and finds in the docs.",
+  "codes": {
+    "QUOTA-CFG-000": {
+      "meaning": "unspecified config error (the resolver's default when no specific code was assigned; assign a real code before shipping a new refusal)",
+      "assigned_by": "python",
+      "raised_by": [
+        "python"
+      ]
+    },
+    "QUOTA-CFG-001": {
+      "meaning": "Redis counter store undeclared (storage.redis_url absent or null with no QUOTA_REDIS_URL set) \u2014 local/byo_redis modes",
+      "assigned_by": "python",
+      "raised_by": [
+        "python",
+        "go"
+      ]
+    },
+    "QUOTA-CFG-002": {
+      "meaning": "quota-config.json missing (a missing file is a config error, never an empty config)",
+      "assigned_by": "python",
+      "raised_by": [
+        "python"
+      ]
+    },
+    "QUOTA-CFG-003": {
+      "meaning": "quota-config.json malformed (unparseable JSON)",
+      "assigned_by": "python",
+      "raised_by": [
+        "python"
+      ]
+    },
+    "QUOTA-CFG-004": {
+      "meaning": "tier catalog undeclared (tiers key absent or null) \u2014 the library never invents policy",
+      "assigned_by": "python",
+      "raised_by": [
+        "python"
+      ]
+    },
+    "QUOTA-CFG-005": {
+      "meaning": "redis_url \"memory://\" refused on Python (no in-memory counter backend; bridge mode is the no-Redis answer). Go accepts memory:// as the explicit in-memory declaration \u2014 documented divergence D-5(b)",
+      "assigned_by": "python",
+      "raised_by": [
+        "python"
+      ]
+    },
+    "QUOTA-CFG-006": {
+      "meaning": "config schema violation (unknown/mistyped storage key, unknown engine_mode, non-array tiers) \u2014 ALL violations listed at once",
+      "assigned_by": "python",
+      "raised_by": [
+        "python"
+      ]
+    },
+    "QUOTA-CFG-007": {
+      "meaning": "bridge mode without its mesh API key (AB0T_MESH_API_KEY)",
+      "assigned_by": "python",
+      "raised_by": [
+        "python"
+      ]
+    },
+    "QUOTA-CFG-008": {
+      "meaning": "bridge mode without a service identity (service_name / AB0T_SERVICE_NAME)",
+      "assigned_by": "python",
+      "raised_by": [
+        "python"
+      ]
+    },
+    "QUOTA-CFG-009": {
+      "meaning": "DynamoDB region undeclared AND the AWS SDK chain resolved nothing (Go; Python defers region errors to the SDK today)",
+      "assigned_by": "go",
+      "raised_by": [
+        "go"
+      ]
+    },
+    "QUOTA-CFG-010": {
+      "meaning": "SNS region undeclared AND the AWS SDK chain resolved nothing (Go)",
+      "assigned_by": "go",
+      "raised_by": [
+        "go"
+      ]
+    },
+    "QUOTA-CFG-011": {
+      "meaning": "keyspace version regression: storage records a COMPLETED v2 migration (marker high_water=v2-final) but config declares v1-authoritative \u2014 a v1 engine would read orphaned keys and every counter would read zero. Not operator-overridable (ST-KEYSPACE-1)",
+      "assigned_by": "python",
+      "raised_by": [
+        "python",
+        "go"
+      ]
+    },
+    "QUOTA-CFG-012": {
+      "meaning": "brownfield keyspace orphaning: config declares keyspace_version 2 (dual off) but live v1 counter keys exist with no completed migration recorded \u2014 run the keyspace migration or declare keyspace_version 1 (ST-KEYSPACE-1)",
+      "assigned_by": "python",
+      "raised_by": [
+        "python",
+        "go"
+      ]
+    }
+  }
+}

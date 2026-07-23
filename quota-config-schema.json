@@ -1,0 +1,218 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "quota-config-schema.json",
+  "title": "ab0t-quota configuration (quota-config.json)",
+  "description": "DECLARED, NOT DISCOVERED: the library uses exactly what this file (plus documented QUOTA_*/AB0T_* env vars) declares. See docs/requirements.md.",
+  "type": "object",
+  "properties": {
+    "service_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "engine_mode": {
+      "enum": [
+        "local",
+        "byo_redis",
+        "bridge",
+        null
+      ]
+    },
+    "offline": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "auto_create_tables": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "connect_retry_seconds": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "ddb_pitr_confirmed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "dynamodb_endpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dynamodb_region": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dynamodb_table": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "keyspace_dual_write": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "keyspace_version": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "persistence_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "persistence_sync_interval_seconds": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "redis_cluster_confirmed_disabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "redis_durability_confirmed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "redis_key_prefix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redis_password": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redis_scripting_confirmed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "redis_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[$_]": {}
+      }
+    },
+    "tiers": {
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "resources": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "object",
+        "required": [
+          "service",
+          "resource_key",
+          "display_name",
+          "counter_type"
+        ],
+        "properties": {
+          "service": {
+            "type": "string"
+          },
+          "resource_key": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string",
+            "description": "Human-readable name shown in dashboards and 429 responses"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Longer description for admin UIs and docs (never shown to end customers)"
+          },
+          "action_hint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "End-customer remediation copy shown in 429 responses \u2014 what the user can do right now. Absent = the sentence is omitted, never invented (D-CK-1)"
+          },
+          "counter_type": {
+            "enum": [
+              "gauge",
+              "rate",
+              "accumulator"
+            ]
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_seconds": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "reset_period": {
+            "enum": [
+              "daily",
+              "weekly",
+              "monthly",
+              null
+            ]
+          },
+          "precision": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "patternProperties": {
+          "^[$_]": {}
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

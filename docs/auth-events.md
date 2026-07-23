@@ -621,7 +621,7 @@ python -m ab0t_quota delete-user --user-id u123 --confirm
 
 Env vars the CLI reads:
 - `AB0T_QUOTA_DDB_TABLE` — DDB table name (preferred if set)
-- `QUOTA_REDIS_URL` or `REDIS_URL` — Redis URL (fallback)
+- `QUOTA_REDIS_URL` — Redis URL (the generic `REDIS_URL` is never read since 0.7; an undeclared store is a clean non-zero exit, not a silent in-memory run)
 - `AB0T_AUTH_WEBHOOK_PUBLIC_URL` + `AB0T_AUTH_WEBHOOK_SECRET` — for replay/backfill
 
 ### Migration from plain `@on_auth_event` (v0.5.1 and earlier)

@@ -29,6 +29,21 @@ from .clients import BillingServiceClient, BillingServiceError
 logger = logging.getLogger("ab0t_quota.billing.budget")
 
 
+class PricingNotDeclaredError(ValueError):
+    """Asked for a price the pricing config does not declare.
+
+    The config is the only source of prices. Inventing a rate here would
+    reserve real balance against a number the operator never agreed
+    (get_costs -> estimate_reservation -> pre_launch_check -> reserve_funds),
+    so this refuses instead. Subclasses ValueError for back-compat.
+    """
+
+
+class PricingAmbiguousError(PricingNotDeclaredError):
+    """A bare variant name is declared by more than one product, so it does not
+    identify a price. Use the qualified `<product>:<variant>` form."""
+
+
 class BudgetChecker:
     """Reusable budget check pattern for mesh services.
 
@@ -45,12 +60,32 @@ class BudgetChecker:
         self.billing = billing_client
         self.pricing = pricing_config
         self.enforcement = enforcement_enabled
+        self._ambiguous: Dict[str, list] = {}
         self._product_costs = self._build_cost_table()
 
+    @staticmethod
+    def _variant_costs(v: Dict[str, Any]) -> Dict[str, Decimal]:
+        return {
+            "hourly_rate": Decimal(str(v.get("price_per_hour", "0.10"))),
+            "allocation_fee": Decimal(str(v.get("allocation_price", "0.01"))),
+        }
+
     def _build_cost_table(self) -> Dict[str, Dict[str, Decimal]]:
-        """Build product → {hourly_rate, allocation_fee} from pricing config."""
+        """Build lookup key → {hourly_rate, allocation_fee} from pricing config.
+
+        Three kinds of key, all derived from the config's own shape — no
+        product is special-cased by name (ticket 20260722, §5c row 3):
+          * `<product_id>`            → that product's default variant
+          * `<product_id>:<variant>`  → always, unambiguous by construction
+          * `<variant>` (bare)        → only when exactly ONE product declares
+            that variant name and it does not collide with a product_id.
+            Two products declaring `small` would otherwise silently serve one
+            product's price for the other's variant, on the reservation path.
+        """
         products = self.pricing.get("products", {})
-        costs = {}
+        costs: Dict[str, Dict[str, Decimal]] = {}
+        bare_claims: Dict[str, list] = {}
+
         for product_id, product in products.items():
             variants = product.get("variants", {})
             # Use default variant
@@ -59,25 +94,62 @@ class BudgetChecker:
                 if v.get("default") or default is None:
                     default = v
             if default:
-                costs[product_id] = {
-                    "hourly_rate": Decimal(str(default.get("price_per_hour", "0.10"))),
-                    "allocation_fee": Decimal(str(default.get("allocation_price", "0.01"))),
-                }
-            # For sandbox-type products with instance_type variants
-            if product_id == "sandbox":
-                for itype, v in variants.items():
-                    costs[itype] = {
-                        "hourly_rate": Decimal(str(v.get("price_per_hour", "0.10"))),
-                        "allocation_fee": Decimal(str(v.get("allocation_price", "0.01"))),
-                    }
+                costs[product_id] = self._variant_costs(default)
+
+            for variant_id, v in variants.items():
+                costs[f"{product_id}:{variant_id}"] = self._variant_costs(v)
+                bare_claims.setdefault(variant_id, []).append((product_id, v))
+
+        for variant_id, claims in bare_claims.items():
+            if variant_id in products:
+                # A product id always outranks a variant of the same name.
+                continue
+            if len(claims) > 1:
+                # Recorded, not registered: the lookup refuses by NAME so the
+                # caller is told it is ambiguous rather than "not declared".
+                self._ambiguous[variant_id] = [p for p, _ in claims]
+                logger.warning(
+                    "variant name %r is declared by %s — it does not identify a "
+                    "price. Callers must use the qualified form '<product>:%s'.",
+                    variant_id, self._ambiguous[variant_id], variant_id,
+                )
+                continue
+            costs[variant_id] = self._variant_costs(claims[0][1])
+
         return costs
 
     def get_costs(self, product_or_instance: str) -> Dict[str, Decimal]:
-        """Get pricing for a product or instance type."""
-        return self._product_costs.get(product_or_instance, {
-            "hourly_rate": Decimal("0.10"),
-            "allocation_fee": Decimal("0.01"),
-        })
+        """Get pricing for a product id, a variant name, or `product:variant`.
+
+        REFUSES on anything the pricing config does not declare (D-CK-11).
+        This used to return a hardcoded 0.10/0.01 for unknown keys — an
+        invented rate that reserves real customer balance through
+        estimate_reservation -> pre_launch_check -> reserve_funds. The config
+        is the only source of prices; not knowing one is reportable, not
+        fillable.
+
+        Raises:
+            PricingAmbiguousError: bare variant name claimed by 2+ products.
+            PricingNotDeclaredError: key not declared at all.
+        """
+        costs = self._product_costs.get(product_or_instance)
+        if costs is not None:
+            return costs
+
+        if product_or_instance in self._ambiguous:
+            claimants = self._ambiguous[product_or_instance]
+            raise PricingAmbiguousError(
+                f"pricing key {product_or_instance!r} is ambiguous: declared as a "
+                f"variant by {claimants}. It does not identify a price — use the "
+                f"qualified form, e.g. '{claimants[0]}:{product_or_instance}'."
+            )
+
+        raise PricingNotDeclaredError(
+            f"pricing key {product_or_instance!r} is not declared in the pricing "
+            f"config. Declared keys: {sorted(self._product_costs)}. Add it to "
+            f"pricing.products in quota-config.json — a price that is not "
+            f"configured cannot be charged."
+        )
 
     def estimate_reservation(self, product_or_instance: str, count: int = 1) -> Decimal:
         """Estimate total reservation amount (allocation_fee + 1 hour of runtime)."""

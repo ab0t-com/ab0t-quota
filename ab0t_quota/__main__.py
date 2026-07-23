@@ -80,13 +80,15 @@ def _subscribe_events(args) -> int:
 
 
 def _build_store_from_env():
-    """Construct a LedgerStore from env vars for CLI use.
+    """Construct a LedgerStore from DECLARED env vars for CLI use (T-7/ENV-10).
 
-    Priority: AB0T_QUOTA_DDB_TABLE+aioboto3 > QUOTA_REDIS_URL+redis.asyncio > InMemory.
-    The CLI is meant to be run on the same host/network as the lib, so this
-    typically matches what the running app picked at setup_quota time.
+    Priority: AB0T_QUOTA_DDB_TABLE+aioboto3 > QUOTA_REDIS_URL+redis.asyncio.
+    DECLARED, NOT DISCOVERED: no generic REDIS_URL, and no silent in-memory
+    fallback — replay/events against an undeclared store used to read and
+    write NOTHING while exiting 0. A declared-but-unavailable store refuses
+    (SystemExit) rather than silently running against the wrong one.
     """
-    from .handler_ledger import DDBLedgerStore, RedisLedgerStore, InMemoryLedgerStore
+    from .handler_ledger import DDBLedgerStore, RedisLedgerStore
 
     ddb_table = os.getenv("AB0T_QUOTA_DDB_TABLE")
     if ddb_table:
@@ -96,20 +98,26 @@ def _build_store_from_env():
             client = session.client("dynamodb")
             return DDBLedgerStore(client, table_name=ddb_table)
         except Exception as e:
-            print(f"warning: DDB requested but unavailable ({e}); falling back", file=sys.stderr)
+            print(f"error: AB0T_QUOTA_DDB_TABLE={ddb_table!r} is declared but the DDB "
+                  f"client cannot be built ({e}). Fix it or unset it — the CLI will "
+                  f"not silently fall back to another store.", file=sys.stderr)
+            raise SystemExit(2) from e
 
-    redis_url = os.getenv("QUOTA_REDIS_URL") or os.getenv("REDIS_URL")
+    redis_url = os.getenv("QUOTA_REDIS_URL")
     if redis_url:
         try:
             from redis.asyncio import from_url
             r = from_url(redis_url, decode_responses=False)
             return RedisLedgerStore(r)
         except Exception as e:
-            print(f"warning: Redis requested but unavailable ({e}); falling back", file=sys.stderr)
+            print(f"error: QUOTA_REDIS_URL is declared but a client cannot be built "
+                  f"({e}). Fix it or unset it.", file=sys.stderr)
+            raise SystemExit(2) from e
 
-    print("warning: no persistent store (set AB0T_QUOTA_DDB_TABLE or QUOTA_REDIS_URL); using in-memory",
-          file=sys.stderr)
-    return InMemoryLedgerStore()
+    print("error: no ledger store declared — set AB0T_QUOTA_DDB_TABLE or "
+          "QUOTA_REDIS_URL. (The generic REDIS_URL is no longer read, and there is "
+          "no silent in-memory fallback: it read and wrote nothing.)", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _print_rows(rows, *, format="table"):
@@ -279,9 +287,182 @@ def _delete_user(args) -> int:
     return asyncio.run(_do())
 
 
+def _preflight(args) -> int:
+    """T-12: pre-deploy verification — schema, resolved plan + provenance,
+    then the boot gates read-only. See ab0t_quota/preflight.py."""
+    import asyncio as _asyncio
+
+    from .preflight import EXIT_INTERNAL, run_preflight
+
+    emit = (lambda s: print(s, file=sys.stderr)) if args.json_out else print
+    try:
+        report = _asyncio.run(run_preflight(
+            config_path=args.config,
+            offline=args.offline,
+            check_mesh=args.check_mesh,
+            strict=args.strict,
+            timeout=args.timeout,
+            script_load=not args.no_script_load,
+            emit=emit,
+        ))
+    except Exception as e:  # exit 4: a bug in US, never the consumer's env
+        print(f"preflight internal error (a bug in ab0t-quota, not your "
+              f"environment — please report it): {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return EXIT_INTERNAL
+    if args.json_out:
+        print(json.dumps(report.to_json(), indent=2))
+    return report.exit_code
+
+
+def _doctor(args) -> int:
+    """T-1 (tooling lane): posture grading over the SAME evaluator set as
+    preflight/boot. `preflight` answers "will it boot"; `doctor` answers
+    "is what boots production-grade" — and says what it could not check."""
+    import asyncio as _asyncio
+
+    from .preflight import EXIT_INTERNAL, run_doctor
+
+    emit = (lambda s: print(s, file=sys.stderr)) if args.json_out else print
+    try:
+        doc = _asyncio.run(run_doctor(
+            config_path=args.config,
+            offline=args.offline,
+            check_mesh=args.check_mesh,
+            strict=args.strict,
+            timeout=args.timeout,
+            script_load=not args.no_script_load,
+            fail_on_risk=args.fail_on_risk,
+            emit=emit,
+        ))
+    except Exception as e:  # exit 4: a bug in US, never the consumer's env
+        print(f"doctor internal error (a bug in ab0t-quota, not your "
+              f"environment — please report it): {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return EXIT_INTERNAL
+    if args.json_out:
+        print(json.dumps(doc.to_json(), indent=2))
+    return doc.exit_code
+
+
+def _provision(args) -> int:
+    """T-2/T-3 (tooling lane): emit infra artifacts from the enforcing
+    registry, or start a conforming local dev Redis. NEVER creates cloud
+    resources — emit-and-let-them-apply (D-3's rule)."""
+    from . import provision as prov
+
+    if args.local:
+        return prov.run_local(port=args.port, name=args.name,
+                              dry_run=args.dry_run, timeout=args.timeout,
+                              emit_line=lambda s: print(s, file=sys.stderr))
+    if not args.emit:
+        print("error: choose --emit {compose|terraform|acl|iam} or --local",
+              file=sys.stderr)
+        return 2
+    config = None
+    cfg_path = args.config or os.environ.get("QUOTA_CONFIG_PATH")
+    if cfg_path:
+        from .config import load_config
+        from .errors import QuotaConfigError
+        try:
+            config = load_config(args.config)
+        except QuotaConfigError as e:
+            print(f"CONFIG ERROR: {e}", file=sys.stderr)
+            return 2
+    else:
+        print("note: no --config/QUOTA_CONFIG_PATH — emitting the documented "
+              "default table names", file=sys.stderr)
+    try:
+        kw = {"include_create": args.include_create} if args.emit == "iam" else {}
+        text = prov.emit(args.emit, config, **kw)
+    except AssertionError as e:  # our registry bug, never the consumer's env
+        print(f"provision internal error (a bug in ab0t-quota — please report "
+              f"it): {e}", file=sys.stderr)
+        return 4
+    print(text, end="")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="ab0t_quota", description="ab0t-quota CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    # preflight — T-12 (D-4 names it; `check` kept as an alias so the parent
+    # pack's provisional wording stays true)
+    pf = sub.add_parser(
+        "preflight", aliases=["check"],
+        help="pre-deploy verification: config schema, resolved plan with "
+             "provenance, boot gates read-only. Exit: 0 ok / 1 gate refusal / "
+             "2 config / 3 unreachable / 4 internal")
+    pf.add_argument("--config", help="quota-config.json (default: same search order as boot)")
+    pf.add_argument("--json", dest="json_out", action="store_true",
+                    help="machine-readable report on stdout (human report -> stderr)")
+    pf.add_argument("--offline", action="store_true",
+                    help="schema + plan + provenance only; contacts NOTHING")
+    pf.add_argument("--check-mesh", action="store_true",
+                    help="ALSO probe mesh /health endpoints (GET only; OFF by default per D-6)")
+    pf.add_argument("--strict", action="store_true",
+                    help="warnings also fail the exit code")
+    pf.add_argument("--timeout", type=float, default=5.0, help="per-probe timeout seconds")
+    pf.add_argument("--no-script-load", action="store_true",
+                    help="skip D-73's SCRIPT LOAD (the one server-visible write); "
+                         "D-73 reports SKIPPED and boot will still perform it")
+    pf.set_defaults(func=_preflight)
+
+    # doctor — T-1 (tooling lane): posture grading, one evaluator set.
+    # `preflight` = "will it boot" (CI); `doctor` = "is it production-grade,
+    # and what could I not check" (humans + auditors).
+    dr = sub.add_parser(
+        "doctor",
+        help="grade production POSTURE (persistence, PITR, TTL, eviction "
+             "facts, ACL breadth, encryption, retention) over the same "
+             "evaluators preflight/boot use; honest about what it cannot "
+             "check. Exit mirrors preflight (0/1/2/3/4); --fail-on-risk "
+             "turns RISK posture findings into exit 1")
+    dr.add_argument("--config", help="quota-config.json (default: same search order as boot)")
+    dr.add_argument("--json", dest="json_out", action="store_true",
+                    help="preflight-report/v1 EXTENDED with a posture section "
+                         "(hand it to an auditor); human report -> stderr")
+    dr.add_argument("--offline", action="store_true",
+                    help="static posture only; contacts NOTHING")
+    dr.add_argument("--check-mesh", action="store_true",
+                    help="ALSO probe mesh /health endpoints (GET only; OFF by default per D-6)")
+    dr.add_argument("--strict", action="store_true",
+                    help="preflight warnings also fail the exit code")
+    dr.add_argument("--fail-on-risk", action="store_true",
+                    help="RISK posture findings fail the exit code (advice by default)")
+    dr.add_argument("--timeout", type=float, default=5.0, help="per-probe timeout seconds")
+    dr.add_argument("--no-script-load", action="store_true",
+                    help="skip D-73's SCRIPT LOAD (doctor's one server-visible write)")
+    dr.set_defaults(func=_doctor)
+
+    # provision — T-2/T-3 (tooling lane): the vehicle. Emits artifacts from
+    # the enforcing registry; NEVER creates cloud resources.
+    pv = sub.add_parser(
+        "provision",
+        help="emit infrastructure artifacts (compose|terraform|acl|iam) "
+             "generated from the enforcing gate registry, or start a "
+             "conforming local dev Redis (--local). Never touches cloud "
+             "resources: emit-and-let-them-apply")
+    pv.add_argument("--emit", choices=["compose", "terraform", "acl", "iam"],
+                    help="artifact to print on stdout")
+    pv.add_argument("--config", help="quota-config.json for declared table names "
+                                     "(optional; defaults are emitted otherwise)")
+    pv.add_argument("--include-create", action="store_true",
+                    help="(--emit iam) include the self-provisioning actions — "
+                         "only with storage.auto_create_tables=true")
+    pv.add_argument("--local", action="store_true",
+                    help="start ONE local Docker Redis conforming to the gates, "
+                         "then verify it with the boot evaluator")
+    pv.add_argument("--port", type=int, default=6399,
+                    help="host port for --local (default 6399 — deliberately "
+                         "not 6379: declare, never discover)")
+    pv.add_argument("--name", default="ab0t-quota-dev-redis",
+                    help="container name for --local")
+    pv.add_argument("--dry-run", action="store_true",
+                    help="print the docker command --local would run, run nothing")
+    pv.add_argument("--timeout", type=float, default=5.0, help="verification timeout seconds")
+    pv.set_defaults(func=_provision)
 
     # TODO(public-mesh-ga): Add a provider-neutral sync-plans command that
     # reads quota-config.json plans/prices and publishes plan metadata/tier

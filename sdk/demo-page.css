@@ -1,0 +1,146 @@
+/*
+ * demo-page.css — page chrome for the sdk/ demo, showcase and hosted-page
+ * compositions. NOT part of the SDK bundle.
+ *
+ * It deliberately styles ONLY the surrounding page and borrows the SDK's own
+ * design tokens to do it — which is itself a demonstration: a host app can
+ * build its whole shell out of --ab0t-* and the widgets will sit inside it as
+ * though they were written for it.
+ */
+
+:root { color-scheme: light dark; }
+
+/*
+ * The demo pages OPT IN to the SDK's system stack via --ab0t-font. That is
+ * the whole point: a host sets one token and every widget inside follows,
+ * with no download and no FOUT. The SDK itself still ships `inherit`.
+ */
+:root { --ab0t-font: var(--ab0t-font-ui); }
+
+body {
+  margin: 0;
+  padding: var(--ab0t-s6) var(--ab0t-s6) var(--ab0t-s9);
+  font-family: var(--ab0t-font-ui);
+  font-size: 15px;
+  line-height: var(--ab0t-lh-md);
+  background: var(--ab0t-bg-sunken);
+  color: var(--ab0t-fg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-synthesis-weight: none;
+}
+
+.wrap { max-width: 1140px; margin: 0 auto; }
+.wrap-narrow { max-width: 780px; margin: 0 auto; }
+
+.page-head { display: flex; align-items: flex-start; gap: var(--ab0t-s4); flex-wrap: wrap; }
+.page-head > div { flex: 1 1 420px; min-width: 0; }
+h1 {
+  font-size: clamp(1.4rem, 1.1rem + 1.2vw, 2rem); margin: 0 0 var(--ab0t-s3);
+  line-height: var(--ab0t-lh-3xl); letter-spacing: var(--ab0t-tracking-hero);
+  font-weight: 700; text-wrap: balance;
+}
+/* Section rhythm: a heading belongs to what FOLLOWS it, so the space above is
+   large and the space below is small. Equal margins make a page read as one
+   undifferentiated column. */
+h2 {
+  font-size: 1.15rem; margin: var(--ab0t-s9) 0 var(--ab0t-s4);
+  line-height: var(--ab0t-lh-xl); letter-spacing: var(--ab0t-tracking-tight);
+  font-weight: 650; text-wrap: balance;
+}
+h2:first-child { margin-top: 0; }
+.lede {
+  margin: 0; color: var(--ab0t-fg-muted); font-size: 0.95rem;
+  line-height: var(--ab0t-lh-md); max-width: var(--ab0t-measure);
+  text-wrap: pretty;
+}
+.eyebrow {
+  font-size: var(--ab0t-fs-2xs); font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--ab0t-fg-muted); margin: 0 0 var(--ab0t-s2);
+}
+
+.toolbar { display: flex; gap: var(--ab0t-s2); flex-wrap: wrap; align-items: center; }
+
+/* A control that looks native to the system, built from the same tokens. */
+.ctl {
+  display: inline-flex; align-items: center; gap: var(--ab0t-s2);
+  padding: 7px 12px; min-height: 34px;
+  font: inherit; font-size: var(--ab0t-fs-sm); font-weight: 600;
+  color: var(--ab0t-fg); background: var(--ab0t-bg-raised);
+  border: 1px solid var(--ab0t-border-strong);
+  border-radius: var(--ab0t-radius-sm);
+  cursor: pointer;
+  transition: background-color var(--ab0t-dur-fast) var(--ab0t-ease);
+}
+.ctl:hover { background: var(--ab0t-bg-sunken); }
+.ctl:focus-visible { outline: 2px solid var(--ab0t-focus); outline-offset: 2px; }
+.ctl[aria-pressed="true"] {
+  background: var(--ab0t-accent); color: var(--ab0t-accent-fg);
+  border-color: var(--ab0t-accent);
+}
+
+/* min(Npx, 100%) not bare Npx: a bare track floor cannot shrink below itself, so
+   below that width the GRID overflows the viewport — empty children and all. */
+.grid {
+  display: grid; gap: var(--ab0t-s5);
+  grid-template-columns: repeat(auto-fit, minmax(min(330px, 100%), 1fr));
+}
+.grid-2 { display: grid; gap: var(--ab0t-s5); grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); }
+
+.case {
+  background: var(--ab0t-bg-raised);
+  border: 1px solid var(--ab0t-border);
+  border-radius: var(--ab0t-radius-lg);
+  box-shadow: var(--ab0t-shadow-1);
+  padding: var(--ab0t-card-pad);
+  min-width: 0;
+  display: flex; flex-direction: column;
+}
+.case > h3 {
+  font-size: var(--ab0t-fs-xs); margin: 0 0 var(--ab0t-s2);
+  text-transform: uppercase; letter-spacing: var(--ab0t-tracking-caps);
+  font-weight: 700; line-height: var(--ab0t-lh-xs);
+}
+.case > .why { font-size: var(--ab0t-fs-sm); color: var(--ab0t-fg-muted); margin: 0 0 var(--ab0t-s2); }
+.expect {
+  font-size: var(--ab0t-fs-xs); line-height: var(--ab0t-lh-xs);
+  margin: 0 0 var(--ab0t-s5);
+  padding: var(--ab0t-s3);
+  background: var(--ab0t-bg-sunken); border-radius: var(--ab0t-radius-sm);
+  color: var(--ab0t-fg-muted); border: 1px solid var(--ab0t-border);
+}
+.expect b { color: var(--ab0t-fg); }
+.verdict {
+  margin-top: var(--ab0t-s3); font-size: var(--ab0t-fs-xs); font-weight: 600;
+  line-height: 1.5; overflow-wrap: anywhere;
+}
+.pass { color: var(--ab0t-info); }
+.fail { color: var(--ab0t-exceeded); }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86em; background: var(--ab0t-bg-sunken);
+  padding: 1px 5px; border-radius: 4px; border: 1px solid var(--ab0t-border);
+}
+.note {
+  margin: var(--ab0t-s5) 0 0; padding: var(--ab0t-s4);
+  max-width: var(--ab0t-measure); line-height: var(--ab0t-lh-sm);
+  border-left: 3px solid var(--ab0t-border-strong);
+  background: var(--ab0t-bg-raised); border-radius: var(--ab0t-radius-sm);
+  font-size: var(--ab0t-fs-sm); color: var(--ab0t-fg-muted);
+}
+.note b { color: var(--ab0t-fg); }
+
+.scorebar {
+  position: sticky; bottom: 0; margin-top: var(--ab0t-s6);
+  padding: var(--ab0t-s3) var(--ab0t-s4);
+  background: var(--ab0t-bg-raised); border: 1px solid var(--ab0t-border);
+  border-radius: var(--ab0t-radius); box-shadow: var(--ab0t-shadow-2);
+  font-weight: 700;
+}
+
+.stack { display: flex; flex-direction: column; gap: var(--ab0t-s5); }
+
+@media (max-width: 640px) {
+  body { padding: var(--ab0t-s4); }
+}

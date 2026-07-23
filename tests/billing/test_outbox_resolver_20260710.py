@@ -99,7 +99,9 @@ async def test_transient_ddb_failure_then_success_starts_normally(monkeypatch):
     calls = {"n": 0}
 
     class _FakeDurableStore:
-        async def ensure_table(self):
+        async def ensure_table(self, **kw):
+            # T-6 grew the real interface with `create=` (call-site policy);
+            # this fake mirrors it. No assertion changed.
             return None
         def durable(self):
             return True

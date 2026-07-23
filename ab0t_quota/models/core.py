@@ -114,6 +114,15 @@ class ResourceDef(BaseModel):
         default=None,
         description="Longer description for admin UIs and docs",
     )
+    action_hint: Optional[str] = Field(
+        default=None,
+        description="END-CUSTOMER remediation copy shown in 429 responses: one "
+                    "sentence telling the user what they can do RIGHT NOW "
+                    "(e.g. 'Archive a project to free up a slot.'). Distinct "
+                    "from `description`, which is admin-facing prose for "
+                    "dashboards and docs. Absent = the library omits the "
+                    "sentence rather than inventing one (D-CK-1).",
+    )
     counter_type: CounterType = Field(
         ...,
         description="How usage is counted (gauge, rate, or accumulator)",
@@ -701,6 +710,19 @@ class QuotaState(BaseModel):
         default=False,
         description="Whether an org-specific override is active",
     )
+    # D-CK-3: severity reads the SAME configured thresholds the enforcement
+    # path uses. Defaults are sourced from TierLimits — the one place the
+    # library declares them — so there is no second copy to drift.
+    warning_threshold: float = Field(
+        default=TierLimits.model_fields["warning_threshold"].default,
+        ge=0.0, le=1.0,
+        description="Configured WARNING threshold for this resource's tier limit",
+    )
+    critical_threshold: float = Field(
+        default=TierLimits.model_fields["critical_threshold"].default,
+        ge=0.0, le=1.0,
+        description="Configured CRITICAL threshold for this resource's tier limit",
+    )
 
     @property
     def utilization(self) -> Optional[float]:
@@ -724,9 +746,9 @@ class QuotaState(BaseModel):
             return AlertSeverity.INFO
         if util >= 1.0:
             return AlertSeverity.EXCEEDED
-        if util >= 0.95:
+        if util >= self.critical_threshold:
             return AlertSeverity.CRITICAL
-        if util >= 0.80:
+        if util >= self.warning_threshold:
             return AlertSeverity.WARNING
         return AlertSeverity.INFO
 

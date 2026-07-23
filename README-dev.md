@@ -26,7 +26,9 @@ from ab0t_quota.providers import JWTTierProvider
 from ab0t_quota.registry import ResourceRegistry, SANDBOX_RESOURCES
 from ab0t_quota.tiers import DEFAULT_TIERS
 
-# 1. Setup
+# 1. Setup — LOCAL-DEV example: an explicitly declared localhost for a dev
+# box (the library itself never invents this value; production declares
+# its Redis in quota-config.json / QUOTA_REDIS_URL)
 redis = Redis.from_url("redis://localhost:6379/0")
 registry = ResourceRegistry()
 registry.register(*SANDBOX_RESOURCES)

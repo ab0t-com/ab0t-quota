@@ -642,7 +642,8 @@ class DDBLedgerStore:
         self.ddb = ddb_client
         self.table = table_name
 
-    async def ensure_table(self, *, active_timeout_s: float = 60.0) -> None:
+    async def ensure_table(self, *, active_timeout_s: float = 60.0,
+                           create: bool = True) -> None:
         """D-82 — CREATE the table if absent (idempotent), then WAIT for it to be ACTIVE.
 
         This store previously ASSUMED its table existed. The outbox and the activation store
@@ -665,6 +666,15 @@ class DDBLedgerStore:
                                 "ResourceNotFoundException", ())
             if not (isinstance(e, not_found) or "ResourceNotFound" in type(e).__name__):
                 raise  # a real error (perms, endpoint) — don't mask it
+            if not create:
+                raise RuntimeError(
+                    f"handler-ledger table {self.table} does not exist and "
+                    f"storage.auto_create_tables is false (the default) — "
+                    f"pre-create the table or set storage.auto_create_tables: "
+                    f"true (ENV-04)")
+            # T-18/ENV-16: create WITH the GSIs the queries need — a table
+            # created without them looked healthy while query_by_user/
+            # query_by_status failed ValidationException on every call.
             await self.ddb.create_table(
                 TableName=self.table,
                 KeySchema=[
@@ -674,8 +684,34 @@ class DDBLedgerStore:
                 AttributeDefinitions=[
                     {"AttributeName": "PK", "AttributeType": "S"},
                     {"AttributeName": "SK", "AttributeType": "S"},
+                    {"AttributeName": "gsi1_pk", "AttributeType": "S"},
+                    {"AttributeName": "gsi1_sk", "AttributeType": "S"},
+                    {"AttributeName": "gsi2_pk", "AttributeType": "S"},
+                    {"AttributeName": "gsi2_sk", "AttributeType": "S"},
+                ],
+                GlobalSecondaryIndexes=[
+                    {
+                        "IndexName": "gsi1",  # query_by_user (USER#… / attempted_at)
+                        "KeySchema": [
+                            {"AttributeName": "gsi1_pk", "KeyType": "HASH"},
+                            {"AttributeName": "gsi1_sk", "KeyType": "RANGE"},
+                        ],
+                        "Projection": {"ProjectionType": "ALL"},
+                    },
+                    {
+                        "IndexName": "gsi2",  # query_by_status (STATUS#… / attempted_at)
+                        "KeySchema": [
+                            {"AttributeName": "gsi2_pk", "KeyType": "HASH"},
+                            {"AttributeName": "gsi2_sk", "KeyType": "RANGE"},
+                        ],
+                        "Projection": {"ProjectionType": "ALL"},
+                    },
                 ],
                 BillingMode="PAY_PER_REQUEST",
+                Tags=[
+                    {"Key": "Service", "Value": "ab0t-quota"},
+                    {"Key": "ManagedBy", "Value": "ab0t-quota-library"},
+                ],
             )
             logger.info("created handler-ledger table %s", self.table)
 

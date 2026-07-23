@@ -34,6 +34,15 @@ logger = logging.getLogger("ab0t_quota.bridge")
 
 DEFAULT_TIMEOUT = 5.0  # seconds
 
+#: D-12: the sentinel reported when billing cannot answer under fail-open.
+#: Explicitly NOT a tier the operator assigned — never a real (cheapest) tier.
+TIER_UNKNOWN = "unknown"
+
+
+class BridgeUnavailableError(RuntimeError):
+    """D-12: typed bridge-outage signal. Raised (default, fail-CLOSED) instead
+    of inventing a tier when billing cannot answer a tier/usage read."""
+
 
 def _bridge_fail_open() -> bool:
     """Bridge outage policy. DEFAULT = FAIL-CLOSED (deny), so a billing outage can
@@ -152,25 +161,51 @@ class BridgeClient:
             resp = await self._client.get(url)
             return self._parse(resp, op="usage")
         except httpx.RequestError as e:
-            logger.warning("bridge_usage_network_error: %s", e)
-            return {
-                "org_id": org_id, "tier_id": "free", "tier_display": "Free",
-                "resources": [], "error": str(e),
-            }
+            # D-12: never invent a tier — same switch as every other bridge op.
+            if self._tier_unavailable(org_id, f"network error: {e}", op="usage"):
+                return {
+                    "org_id": org_id, "tier_id": TIER_UNKNOWN,
+                    "tier_display": "Unknown (billing unreachable)",
+                    "resources": [], "error": str(e), "_bridge_error": True,
+                }
+            raise BridgeUnavailableError(
+                f"billing unreachable while reading usage for org {org_id} "
+                f"(network error: {e}) — failing CLOSED (D-12; "
+                f"AB0T_QUOTA_BRIDGE_FAIL_OPEN=true opts into a tier-UNKNOWN result)")
 
     async def get_tier(self, org_id: str) -> str:
         url = f"{self._base}/billing/{org_id}/tier"
         try:
             resp = await self._client.get(url)
             if resp.status_code == 200:
-                return resp.json().get("tier_id", "free")
+                data = resp.json()
+                if "tier_id" in data:
+                    return data["tier_id"]
+                error = "HTTP 200 without a tier_id field"
+            else:
+                error = f"HTTP {resp.status_code}"
         except httpx.RequestError as e:
-            logger.warning("bridge_tier_fetch_network_error: %s", e)
-        # TODO(public-mesh-ga): Make bridge tier fallback configurable
-        # fail-open/fail-closed per consumer; hardcoded "free" can silently
-        # downgrade paid orgs during billing outages. Backlink:
-        # audit: 2026-05-16 public-mesh-ga readiness pass
-        return "free"
+            error = f"network error: {e}"
+        # D-12 (was ENV-17): no invented "free" — a billing outage or a bad mesh
+        # key must never silently enforce a paid org at the cheapest tier.
+        if self._tier_unavailable(org_id, error, op="get_tier"):
+            return TIER_UNKNOWN
+        raise BridgeUnavailableError(
+            f"billing unreachable while resolving the tier for org {org_id} "
+            f"({error}) — failing CLOSED (D-12; AB0T_QUOTA_BRIDGE_FAIL_OPEN=true "
+            f"opts into allow with tier UNKNOWN, never an invented tier)")
+
+    @staticmethod
+    def _tier_unavailable(org_id: str, error: str, *, op: str) -> bool:
+        """Log the outage + the chosen policy; True = fail OPEN (allow)."""
+        fail_open = _bridge_fail_open()
+        logger.error(
+            "bridge_%s_unavailable org=%s — failing %s "
+            "(AB0T_QUOTA_BRIDGE_FAIL_OPEN=%s): %s",
+            op, org_id,
+            "OPEN/allow with tier UNKNOWN" if fail_open else "CLOSED/deny",
+            fail_open, error)
+        return fail_open
 
     @staticmethod
     def _parse(resp: httpx.Response, op: str) -> dict:
@@ -214,7 +249,8 @@ def _network_error_result(resource_key: str, error: str) -> dict:
         "decision": "allow" if _fail_open else "deny",
         "resource_key": resource_key,
         "current": 0, "requested": 1, "limit": None,
-        "tier_id": "free", "tier_display": "Free",
+        # D-12: report the outage, never an invented (cheapest) tier.
+        "tier_id": TIER_UNKNOWN, "tier_display": "Unknown (billing unreachable)",
         "severity": "info" if _fail_open else "warning",
         "message": f"bridge unreachable: {error}",
         "_bridge_error": True,

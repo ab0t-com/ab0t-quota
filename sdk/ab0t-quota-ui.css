@@ -1,0 +1,767 @@
+/*!
+ * ab0t-quota-ui.css — the design system for the ab0t commercial UI layer.
+ * v0.2.0 · zero dependencies · no build step · no font loading · no external fetch
+ *
+ * WHITE-LABELLING: every visual decision is a --ab0t-* custom property. Host
+ * pages override the tokens on ANY ancestor element; they never need to fight a
+ * selector. There are no !important rules, no CSS reset, and no @font-face — an
+ * SDK that loads a font has chosen the client's brand for them (DESIGN §2).
+ *
+ * ACCESSIBILITY: every text/background pair below is machine-checked in BOTH
+ * themes by `node test_sdk.js` (gates X4/X5), which parse THIS FILE, computes the
+ * WCAG 2.1 relative-luminance ratio, and fails the build under 4.5:1 for body
+ * text / 3:1 for large text and non-text affordances. The numbers are measured
+ * from the artifact, never asserted in prose.
+ *
+ * Layer order, top to bottom:
+ *   1. primitive tokens (type / space / radius / elevation / motion)
+ *   2. semantic colour tokens, light + dark + explicit override
+ *   3. components
+ */
+
+/* ============================================================ 1. PRIMITIVES */
+
+:root {
+  /*
+   * TYPE.
+   *
+   * The host's font is the host's decision. `inherit` means we adopt whatever
+   * the page already uses; a brand overrides this one token to change it.
+   *
+   * WHY THERE IS NO @font-face HERE, AND WHY THAT IS NOT LAZINESS:
+   * loading a webfont would (a) fire a network request from a bundle whose
+   * whole promise is "self-contained", (b) pick the client's brand for them,
+   * and (c) add a FOUT to a billing widget. A vendor SDK that restyles its
+   * host's typography without being asked is a bug. If you want a specific
+   * face, set --ab0t-font — one token, and every component follows.
+   */
+  --ab0t-font: inherit;
+  --ab0t-font-num: inherit;
+
+  /* An opt-in stack for hosts that have NOT set their own type. Modern
+     system-ui first, then the platform faces, then a metric-compatible
+     fallback chain. Zero downloads, good on every OS. Use it by setting
+     --ab0t-font: var(--ab0t-font-ui). */
+  --ab0t-font-ui:
+    system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI",
+    Roboto, "Helvetica Neue", "Noto Sans", "Liberation Sans", Arial, sans-serif;
+  --ab0t-font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /*
+   * Type scale — 1.125 (minor third) off a 0.875rem body, in rem so host zoom
+   * and root sizing work. Each size is PAIRED with a line-height: leading is a
+   * property of the size, not a global constant, and small text needs
+   * proportionally more of it than a heading does.
+   */
+  --ab0t-fs-2xs: 0.6875rem;   /* 11px — pill text, footnotes                */
+  --ab0t-fs-xs:  0.75rem;     /* 12px — meta, captions                      */
+  --ab0t-fs-sm:  0.8125rem;   /* 13px — secondary body                      */
+  --ab0t-fs-md:  0.875rem;    /* 14px — body                                */
+  --ab0t-fs-lg:  1rem;        /* 16px — card titles                         */
+  --ab0t-fs-xl:  1.125rem;    /* 18px — section headings                    */
+  --ab0t-fs-2xl: 1.375rem;    /* 22px — page headings                       */
+  --ab0t-fs-3xl: 1.75rem;     /* 28px — hero figures (balance, totals)      */
+
+  --ab0t-lh-2xs: 1.45;
+  --ab0t-lh-xs:  1.45;
+  --ab0t-lh-sm:  1.5;
+  --ab0t-lh-md:  1.55;
+  --ab0t-lh-lg:  1.4;
+  --ab0t-lh-xl:  1.3;
+  --ab0t-lh-2xl: 1.2;
+  --ab0t-lh-3xl: 1.1;
+  /* legacy aliases, still referenced by prose blocks */
+  --ab0t-lh-tight: 1.25;
+  --ab0t-lh-body:  1.55;
+
+  /* Optical tracking: large type needs negative tracking to stop looking
+     loose, small caps-y type needs positive to stop looking cramped. */
+  --ab0t-tracking-caps:  0.06em;
+  --ab0t-tracking-tight: -0.011em;
+  --ab0t-tracking-hero:  -0.021em;
+
+  /* Comfortable measure for anything that is a real sentence. Long lines are
+     the single most common readability failure in a dashboard. */
+  --ab0t-measure: 68ch;
+
+  --ab0t-fw-normal: 400;
+  --ab0t-fw-medium: 500;
+  --ab0t-fw-semi:   600;
+  --ab0t-fw-bold:   700;
+
+  /*
+   * SPACE — one 4px-based scale, and every margin/padding/gap in the system
+   * resolves to a step on it. Nothing uses a raw pixel value.
+   *
+   * The scale is deliberately NOT linear at the top: 4-8-12-16-20-24 then
+   * jumps 32-40-56. Small steps need fine control (they separate related
+   * things); large steps separate unrelated things, where 4px of difference is
+   * invisible anyway. A linear scale wastes half its steps on distinctions
+   * nobody can see.
+   *
+   * SEMANTIC aliases sit on top of the raw steps. Components reference the
+   * ALIAS, so a brand retunes density by overriding four tokens instead of
+   * hunting through selectors — which is exactly what .brand-quanta does.
+   */
+  --ab0t-s1: 4px;
+  --ab0t-s2: 8px;
+  --ab0t-s3: 12px;
+  --ab0t-s4: 16px;
+  --ab0t-s5: 20px;
+  --ab0t-s6: 24px;
+  --ab0t-s7: 32px;
+  --ab0t-s8: 40px;
+  --ab0t-s9: 56px;
+
+  --ab0t-card-pad: var(--ab0t-s5);   /* the card's inner frame              */
+  --ab0t-gap: var(--ab0t-s3);        /* between peers on one line           */
+  --ab0t-stack: var(--ab0t-s4);      /* between stacked blocks in a card    */
+  --ab0t-stack-tight: var(--ab0t-s2);/* label -> its own value              */
+  --ab0t-section: var(--ab0t-s6);    /* between distinct regions of a card  */
+
+  /* Some children are continuations of the block above (a caption under a
+     bar, a list under its label). They cancel the parent's stack gap and
+     re-add a tight one, so the pair reads as ONE unit instead of two. */
+  --ab0t-pull-tight: calc(-1 * var(--ab0t-stack) + var(--ab0t-stack-tight));
+
+  /* Radii — one scale, one pill. A brand that wants square corners sets these
+     three to 0 and every component follows. */
+  --ab0t-radius-sm:  6px;
+  --ab0t-radius:    10px;
+  --ab0t-radius-lg: 14px;
+  --ab0t-radius-pill: 999px;
+
+  /* Elevation — deliberately restrained. Two levels, both theme-aware. */
+  --ab0t-shadow-1: 0 1px 2px rgba(16, 19, 24, 0.06), 0 1px 1px rgba(16, 19, 24, 0.04);
+  --ab0t-shadow-2: 0 4px 16px rgba(16, 19, 24, 0.10), 0 1px 3px rgba(16, 19, 24, 0.06);
+
+  /* Motion — one duration scale, one easing. Every transition in the system
+     references these, so `prefers-reduced-motion` has exactly one place to
+     switch off (see the block at the end of this file). */
+  --ab0t-dur-fast: 110ms;
+  --ab0t-dur:      190ms;
+  --ab0t-dur-slow: 420ms;
+  --ab0t-ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+
+  --ab0t-focus-width: 2px;
+  --ab0t-focus-offset: 2px;
+  --ab0t-meter-h: 8px;
+}
+
+/* ==================================================== 2. SEMANTIC COLOUR */
+/* Light is the default declaration; the dark block below re-declares the same
+   token names. Values are chosen to pass the X4 contrast gate. */
+
+:root {
+  --ab0t-fg:        #101318;
+  --ab0t-fg-muted:  #565f70;
+  --ab0t-bg:        #ffffff;
+  --ab0t-bg-sunken: #f4f6f9;
+  --ab0t-bg-raised: #ffffff;
+  --ab0t-border:    #d9dee7;
+  --ab0t-border-strong: #7f8a9b;
+
+  --ab0t-accent:        #1e4fd0;
+  --ab0t-accent-hover:  #1a44b4;
+  --ab0t-accent-active: #163a99;
+  --ab0t-accent-fg:     #ffffff;
+  --ab0t-focus:         #1e4fd0;
+
+  /* Severity. Never the sole signal — each level also carries a distinct icon
+     SHAPE and a text label (see .ab0t-badge). Colour is the third channel. */
+  --ab0t-info:     #1c7a41;
+  --ab0t-warning:  #8a5200;
+  --ab0t-critical: #ac3a06;
+  --ab0t-exceeded: #b3121f;
+
+  /* Tinted surfaces for banners. Kept very light so the severity TEXT token
+     above still clears 4.5:1 when placed on them. */
+  --ab0t-info-bg:     #eef7f1;
+  --ab0t-warning-bg:  #fdf4e5;
+  --ab0t-critical-bg: #fdf1ea;
+  --ab0t-exceeded-bg: #fdeff0;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ab0t-fg:        #e9edf5;
+    --ab0t-fg-muted:  #a3acbe;
+    --ab0t-bg:        #12151d;
+    --ab0t-bg-sunken: #1a1e28;
+    --ab0t-bg-raised: #191d26;
+    --ab0t-border:    #2e3543;
+    --ab0t-border-strong: #6a748a;
+
+    --ab0t-accent:        #93b0ff;
+    --ab0t-accent-hover:  #adc3ff;
+    --ab0t-accent-active: #c3d3ff;
+    --ab0t-accent-fg:     #0c0f15;
+    --ab0t-focus:         #93b0ff;
+
+    --ab0t-info:     #57c37c;
+    --ab0t-warning:  #e0a83f;
+    --ab0t-critical: #ff9459;
+    --ab0t-exceeded: #ff8189;
+
+    --ab0t-info-bg:     #16241c;
+    --ab0t-warning-bg:  #262013;
+    --ab0t-critical-bg: #2a1d14;
+    --ab0t-exceeded-bg: #2a1619;
+
+    --ab0t-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.45);
+    --ab0t-shadow-2: 0 4px 18px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.4);
+  }
+}
+
+/* Explicit theme attribute wins in BOTH directions — a viewer toggle must be
+   able to force light on a dark-preferring OS and vice versa. */
+:root[data-theme="light"] {
+  --ab0t-fg: #101318; --ab0t-fg-muted: #565f70; --ab0t-bg: #ffffff;
+  --ab0t-bg-sunken: #f4f6f9; --ab0t-bg-raised: #ffffff;
+  --ab0t-border: #d9dee7; --ab0t-border-strong: #7f8a9b;
+  --ab0t-accent: #1e4fd0; --ab0t-accent-hover: #1a44b4; --ab0t-accent-active: #163a99;
+  --ab0t-accent-fg: #ffffff; --ab0t-focus: #1e4fd0;
+  --ab0t-info: #1c7a41; --ab0t-warning: #8a5200; --ab0t-critical: #ac3a06; --ab0t-exceeded: #b3121f;
+  --ab0t-info-bg: #eef7f1; --ab0t-warning-bg: #fdf4e5;
+  --ab0t-critical-bg: #fdf1ea; --ab0t-exceeded-bg: #fdeff0;
+  --ab0t-shadow-1: 0 1px 2px rgba(16, 19, 24, 0.06), 0 1px 1px rgba(16, 19, 24, 0.04);
+  --ab0t-shadow-2: 0 4px 16px rgba(16, 19, 24, 0.10), 0 1px 3px rgba(16, 19, 24, 0.06);
+}
+:root[data-theme="dark"] {
+  --ab0t-fg: #e9edf5; --ab0t-fg-muted: #a3acbe; --ab0t-bg: #12151d;
+  --ab0t-bg-sunken: #1a1e28; --ab0t-bg-raised: #191d26;
+  --ab0t-border: #2e3543; --ab0t-border-strong: #6a748a;
+  --ab0t-accent: #93b0ff; --ab0t-accent-hover: #adc3ff; --ab0t-accent-active: #c3d3ff;
+  --ab0t-accent-fg: #0c0f15; --ab0t-focus: #93b0ff;
+  --ab0t-info: #57c37c; --ab0t-warning: #e0a83f; --ab0t-critical: #ff9459; --ab0t-exceeded: #ff8189;
+  --ab0t-info-bg: #16241c; --ab0t-warning-bg: #262013;
+  --ab0t-critical-bg: #2a1d14; --ab0t-exceeded-bg: #2a1619;
+  --ab0t-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --ab0t-shadow-2: 0 4px 18px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+
+/* ========================================================== 3. COMPONENTS */
+
+/* ---- shared card shell ---- */
+
+/*
+ * THE CARD SHELL — one frame, six components, identical rhythm.
+ *
+ * Every card is a flex column with ONE gap (--ab0t-stack). That is the whole
+ * vertical-rhythm mechanism: children never set their own top/bottom margins,
+ * so a card cannot drift out of step with its neighbours no matter what order
+ * the JS appends things in. The v0.1 CSS let each block carry its own
+ * margin-bottom, which is exactly why spacing varied card to card.
+ */
+.ab0t-usage,
+.ab0t-paywall,
+.ab0t-plans,
+.ab0t-invoices,
+.ab0t-balance,
+.ab0t-subscription {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ab0t-stack);
+  font-family: var(--ab0t-font);
+  font-size: var(--ab0t-fs-md);
+  line-height: var(--ab0t-lh-md);
+  color: var(--ab0t-fg);
+  background: var(--ab0t-bg-raised);
+  border: 1px solid var(--ab0t-border);
+  border-radius: var(--ab0t-radius-lg);
+  box-shadow: var(--ab0t-shadow-1);
+  padding: var(--ab0t-card-pad);
+  max-width: 100%;
+  box-sizing: border-box;
+  /* Numbers that sit in a column must line up; this is a data surface. */
+  font-variant-numeric: tabular-nums;
+  text-size-adjust: 100%;
+}
+
+.ab0t-usage *,
+.ab0t-paywall *,
+.ab0t-plans *,
+.ab0t-invoices *,
+.ab0t-balance *,
+.ab0t-subscription * { box-sizing: border-box; min-width: 0; }
+
+/* Heads sit flush in the flow — the parent gap provides their spacing, so
+   these carry NO margin of their own. */
+.ab0t-card-head,
+.ab0t-usage-head,
+.ab0t-paywall-head {
+  display: flex; align-items: center; gap: var(--ab0t-gap);
+  flex-wrap: wrap; margin: 0;
+  /* Optical: a chip next to a title should align on the title's cap-height,
+     not its box. A hair of top padding on the head does it cheaply. */
+  min-height: 1.5em;
+}
+.ab0t-usage-title, .ab0t-card-title {
+  margin: 0; font-size: var(--ab0t-fs-lg); font-weight: var(--ab0t-fw-semi);
+  line-height: var(--ab0t-lh-lg); letter-spacing: var(--ab0t-tracking-tight);
+  text-wrap: balance;
+}
+.ab0t-card-sub {
+  margin: calc(-1 * var(--ab0t-stack) + var(--ab0t-s1)) 0 0;
+  font-size: var(--ab0t-fs-sm); line-height: var(--ab0t-lh-sm);
+  color: var(--ab0t-fg-muted); max-width: var(--ab0t-measure);
+}
+
+/* ---- icons: inline SVG, drawn by the JS. Never a font, never a fetch. ---- */
+
+.ab0t-i {
+  flex: none; width: 1em; height: 1em;
+  display: inline-block; vertical-align: -0.125em;
+  stroke: currentColor; fill: none;
+  stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round;
+}
+.ab0t-i-lg { width: 1.35em; height: 1.35em; stroke-width: 1.7; }
+
+/* ---- chips & pills ---- */
+
+.ab0t-plan-chip, .ab0t-pill {
+  display: inline-flex; align-items: center; gap: var(--ab0t-s1);
+  font-size: var(--ab0t-fs-2xs); font-weight: var(--ab0t-fw-semi);
+  letter-spacing: 0.02em; padding: 3px 9px;
+  border-radius: var(--ab0t-radius-pill);
+  background: var(--ab0t-bg-sunken); color: var(--ab0t-fg-muted);
+  border: 1px solid var(--ab0t-border); white-space: nowrap;
+}
+.ab0t-pill-strong { color: var(--ab0t-fg); border-color: var(--ab0t-border-strong); }
+
+/* ---- meters ---- */
+
+.ab0t-meters { display: flex; flex-direction: column; gap: var(--ab0t-s4); }
+
+.ab0t-meter-head, .ab0t-meter-foot {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: var(--ab0t-gap);
+}
+.ab0t-meter-head { font-size: var(--ab0t-fs-md); }
+.ab0t-meter-name { font-weight: var(--ab0t-fw-medium); min-width: 0; }
+.ab0t-meter-value {
+  color: var(--ab0t-fg-muted); font-family: var(--ab0t-font-num);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.ab0t-meter-foot {
+  margin-top: var(--ab0t-s2); font-size: var(--ab0t-fs-xs);
+  line-height: var(--ab0t-lh-xs); color: var(--ab0t-fg-muted);
+}
+
+.ab0t-track {
+  position: relative; height: var(--ab0t-meter-h);
+  border-radius: var(--ab0t-radius-pill);
+  background: var(--ab0t-bg-sunken);
+  border: 1px solid var(--ab0t-border);
+  overflow: hidden;
+}
+.ab0t-meter .ab0t-track { margin-top: var(--ab0t-stack-tight); }
+
+.ab0t-fill {
+  height: 100%;
+  border-radius: var(--ab0t-radius-pill);
+  background: var(--ab0t-info);
+  transition: width var(--ab0t-dur-slow) var(--ab0t-ease),
+              background-color var(--ab0t-dur) var(--ab0t-ease);
+}
+
+/* Severity is never colour-alone — the icon SHAPE and the text label carry it
+   too. These rules only add the third (colour) channel. */
+.ab0t-sev-warning  .ab0t-fill { background: var(--ab0t-warning); }
+.ab0t-sev-critical .ab0t-fill { background: var(--ab0t-critical); }
+.ab0t-sev-exceeded .ab0t-fill { background: var(--ab0t-exceeded); }
+.ab0t-sev-info     .ab0t-badge { color: var(--ab0t-info); }
+.ab0t-sev-warning  .ab0t-badge { color: var(--ab0t-warning); }
+.ab0t-sev-critical .ab0t-badge { color: var(--ab0t-critical); }
+.ab0t-sev-exceeded .ab0t-badge { color: var(--ab0t-exceeded); }
+
+.ab0t-badge {
+  display: inline-flex; align-items: center; gap: var(--ab0t-s1);
+  font-weight: var(--ab0t-fw-semi);
+}
+.ab0t-override {
+  padding: 1px 8px; border-radius: var(--ab0t-radius-pill);
+  border: 1px dashed var(--ab0t-border-strong); color: var(--ab0t-fg-muted);
+}
+
+.ab0t-unlimited {
+  display: flex; align-items: center; gap: var(--ab0t-s2);
+  margin-top: var(--ab0t-s2); font-size: var(--ab0t-fs-sm);
+  color: var(--ab0t-fg-muted);
+}
+.ab0t-unlimited .ab0t-i { color: var(--ab0t-info); }
+
+/* ---- warning banner ---- */
+
+.ab0t-warn {
+  display: flex; flex-wrap: wrap; align-items: center;
+  justify-content: space-between; gap: var(--ab0t-gap);
+  padding: var(--ab0t-s3) var(--ab0t-s4);
+  margin: 0;
+  border-radius: var(--ab0t-radius);
+  background: var(--ab0t-warning-bg);
+  border: 1px solid var(--ab0t-border);
+  border-left: 3px solid var(--ab0t-warning);
+  font-size: var(--ab0t-fs-md);
+}
+.ab0t-warn.ab0t-sev-critical {
+  background: var(--ab0t-critical-bg); border-left-color: var(--ab0t-critical);
+}
+.ab0t-warn-body { display: flex; align-items: center; gap: var(--ab0t-s2); min-width: 0; }
+.ab0t-sev-warning  .ab0t-warn-body .ab0t-i { color: var(--ab0t-warning); }
+.ab0t-sev-critical .ab0t-warn-body .ab0t-i { color: var(--ab0t-critical); }
+.ab0t-warn .ab0t-cta { margin-top: 0; }
+
+/* ---- paywall ---- */
+
+.ab0t-paywall { border-left: 3px solid var(--ab0t-exceeded); }
+.ab0t-paywall-head .ab0t-i-lg { color: var(--ab0t-exceeded); }
+.ab0t-paywall-msg {
+  margin: 0;
+  font-size: var(--ab0t-fs-lg); line-height: var(--ab0t-lh-lg);
+  letter-spacing: var(--ab0t-tracking-tight);
+  max-width: var(--ab0t-measure);
+  text-wrap: pretty;
+}
+.ab0t-track-full .ab0t-fill { background: var(--ab0t-exceeded); }
+.ab0t-paywall-nums {
+  /* caption for the bar directly above it — one unit, not two */
+  margin-top: var(--ab0t-pull-tight);
+  font-size: var(--ab0t-fs-xs); line-height: var(--ab0t-lh-xs);
+  color: var(--ab0t-fg-muted); font-variant-numeric: tabular-nums;
+}
+.ab0t-retry {
+  margin: 0; font-size: var(--ab0t-fs-sm); line-height: var(--ab0t-lh-sm);
+  color: var(--ab0t-fg-muted);
+}
+
+.ab0t-feat-label {
+  margin: 0; font-size: var(--ab0t-fs-2xs);
+  font-weight: var(--ab0t-fw-semi); text-transform: uppercase;
+  letter-spacing: var(--ab0t-tracking-caps); color: var(--ab0t-fg-muted);
+}
+.ab0t-features {
+  /* list belongs to the label above it */
+  margin: var(--ab0t-pull-tight) 0 0; padding: 0; list-style: none;
+  font-size: var(--ab0t-fs-sm); line-height: var(--ab0t-lh-sm);
+  color: var(--ab0t-fg-muted);
+  display: flex; flex-direction: column; gap: var(--ab0t-s2);
+}
+/* NO text-transform here. A feature key is the consumer's own identifier;
+ * capitalising it renders `sso` as "Sso" and `gpu_access` as "Gpu Access" —
+ * the same `.title()`-mangling defect as TICKET_config_is_king §5e, applied at
+ * paint instead of in code. desnake() (js:104) already de-snakes; the author's
+ * casing is then left exactly as they wrote it. */
+.ab0t-features li {
+  display: flex; align-items: flex-start; gap: var(--ab0t-s2);
+}
+.ab0t-features .ab0t-i { color: var(--ab0t-info); margin-top: 0.28em; }
+
+/* ---- buttons: the full interactive-state set ---- */
+
+.ab0t-cta { margin: 0; }
+
+.ab0t-btn {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center;
+  gap: var(--ab0t-s2);
+  padding: 9px 16px; min-height: 38px;
+  border: 1px solid transparent;
+  border-radius: var(--ab0t-radius-sm);
+  font-family: var(--ab0t-font); font-size: var(--ab0t-fs-md);
+  font-weight: var(--ab0t-fw-semi); line-height: 1;
+  text-decoration: none; cursor: pointer;
+  background: var(--ab0t-accent); color: var(--ab0t-accent-fg);
+  transition: background-color var(--ab0t-dur-fast) var(--ab0t-ease),
+              box-shadow var(--ab0t-dur-fast) var(--ab0t-ease),
+              transform var(--ab0t-dur-fast) var(--ab0t-ease);
+}
+.ab0t-btn:hover { background: var(--ab0t-accent-hover); box-shadow: var(--ab0t-shadow-2); }
+.ab0t-btn:active { background: var(--ab0t-accent-active); transform: translateY(1px); box-shadow: none; }
+.ab0t-btn .ab0t-i { transition: transform var(--ab0t-dur) var(--ab0t-ease); }
+.ab0t-btn:hover .ab0t-i-arrow { transform: translateX(2px); }
+
+.ab0t-btn-secondary {
+  background: var(--ab0t-bg-raised); color: var(--ab0t-fg);
+  border-color: var(--ab0t-border-strong);
+}
+.ab0t-btn-secondary:hover { background: var(--ab0t-bg-sunken); }
+.ab0t-btn-secondary:active { background: var(--ab0t-bg-sunken); }
+
+.ab0t-btn-sm { padding: 5px 10px; min-height: 28px; font-size: var(--ab0t-fs-xs); }
+
+/* Disabled and loading share one visual language: the control is inert and
+   says so, rather than looking live and doing nothing. */
+.ab0t-btn[aria-disabled="true"],
+.ab0t-btn:disabled {
+  background: var(--ab0t-bg-sunken); color: var(--ab0t-fg-muted);
+  border-color: var(--ab0t-border);
+  cursor: not-allowed; box-shadow: none; transform: none;
+  pointer-events: none;
+}
+.ab0t-btn[data-loading="true"] { cursor: progress; pointer-events: none; }
+.ab0t-btn[data-loading="true"] .ab0t-i-spin {
+  animation: ab0t-spin 900ms linear infinite;
+  transform-origin: 50% 50%;
+}
+@keyframes ab0t-spin { to { transform: rotate(360deg); } }
+
+/* One focus treatment for every interactive element in the system. */
+.ab0t-btn:focus-visible,
+.ab0t-link:focus-visible,
+.ab0t-iconbtn:focus-visible,
+.ab0t-plan:focus-visible,
+a.ab0t-file:focus-visible {
+  outline: var(--ab0t-focus-width) solid var(--ab0t-focus);
+  outline-offset: var(--ab0t-focus-offset);
+}
+
+.ab0t-cta-text { font-size: var(--ab0t-fs-sm); color: var(--ab0t-fg-muted); }
+
+.ab0t-link {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--ab0t-accent); font: inherit; font-size: var(--ab0t-fs-sm);
+  text-decoration: underline; text-underline-offset: 2px;
+  border-radius: var(--ab0t-radius-sm);
+  transition: color var(--ab0t-dur-fast) var(--ab0t-ease);
+}
+.ab0t-link:hover { color: var(--ab0t-accent-hover); }
+
+a.ab0t-file {
+  display: inline-flex; align-items: center; gap: var(--ab0t-s1);
+  color: var(--ab0t-accent); text-decoration: none;
+  font-size: var(--ab0t-fs-xs); font-weight: var(--ab0t-fw-medium);
+  border-radius: var(--ab0t-radius-sm);
+}
+a.ab0t-file:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+/* ---- quiet / empty / error / skeleton states ---- */
+
+.ab0t-quiet {
+  display: flex; align-items: center; gap: var(--ab0t-s2);
+  font-size: var(--ab0t-fs-sm); color: var(--ab0t-fg-muted);
+}
+.ab0t-empty {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center;
+  gap: var(--ab0t-s3); padding: var(--ab0t-s8) var(--ab0t-s4);
+  min-height: 120px;
+  text-align: center; color: var(--ab0t-fg-muted);
+  font-size: var(--ab0t-fs-sm); line-height: var(--ab0t-lh-sm);
+}
+.ab0t-empty .ab0t-i { width: 22px; height: 22px; opacity: 0.7; }
+
+.ab0t-skeleton { display: flex; flex-direction: column; gap: var(--ab0t-s3); }
+.ab0t-sk {
+  height: 12px; border-radius: var(--ab0t-radius-pill);
+  background: var(--ab0t-bg-sunken);
+  background-image: linear-gradient(90deg,
+    transparent 0%, var(--ab0t-border) 45%, transparent 90%);
+  background-size: 260% 100%;
+  animation: ab0t-shimmer 1.35s var(--ab0t-ease) infinite;
+}
+.ab0t-sk-title { height: 16px; width: 42%; }
+.ab0t-sk-bar { height: var(--ab0t-meter-h); }
+.ab0t-sk-row { height: 12px; width: 72%; }
+@keyframes ab0t-shimmer {
+  from { background-position: 140% 0; }
+  to   { background-position: -60% 0; }
+}
+
+/* ---- plan comparison ---- */
+
+.ab0t-plan-grid {
+  display: grid; gap: var(--ab0t-s4);
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+.ab0t-plan {
+  display: flex; flex-direction: column; gap: var(--ab0t-stack);
+  padding: var(--ab0t-card-pad);
+  border: 1px solid var(--ab0t-border);
+  border-radius: var(--ab0t-radius);
+  background: var(--ab0t-bg);
+  min-width: 0;
+  transition: border-color var(--ab0t-dur) var(--ab0t-ease),
+              box-shadow var(--ab0t-dur) var(--ab0t-ease),
+              transform var(--ab0t-dur) var(--ab0t-ease);
+}
+.ab0t-plan:hover { box-shadow: var(--ab0t-shadow-2); transform: translateY(-2px); }
+.ab0t-plan-current {
+  border-color: var(--ab0t-accent);
+  box-shadow: 0 0 0 1px var(--ab0t-accent);
+}
+.ab0t-plan-name {
+  margin: 0; font-size: var(--ab0t-fs-xl); font-weight: var(--ab0t-fw-semi);
+  line-height: var(--ab0t-lh-xl); letter-spacing: var(--ab0t-tracking-tight);
+  text-wrap: balance;
+}
+.ab0t-plan-desc {
+  margin: var(--ab0t-pull-tight) 0 0;
+  font-size: var(--ab0t-fs-sm); line-height: var(--ab0t-lh-sm);
+  color: var(--ab0t-fg-muted); text-wrap: pretty;
+}
+.ab0t-plan-price {
+  font-size: clamp(var(--ab0t-fs-2xl), 1.1rem + 1.4vw, var(--ab0t-fs-3xl));
+  font-weight: var(--ab0t-fw-bold);
+  line-height: var(--ab0t-lh-3xl); letter-spacing: var(--ab0t-tracking-hero);
+  font-variant-numeric: tabular-nums;
+}
+.ab0t-plan-period { font-size: var(--ab0t-fs-sm); font-weight: var(--ab0t-fw-normal); color: var(--ab0t-fg-muted); }
+.ab0t-plan-limits {
+  margin: 0; padding: 0; list-style: none;
+  border-top: 1px solid var(--ab0t-border);
+}
+.ab0t-plan-limits li:last-child { border-bottom: none; }
+.ab0t-plan-limits li {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: var(--ab0t-s4); padding: var(--ab0t-s2) 0;
+  border-bottom: 1px solid var(--ab0t-border);
+  font-size: var(--ab0t-fs-sm);
+}
+.ab0t-limit-key { color: var(--ab0t-fg-muted); min-width: 0; }
+.ab0t-limit-val { font-weight: var(--ab0t-fw-semi); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ab0t-plan .ab0t-cta { margin-top: auto; }
+.ab0t-plan .ab0t-btn { width: 100%; }
+
+/* ---- tabular widgets: invoices ---- */
+
+.ab0t-rows { display: flex; flex-direction: column; }
+.ab0t-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--ab0t-s4); padding: var(--ab0t-s3) 0;
+  border-top: 1px solid var(--ab0t-border);
+  font-size: var(--ab0t-fs-sm); line-height: var(--ab0t-lh-sm);
+}
+/* The first row's rule would double the card's own top edge; the last row's
+   padding would look heavier than the card's bottom padding. Trim both. */
+.ab0t-row:first-child { border-top: none; padding-top: 0; }
+.ab0t-row:last-child { padding-bottom: 0; }
+.ab0t-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ab0t-row-title { font-weight: var(--ab0t-fw-semi); color: var(--ab0t-fg); }
+.ab0t-row-meta { color: var(--ab0t-fg-muted); font-size: var(--ab0t-fs-xs); }
+.ab0t-row-side {
+  display: flex; align-items: center; gap: var(--ab0t-s3);
+  flex-wrap: wrap; justify-content: flex-end;
+}
+.ab0t-amount { font-weight: var(--ab0t-fw-semi); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ab0t-row-due .ab0t-pill { color: var(--ab0t-critical); border-color: var(--ab0t-critical); }
+.ab0t-more {
+  margin: var(--ab0t-pull-tight) 0 0; padding-top: var(--ab0t-s3);
+  border-top: 1px solid var(--ab0t-border);
+  font-size: var(--ab0t-fs-xs); color: var(--ab0t-fg-muted);
+}
+
+/* ---- balance / spend summary ---- */
+
+.ab0t-figures {
+  display: grid; gap: var(--ab0t-s4);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.ab0t-figure {
+  display: flex; flex-direction: column; gap: var(--ab0t-s1);
+  padding: var(--ab0t-s4) var(--ab0t-s4) var(--ab0t-s5);
+  background: var(--ab0t-bg-sunken);
+  border: 1px solid var(--ab0t-border);
+  border-radius: var(--ab0t-radius);
+  min-width: 0;
+}
+.ab0t-figure-label {
+  font-size: var(--ab0t-fs-2xs); font-weight: var(--ab0t-fw-semi);
+  text-transform: uppercase; letter-spacing: var(--ab0t-tracking-caps);
+  color: var(--ab0t-fg-muted);
+}
+.ab0t-figure-value {
+  /* Fluid: a long amount in a narrow tile must shrink rather than overflow.
+     Floor 1.125rem so it never drops below the card title it sits under. */
+  font-size: clamp(var(--ab0t-fs-xl), 1rem + 1.1vw, var(--ab0t-fs-2xl));
+  font-weight: var(--ab0t-fw-bold);
+  line-height: var(--ab0t-lh-2xl); letter-spacing: var(--ab0t-tracking-hero);
+  margin-top: auto;
+  font-family: var(--ab0t-font-num); font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.ab0t-figure-note {
+  font-size: var(--ab0t-fs-xs); line-height: var(--ab0t-lh-xs);
+  color: var(--ab0t-fg-muted); text-wrap: pretty;
+}
+
+/* ---- subscription status ---- */
+
+.ab0t-sub { display: flex; flex-direction: column; gap: var(--ab0t-stack); }
+.ab0t-sub-head {
+  display: flex; align-items: center; gap: var(--ab0t-s3); flex-wrap: wrap;
+}
+.ab0t-sub-plan {
+  font-size: var(--ab0t-fs-lg); font-weight: var(--ab0t-fw-semi);
+  overflow-wrap: anywhere;
+}
+.ab0t-facts {
+  margin: 0; display: grid; gap: var(--ab0t-s2) var(--ab0t-s5);
+  /* max-content keeps every value on ONE left edge; the labels size to the
+     longest of them instead of each row inventing its own alignment. */
+  grid-template-columns: max-content 1fr;
+  font-size: var(--ab0t-fs-sm); line-height: var(--ab0t-lh-sm);
+}
+.ab0t-facts dt { color: var(--ab0t-fg-muted); text-wrap: nowrap; }
+.ab0t-facts dd { margin: 0; font-variant-numeric: tabular-nums; }
+.ab0t-notice {
+  display: flex; align-items: flex-start; gap: var(--ab0t-s2);
+  padding: var(--ab0t-s3);
+  border-radius: var(--ab0t-radius);
+  background: var(--ab0t-warning-bg);
+  border: 1px solid var(--ab0t-border);
+  border-left: 3px solid var(--ab0t-warning);
+  font-size: var(--ab0t-fs-sm);
+}
+.ab0t-notice .ab0t-i { color: var(--ab0t-warning); margin-top: 0.15em; }
+
+/* ---- screen-reader-only helper (live-region text) ---- */
+
+.ab0t-sr {
+  position: absolute; width: 1px; height: 1px; padding: 0;
+  margin: -1px; overflow: hidden; clip: rect(0 0 0 0);
+  white-space: nowrap; border: 0;
+}
+
+/* ============================================================ RESPONSIVE */
+
+@media (max-width: 640px) {
+  :root { --ab0t-card-pad: var(--ab0t-s4); }
+  .ab0t-row { flex-direction: column; align-items: flex-start; gap: var(--ab0t-s2); }
+  .ab0t-row-side { justify-content: flex-start; }
+  .ab0t-facts { grid-template-columns: 1fr; gap: var(--ab0t-s1); }
+  .ab0t-facts dd { margin-bottom: var(--ab0t-s2); }
+}
+
+@media (max-width: 480px) {
+  .ab0t-warn { flex-direction: column; align-items: flex-start; }
+  .ab0t-warn .ab0t-btn { width: 100%; }
+  .ab0t-meter-head { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .ab0t-plan-grid { grid-template-columns: 1fr; }
+  .ab0t-figures { grid-template-columns: 1fr; }
+}
+
+/* ============================================== REDUCED MOTION (one place) */
+
+@media (prefers-reduced-motion: reduce) {
+  .ab0t-fill,
+  .ab0t-btn,
+  .ab0t-btn .ab0t-i,
+  .ab0t-link,
+  .ab0t-plan { transition: none; }
+  .ab0t-plan:hover, .ab0t-btn:active { transform: none; }
+  .ab0t-sk { animation: none; }
+  .ab0t-btn[data-loading="true"] .ab0t-i-spin { animation: none; }
+}
+
+/* ================================================== FORCED COLOURS / HC */
+/* In Windows High Contrast the fill loses its background; give it a visible
+   border so the meter still reads as a filled proportion. */
+
+@media (forced-colors: active) {
+  .ab0t-fill { forced-color-adjust: none; background: Highlight; }
+  .ab0t-track { border-color: CanvasText; }
+  .ab0t-btn { border-color: ButtonText; }
+}

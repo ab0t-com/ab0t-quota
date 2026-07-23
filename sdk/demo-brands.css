@@ -1,0 +1,162 @@
+/*
+ * demo-brands.css — TWO fictional consumers' brands, expressed ENTIRELY as
+ * --ab0t-* token overrides on a wrapper element.
+ *
+ * This file is the white-label proof. Read it and notice what is NOT here:
+ *
+ *   - not one selector names an ab0t component (.ab0t-btn, .ab0t-meter, …)
+ *   - not one !important
+ *   - no forked CSS, no shadow DOM, no build step, no JS
+ *
+ * A consumer restyles the entire widget set — colour, radius, type, density,
+ * meter thickness, elevation — by writing a block like one of these and
+ * putting the class on any ancestor. That is the integration a vendor is
+ * buying, and it either works from tokens alone or the SDK is not white-label.
+ *
+ * THE FOUR-BLOCK PATTERN. Each brand declares its palette four times, and all
+ * four are load-bearing:
+ *
+ *   1. `.brand-x { … }`                          light, the default
+ *   2. `@media (prefers-color-scheme: dark)`     follows the OS
+ *   3. `:root[data-theme="light"] .brand-x`      a viewer toggle forcing light
+ *   4. `:root[data-theme="dark"]  .brand-x`      a viewer toggle forcing dark
+ *
+ * Skip 3 and 4 and the host's theme switch silently stops working inside the
+ * branded subtree — the widgets go dark while the brand's own surfaces stay
+ * light. A brand that only themes one mode is broken for half its customers.
+ *
+ * Every colour pair below was checked with the same method as the SDK's own
+ * palette (`node contrast.js`); brand accents clear 4.5:1 against the brand
+ * surface they sit on in both modes.
+ */
+
+/* ======================================================== ATLAS PRESS ====
+ * A publishing customer. Serif, pill-shaped, generous, warm paper surfaces,
+ * thick meters. About as far from a default admin console as tokens allow.
+ */
+
+.brand-atlas {
+  /* form — identical in both modes */
+  --ab0t-font: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  --ab0t-font-num: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --ab0t-radius-sm: 999px;
+  --ab0t-radius: 20px;
+  --ab0t-radius-lg: 24px;
+  --ab0t-card-pad: var(--ab0t-s7);
+  --ab0t-meter-h: 12px;
+  --ab0t-fs-lg: 1.0625rem;
+}
+.brand-atlas,
+:root[data-theme="light"] .brand-atlas {
+  --ab0t-accent: #7a2f6a;        /* 8.46:1 on #fffdf9 */
+  --ab0t-accent-hover: #672858;
+  --ab0t-accent-active: #55214a;
+  --ab0t-accent-fg: #ffffff;
+  --ab0t-focus: #7a2f6a;
+  --ab0t-bg: #fffdf9;
+  --ab0t-bg-raised: #fffdf9;
+  --ab0t-bg-sunken: #f4ede2;
+  --ab0t-border: #e0d3c1;
+  --ab0t-border-strong: #8a7860;
+  --ab0t-fg: #241c16;
+  --ab0t-fg-muted: #5c5045;
+}
+@media (prefers-color-scheme: dark) {
+  .brand-atlas {
+    --ab0t-accent: #eaa8d8;      /* 9.28:1 on #1d1720 */
+    --ab0t-accent-hover: #f2c0e5;
+    --ab0t-accent-active: #f8d7ef;
+    --ab0t-accent-fg: #1a0f17;
+    --ab0t-focus: #eaa8d8;
+    --ab0t-bg: #171219;
+    --ab0t-bg-raised: #1d1720;
+    --ab0t-bg-sunken: #251e29;
+    --ab0t-border: #3a2f3f;
+    --ab0t-border-strong: #857392;
+    --ab0t-fg: #f2e9ee;
+    --ab0t-fg-muted: #b6a7b6;
+  }
+}
+:root[data-theme="dark"] .brand-atlas {
+  --ab0t-accent: #eaa8d8;
+  --ab0t-accent-hover: #f2c0e5;
+  --ab0t-accent-active: #f8d7ef;
+  --ab0t-accent-fg: #1a0f17;
+  --ab0t-focus: #eaa8d8;
+  --ab0t-bg: #171219;
+  --ab0t-bg-raised: #1d1720;
+  --ab0t-bg-sunken: #251e29;
+  --ab0t-border: #3a2f3f;
+  --ab0t-border-strong: #857392;
+  --ab0t-fg: #f2e9ee;
+  --ab0t-fg-muted: #b6a7b6;
+}
+
+/* ====================================================== QUANTA SYSTEMS ====
+ * A developer-tools customer. Monospace, zero radius, compact, hairline
+ * borders instead of shadows, 4px meters. The opposite end of every axis.
+ */
+
+.brand-quanta {
+  --ab0t-font: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --ab0t-font-num: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --ab0t-radius-sm: 0px;
+  --ab0t-radius: 0px;
+  --ab0t-radius-lg: 0px;
+  --ab0t-radius-pill: 0px;
+  --ab0t-card-pad: var(--ab0t-s3);
+  --ab0t-gap: var(--ab0t-s2);
+  --ab0t-meter-h: 4px;
+  --ab0t-fs-md: 0.8125rem;
+  --ab0t-fs-lg: 0.875rem;
+  --ab0t-fs-xl: 1rem;
+  --ab0t-shadow-1: none;
+}
+.brand-quanta,
+:root[data-theme="light"] .brand-quanta {
+  --ab0t-accent: #0a6b60;        /* 6.39:1 on #ffffff */
+  --ab0t-accent-hover: #085a51;
+  --ab0t-accent-active: #064a43;
+  --ab0t-accent-fg: #ffffff;
+  --ab0t-focus: #0a6b60;
+  --ab0t-bg: #ffffff;
+  --ab0t-bg-raised: #ffffff;
+  --ab0t-bg-sunken: #eef2f1;
+  --ab0t-border: #ccd6d4;
+  --ab0t-border-strong: #6b7c79;
+  --ab0t-fg: #0d1615;
+  --ab0t-fg-muted: #4f5e5c;
+  --ab0t-shadow-2: 0 0 0 2px var(--ab0t-accent);
+}
+@media (prefers-color-scheme: dark) {
+  .brand-quanta {
+    --ab0t-accent: #4fd6c4;      /* 9.42:1 on #10201e */
+    --ab0t-accent-hover: #74e2d3;
+    --ab0t-accent-active: #99ede1;
+    --ab0t-accent-fg: #04211d;
+    --ab0t-focus: #4fd6c4;
+    --ab0t-bg: #0b1817;
+    --ab0t-bg-raised: #10201e;
+    --ab0t-bg-sunken: #142826;
+    --ab0t-border: #23413d;
+    --ab0t-border-strong: #5f8480;
+    --ab0t-fg: #dfeeeb;
+    --ab0t-fg-muted: #93aaa6;
+    --ab0t-shadow-2: 0 0 0 2px var(--ab0t-accent);
+  }
+}
+:root[data-theme="dark"] .brand-quanta {
+  --ab0t-accent: #4fd6c4;
+  --ab0t-accent-hover: #74e2d3;
+  --ab0t-accent-active: #99ede1;
+  --ab0t-accent-fg: #04211d;
+  --ab0t-focus: #4fd6c4;
+  --ab0t-bg: #0b1817;
+  --ab0t-bg-raised: #10201e;
+  --ab0t-bg-sunken: #142826;
+  --ab0t-border: #23413d;
+  --ab0t-border-strong: #5f8480;
+  --ab0t-fg: #dfeeeb;
+  --ab0t-fg-muted: #93aaa6;
+  --ab0t-shadow-2: 0 0 0 2px var(--ab0t-accent);
+}
