@@ -63,7 +63,7 @@ Payment service reads this in `core/quota.py:resolve_price_to_tier()`.
 
 ## Checkout Session Metadata
 
-The sandbox-platform passes `org_id` in checkout session metadata:
+Pass `org_id` in the checkout session metadata:
 
 ```python
 session = stripe.checkout.Session.create(

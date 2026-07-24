@@ -107,8 +107,8 @@ Pick one `billing_model` per tier:
 | Value | Use for |
 |---|---|
 | `capacity_only` *(default)* | Limits-only tier with no money side-effects |
-| `consumption_only` | Pay-as-you-go top-ups (no subscription). Combine with `initial_credit` to grant a starting balance — that's how sandbox-platform's free tier gives every user $10 to try things |
-| `subscription_with_credits` | Paid sub that grants $Y of bundled spend each period (the dominant paid-tier model in sandbox-platform) |
+| `consumption_only` | Pay-as-you-go top-ups (no subscription). Combine with `initial_credit` to grant a starting balance — e.g. a free tier that grants every user $10 of starting balance |
+| `subscription_with_credits` | Paid sub that grants $Y of bundled spend each period (the most common paid-tier model) |
 | `subscription_unlock_only` | Paid sub that only raises limits — no credit grant. Use when the value of the tier is purely capacity, not bundled spend |
 
 Lifecycle choices on `credit_grant`:

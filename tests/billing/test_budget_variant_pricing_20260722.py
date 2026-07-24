@@ -260,9 +260,10 @@ def test_a_product_literally_named_sandbox_gets_no_special_treatment():
 # $0.08/h instead of the invented $0.10 default. Zero regression, one real fix.
 # ---------------------------------------------------------------------------
 
-SANDBOX_CONFIG = pathlib.Path(
-    "/home/ubuntu/infra/infra/code/resource/output/sandbox-platform/quota-config.json"
-)
+# In-repo fixture, not an absolute path on one developer's machine (which made
+# this guard skip — and therefore pass — everywhere else).
+SANDBOX_CONFIG = pathlib.Path(__file__).resolve().parents[1] / "data" / \
+    "consumer_sandbox_platform_quota_config_20260721.json"
 
 
 def _real_pricing():

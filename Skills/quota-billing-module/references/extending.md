@@ -32,6 +32,6 @@ Always call `verify_org_access(org_id, user)` in the route handler.
 
 ## Testing
 
-UJ tests live at `billing/output/scripts/curl_tests/user_journeys/UJ-03*.sh`.
+UJ tests live at `<billing-service>/scripts/curl_tests/user_journeys/UJ-03*.sh`.
 Source `quota_test_helpers.sh` for auth bootstrap.
 Each test must be self-contained and idempotent.

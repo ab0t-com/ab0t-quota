@@ -377,7 +377,7 @@ For each archetype above, here's what your service + payment-service + ab0t-quot
 
 ### For any model with `subscription_*`:
 
-1. **`payment-service`** must set `subscription_data.metadata = {"org_id": org_id, "plan_id": plan_id}` on Stripe Checkout sessions. (Lands in `payment/output/app/api/routes/checkout.py:~1281`.)
+1. **`payment-service`** must set `subscription_data.metadata = {"org_id": org_id, "plan_id": plan_id}` on Stripe Checkout sessions. (Lands in the payment service's `app/api/routes/checkout.py`.)
 
 2. **`ab0t-quota`** must receive paid-invoice events — `invoice.paid` and/or `invoice.payment_succeeded` (the lib accepts both). Options:
    - Direct HTTP POST from payment-service to a consumer endpoint (consumer registers its URL).

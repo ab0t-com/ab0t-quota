@@ -1,11 +1,11 @@
 ---
 name: quota-billing-module
-description: Work with the billing service's self-contained quota tier module at billing/output/app/modules/quota/. Use when modifying tier CRUD endpoints, adding new tier features, changing the DynamoDB store (ab0t_quota_state table), updating override logic, fixing tier history or audit trail issues, wiring payment webhook tier sync, debugging tier read/write failures, or extending the module for new commercial features. The module is designed to be extractable to its own service.
+description: Work with the billing service's self-contained quota tier module (`app/modules/quota/`). Use when modifying tier CRUD endpoints, adding new tier features, changing the DynamoDB store (ab0t_quota_state table), updating override logic, fixing tier history or audit trail issues, wiring payment webhook tier sync, debugging tier read/write failures, or extending the module for new commercial features. The module is designed to be extractable to its own service.
 ---
 
 # Billing Quota Module
 
-Self-contained module at `billing/output/app/modules/quota/`. Manages org tiers, overrides, and history. Billing owns tiers because it's the commercial state service. Auth stays lean (identity only).
+Self-contained module at the billing service's `app/modules/quota/`. Manages org tiers, overrides, and history. Billing owns tiers because it's the commercial state service. Auth stays lean (identity only).
 
 ## Module Structure
 

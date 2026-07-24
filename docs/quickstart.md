@@ -49,18 +49,44 @@ Steps 1-2 below are only needed for the **mesh commercial surface** (tiers synce
 from billing, checkout, invoices, the customer portal). Quota enforcement itself
 does not require them.
 
-### 1. Get a mesh credential
+### 1. Get a mesh credential — self-serve, one command
 
-Register your service with ab0t (one-time). You get back:
-- `AB0T_MESH_API_KEY` — your service's mesh credential
-- `AB0T_CONSUMER_ORG_ID` — your service's identity in the mesh
+Install the mesh onboarding client and register. Signup is open; no ticket, no
+email, no waiting:
 
-Set both as environment variables in your deployment.
+```sh
+curl -fsSL https://raw.githubusercontent.com/ab0t-com/clientsetup/main/install.sh | sh
+setup run 07          # register this service as a billing + payment consumer
+```
 
-> **How to register:** this is currently a manual step — contact ab0t
-> (support@ab0t.com) to have your service registered and your credentials
-> issued. There is no self-service portal yet. **If you only want to evaluate
-> the library, skip this entirely and use step 0.**
+The installer is POSIX sh, HTTPS-only, verifies the published sha256 before
+installing, and keeps the previous binary for one-step rollback. **It is
+idempotent — to update, run the exact same command again.** There is no separate
+update flag. Pin a version with `REF=vX.Y.Z`, or relocate with
+`PREFIX=$HOME/.local`.
+
+Registration writes your credential to
+`~/.authmesh/<your-service>/billing-consumer.prod.json`. Export what this library
+reads:
+
+```sh
+export AB0T_MESH_API_KEY="$(jq -r .api_key.key \
+  ~/.authmesh/<your-service>/billing-consumer.prod.json)"
+export AB0T_CONSUMER_ORG_ID="<your service's mesh org UUID>"   # printed by run 07
+```
+
+> ⚠️ **The variable name differs between the two tools.** `clientsetup` prints
+> `BILLING_SERVICE_API_KEY`; this library reads **`AB0T_MESH_API_KEY`**. It is
+> the same value — the export above is the bridge. Skipping it produces
+> `QUOTA-CFG-007: bridge mode without its mesh API key`.
+
+Load the key from your secrets manager in production. **Never commit it.**
+
+Full onboarding reference: <https://github.com/ab0t-com/clientsetup> — see its
+`QUICKSTART.md`.
+
+> **Only evaluating?** Skip this entirely and use step 0 — `preflight` and
+> `doctor` need no credential and contact nothing.
 
 ### 2. Install the library
 

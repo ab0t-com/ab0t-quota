@@ -163,18 +163,19 @@ class TestLoadTiersBillingFields:
         tier = load_tiers(cfg)["hybrid"]
         assert tier.credit_grant.amount_per_period == Decimal("20.00")
 
-    def test_sandbox_platform_real_config_loads_all_four_tiers(self):
-        """End-to-end: the actual sandbox-platform quota-config.json loads
-        with every tier's policy intact. This is the canonical real-world
-        regression guard — if this breaks, every paying customer is affected.
+    def test_four_tier_reference_config_loads_all_policies(self):
+        """End-to-end: a full four-tier config loads with every tier's policy
+        intact. The realistic regression guard for tier loading.
+
+        Reads the in-repo fixture, NOT a checkout outside this repository — a
+        library's tests must not reach into a consumer's directory layout, and
+        must not skip silently when that layout is absent (a skip reads as a
+        pass, so the guard was effectively off anywhere but one machine).
         """
         import json
         from pathlib import Path
-        cfg_path = Path(__file__).resolve().parents[3] / \
-            "resource/output/sandbox-platform/quota-config.json"
-        if not cfg_path.exists():
-            import pytest
-            pytest.skip(f"sandbox-platform config not at {cfg_path}")
+        cfg_path = Path(__file__).parent / "data" / \
+            "consumer_sandbox_platform_quota_config_20260721.json"
 
         cfg = json.loads(cfg_path.read_text())
         tiers = load_tiers(cfg)

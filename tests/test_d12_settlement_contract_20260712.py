@@ -34,21 +34,24 @@ failure B-D1 describes — it would keep agreeing with a law nobody runs any mor
 cannot certify Go against the real billing service: **a Go↔real-billing test remains OWED.**
 
 RUN (needs both houses' deps in one interpreter — billing's venv has them):
-    cd /home/ubuntu/infra/infra/code/billing/output
-    PYTHONPATH=/home/ubuntu/infra/infra/code/shared/ab0t-quota ./venv/bin/python -m pytest \\
-      /home/ubuntu/infra/infra/code/shared/ab0t-quota/tests/test_d12_settlement_contract_20260712.py -v
+    cd <billing-service>
+    PYTHONPATH=<path-to>/ab0t-quota ./venv/bin/python -m pytest \\
+      <path-to>/ab0t-quota/tests/test_d12_settlement_contract_20260712.py -v
 """
 import json
 import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import os
 from pathlib import Path
 
 import pytest
 
 from ab0t_quota.billing.observation import UnsettleableEvent, observe
 
-BILLING_ROOT = Path("/home/ubuntu/infra/infra/code/billing/output")
+# Resolved from an env var, not a path on one machine. Unset ⇒ the test skips
+# explicitly rather than silently depending on a private checkout location.
+BILLING_ROOT = Path(os.environ.get("AB0T_BILLING_ROOT", "")) if os.environ.get("AB0T_BILLING_ROOT") else None
 VECTORS = Path(__file__).parent / "data" / "settlement_contract_vectors_20260712.json"
 
 _IMPORT_ERROR = None

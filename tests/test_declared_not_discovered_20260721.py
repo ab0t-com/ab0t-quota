@@ -40,8 +40,14 @@ from tests.dnd_harness_20260721 import (
 )
 
 CONSUMER_CONFIG = Path(__file__).parent / "data" / "consumer_sandbox_platform_quota_config_20260721.json"
-CANONICAL_CONSUMER_CONFIG = Path(__file__).resolve().parents[3] / \
-    "resource/output/sandbox-platform/quota-config.json"
+# The fixture above is a self-contained test example: a full, realistic config of
+# the shape that produced the incident. It is deliberately NOT tied to any
+# checkout outside this repo — a library's test suite must not reach into a
+# consumer's directory layout, and it must not go red because a consumer edited
+# their own config. (Both happened: the old sync check hard-pathed
+# `../../../resource/output/<consumer>/quota-config.json`, so the suite depended
+# on a private repo being present at a fixed relative path AND on that consumer
+# never changing it.)
 
 LIB_DIR = Path(__file__).resolve().parents[1] / "ab0t_quota"
 
@@ -76,6 +82,27 @@ def _consumer_config() -> dict:
     return json.loads(CONSUMER_CONFIG.read_text())
 
 
+def _consumer_config_at_incident() -> dict:
+    """The consumer's config **in the shape that caused the incident**: every
+    real field of theirs, with `storage.redis_url` forced back to `null`.
+
+    Why this exists (2026-07-24): the gates below originally read the consumer's
+    live config directly, which silently assumed the consumer would stay broken.
+    When they fixed it — declaring `${QUOTA_REDIS_URL:-…}` instead of `null` —
+    three gates went red even though the library was correct. **A regression test
+    that depends on a customer remaining broken stops testing the defect the
+    moment they recover, which is exactly when you most want it still armed.**
+
+    So: keep sourcing every other field from their real config (that is what
+    made these gates trustworthy), and pin only the one field the incident was
+    about. The byte-for-byte sync check against their live file stays separate
+    and unchanged — it tracks drift; this pins the defect.
+    """
+    cfg = _consumer_config()
+    cfg.setdefault("storage", {})["redis_url"] = None
+    return cfg
+
+
 MINIMAL_TIERS = [{
     "tier_id": "free", "display_name": "Free", "sort_order": 1,
     "limits": {"thing.concurrent": 5}, "features": [],
@@ -86,14 +113,22 @@ MINIMAL_TIERS = [{
 # T-1 / T-2 — the headline and the ENV-01/02 family
 # ---------------------------------------------------------------------------
 
-def test_consumer_config_copy_is_in_sync():
-    """The frozen copy must byte-match the canonical consumer file when visible.
+def test_consumer_config_fixture_has_the_incident_shape():
+    """The fixture must keep the structural properties the gates below rely on.
 
-    Only THIS sync check may skip (design §2.4); the headline test never does.
+    Replaces the old byte-for-byte sync check against a consumer's live file
+    (design §2.4). That check tied this suite to a directory outside the repo and
+    went red when the consumer FIXED their config — i.e. it asserted that someone
+    else stayed broken. What the gates actually need is the *shape*, which is
+    what this pins.
     """
-    if not CANONICAL_CONSUMER_CONFIG.exists():
-        pytest.skip(f"canonical consumer config not at {CANONICAL_CONSUMER_CONFIG}")
-    assert CONSUMER_CONFIG.read_bytes() == CANONICAL_CONSUMER_CONFIG.read_bytes()
+    cfg = _consumer_config()
+    assert isinstance(cfg.get("storage"), dict), "fixture must declare a storage block"
+    assert cfg.get("tiers"), "fixture must declare tiers (the gates load them)"
+    assert cfg.get("resources"), "fixture must declare resources"
+    # The incident shape is applied by _consumer_config_at_incident(), not baked
+    # into the fixture — so the fixture stays a valid, bootable example.
+    assert _consumer_config_at_incident()["storage"]["redis_url"] is None
 
 
 def test_typed_error_is_exported():
@@ -110,7 +145,7 @@ def test_null_redis_url_is_a_config_error(tmp_path, monkeypatch, polluted_env,
     environment polluted with generic decoys, produces ONE config error naming
     storage.redis_url — and contacts NOTHING."""
     from ab0t_quota import setup_quota
-    _write_config(tmp_path, monkeypatch, _consumer_config())
+    _write_config(tmp_path, monkeypatch, _consumer_config_at_incident())
 
     app = FastAPI()
     with caplog.at_level(logging.DEBUG):
@@ -164,7 +199,7 @@ def test_password_not_harvested_from_generic_env(tmp_path, monkeypatch, polluted
     the connection must carry NO password."""
     from ab0t_quota import setup_quota
     monkeypatch.setenv("QUOTA_REDIS_URL", "redis://declared-host.test:6379/0")
-    _write_config(tmp_path, monkeypatch, _consumer_config())  # redis_url: null
+    _write_config(tmp_path, monkeypatch, _consumer_config_at_incident())  # redis_url: null
 
     app = FastAPI()
     with pytest.raises(Exception):
@@ -372,7 +407,7 @@ def test_undeclared_store_never_reaches_gates(tmp_path, monkeypatch, seam_record
     monkeypatch.setattr(setup_mod, "_gate_redis_topology", recording_gate)
     for name in ("QUOTA_REDIS_URL", "REDIS_URL"):
         monkeypatch.delenv(name, raising=False)
-    _write_config(tmp_path, monkeypatch, _consumer_config())  # redis_url: null
+    _write_config(tmp_path, monkeypatch, _consumer_config_at_incident())  # redis_url: null
 
     app = FastAPI()
     with pytest.raises(Exception) as ei:

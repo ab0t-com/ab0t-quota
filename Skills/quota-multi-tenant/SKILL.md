@@ -10,7 +10,7 @@ description: Design and enforce quota tiers across a multi-tenant mesh network o
 Each service in the mesh is a **separate company** with its own pricing:
 - Auth service has its own tiers (users/teams/API keys) — auth's business
 - Billing service owns **commercial tiers** for consumer services
-- Each consumer (sandbox-platform, resource-service) reads tiers from billing
+- Each consumer service reads tiers from billing
 
 No god services. Auth doesn't know about sandbox tiers. Billing doesn't know about auth tiers.
 

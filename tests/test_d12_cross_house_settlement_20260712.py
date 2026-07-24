@@ -39,10 +39,10 @@ Until this change, nothing called it. The endpoint existed and **the money was s
 
 HOW TO RUN (needs BOTH houses' dependencies in one interpreter — billing's venv has them)
 -----------------------------------------------------------------------------------------
-    cd /home/ubuntu/infra/infra/code/billing/output
-    PYTHONPATH=/home/ubuntu/infra/infra/code/shared/ab0t-quota \\
+    cd <billing-service>
+    PYTHONPATH=<path-to>/ab0t-quota \\
       ./venv/bin/python -m pytest \\
-      /home/ubuntu/infra/infra/code/shared/ab0t-quota/tests/test_d12_cross_house_settlement_20260712.py -v
+      <path-to>/ab0t-quota/tests/test_d12_cross_house_settlement_20260712.py -v
 
 If DynamoDB Local or Redis is down this suite **SKIPS LOUDLY** and D-12's caller leg is
 **NOT VERIFIED** — exactly-once is a conditional write and a mock cannot prove it (D-57).
@@ -51,12 +51,15 @@ import sys
 import time
 import uuid
 from decimal import Decimal
+import os
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 
-BILLING_ROOT = Path("/home/ubuntu/infra/infra/code/billing/output")
+# Resolved from an env var, not a path on one machine. Unset ⇒ the test skips
+# explicitly rather than silently depending on a private checkout location.
+BILLING_ROOT = Path(os.environ.get("AB0T_BILLING_ROOT", "")) if os.environ.get("AB0T_BILLING_ROOT") else None
 
 # --- The cross-house import. If billing's source is not on this box, this suite cannot
 # --- certify anything and must say so rather than pass vacuously.

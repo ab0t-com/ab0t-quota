@@ -1,11 +1,11 @@
 ---
 name: quota-paid-tier-onboarding
-description: Connect a mesh service to paid tiers via Stripe checkout, billing account auto-creation, and quota enforcement. Use when hooking a new service into the payment→billing→quota pipeline, adding a pricing page, wiring Stripe checkout buttons, connecting payment webhooks to tier changes, auto-creating billing accounts on first contact, displaying tiers and usage in a frontend, or following the sandbox-platform reference implementation for paid plan activation. This is the end-to-end guide from "user sees pricing" to "user pays and gets new limits."
+description: Connect a mesh service to paid tiers via Stripe checkout, billing account auto-creation, and quota enforcement. Use when hooking a new service into the payment→billing→quota pipeline, adding a pricing page, wiring Stripe checkout buttons, connecting payment webhooks to tier changes, auto-creating billing accounts on first contact, displaying tiers and usage in a frontend, or following the reference implementation for paid plan activation. This is the end-to-end guide from "user sees pricing" to "user pays and gets new limits."
 ---
 
 # Paid Tier Onboarding
 
-Reference implementation: sandbox-platform. This skill documents how to connect
+This skill documents how to connect
 any mesh service to the paid tier pipeline.
 
 ## The Pipeline
@@ -56,7 +56,7 @@ one with defaults if missing. Called from every billing service operation:
 - `reserve_funds()` / `commit()` — financial operations
 
 **Every mesh consumer that calls billing triggers this.** The first time a
-sandbox-platform user checks their balance or creates a sandbox (which calls
+a user checks their balance or creates a resource (which calls
 billing reserve), the account appears automatically.
 
 See [references/auto-create-pattern.md](references/auto-create-pattern.md) for the implementation.

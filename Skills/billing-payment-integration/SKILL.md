@@ -239,7 +239,7 @@ Stripe webhook (invoice.paid) → payment service:
     → subscription_credit bucket populated with the period's bundled amount
 ```
 
-Payment service sets `subscription_data.metadata = {org_id, plan_id}` on every subscription checkout (Phase 2.1). This metadata propagates to every `invoice.paid` event from Stripe, letting the credit-grant trigger run without an extra lookup. If you're auditing a stale install, check that `payment/output/app/api/routes/checkout.py` includes the `subscription_data.metadata` field on the Stripe Checkout session — without it, invoice.paid grants are silently skipped.
+Payment service sets `subscription_data.metadata = {org_id, plan_id}` on every subscription checkout (Phase 2.1). This metadata propagates to every `invoice.paid` event from Stripe, letting the credit-grant trigger run without an extra lookup. If you're auditing a stale install, check that the payment service's `app/api/routes/checkout.py` includes the `subscription_data.metadata` field on the Stripe Checkout session — without it, invoice.paid grants are silently skipped.
 
 ### Top-Up Flow
 ```
@@ -292,7 +292,7 @@ Your webhook proxy forwards the raw body + `Stripe-Signature` header to the paym
 
 ## Reference Implementation
 
-See `sandbox-platform` for a complete working implementation:
+See the reference implementation:
 - `app/payment_client.py` — HTTP client for payment service
 - `app/billing_client.py` — HTTP client for billing service
 - `app/main.py` — All proxy routes (search for "Payments" tag)

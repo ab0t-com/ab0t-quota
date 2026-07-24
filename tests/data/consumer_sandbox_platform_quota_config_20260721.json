@@ -1,8 +1,12 @@
 {
   "service_name": "sandbox-platform",
 
+  "$comment_engine_mode": "byo_redis = we run our own Redis and this process enforces. Stated explicitly rather than left to the default.",
+  "engine_mode": "byo_redis",
+
+  "$comment_redis_url": "DECLARED from QUOTA_REDIS_URL — no inline default on purpose: an unset variable must refuse loudly, never silently fall back to a dev host. Password is embedded in the URL (redis://:PW@host:6379/4); db 4 is ours on the shared instance.",
   "storage": {
-    "redis_url": null,
+    "redis_url": "${QUOTA_REDIS_URL}",
     "dynamodb_table": "${QUOTA_STATE_TABLE:-ab0t_quota_state}",
     "dynamodb_region": "us-east-1",
     "persistence_enabled": true,

@@ -143,11 +143,11 @@ all called in registration order.
 
 Convention: a single file per service that imports the registrations.
 
-For sandbox-platform that's `app/quota.py` (which is also where
+Typically `app/quota.py` (which is also where
 `setup_quota()` is called — keeps all the lib wiring together):
 
 ```python
-# sandbox-platform/app/quota.py
+# <your-service>/app/quota.py
 from ab0t_quota import setup_quota
 from ab0t_quota.auth_events import on_auth_event
 
@@ -158,7 +158,7 @@ def bind_app(app):
 def _register_auth_event_handlers():
     @on_auth_event("auth.user.registered")
     async def grant_credit_on_signup(event):
-        # sandbox-platform-specific logic here
+        # your service's own logic here
         ...
 ```
 
@@ -402,7 +402,7 @@ set all four and the lib does it automatically on startup.
 AB0T_AUTH_WEBHOOK_SECRET=<openssl rand -hex 32>
 AB0T_AUTH_ADMIN_TOKEN=<bearer>
 AB0T_AUTH_WEBHOOK_PUBLIC_URL=https://sandbox.service.ab0t.com
-AB0T_AUTH_WATCH_ORG_SLUG=sandbox-platform-users
+AB0T_AUTH_WATCH_ORG_SLUG=<your-service>-users
 
 ./rebuild.sh
 # done. Container starts, lib subscribes itself, events flow.

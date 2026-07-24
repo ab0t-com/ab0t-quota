@@ -1,4 +1,4 @@
-# Deployment Runbook — sandbox + billing + payment + ab0t-quota
+# Deployment Runbook — your service + billing + payment + ab0t-quota
 
 End-to-end deployment guide for the four-service stack:
 
@@ -6,7 +6,7 @@ End-to-end deployment guide for the four-service stack:
 |---|---|---|
 | **payment** | 8005 | Stripe integration, checkout sessions, customer portal, webhooks |
 | **billing** | 8002 | Commercial accounts, balance, tier source-of-truth, quota catalog, bridge engine |
-| **sandbox-platform** | 8020 | Sandbox / browser / desktop provisioning, consumer of quota+billing+payment |
+| **your service** | (yours) | Your product — consumer of quota + billing + payment |
 | **ab0t-quota** (library) | n/a (pip package) | Quota engine + LifecycleEmitter + billing/payment proxy router |
 
 Plus shared infrastructure already running:
@@ -22,12 +22,12 @@ Plus shared infrastructure already running:
 
 ```
 1. Tag library             →  git tag v0.2.0 in shared/ab0t-quota
-2. Build payment service   →  docker compose -f payment/output/docker-compose.yml build
+2. Build payment service   →  docker compose -f <payment-service>/docker-compose.yml build
 3. Build billing service   →  rebuild AFTER library is tagged; pulls from git tag
-4. Build sandbox-platform  →  rebuild AFTER library is tagged
-5. Provision mesh creds    →  register sandbox as consumer of billing + payment
+4. Build your service      →  rebuild AFTER library is tagged
+5. Provision mesh creds    →  register your service as consumer of billing + payment
 6. Configure Stripe        →  webhook URL, price IDs in quota-config.json
-7. Boot in sequence        →  shared-infra → payment → billing → sandbox
+7. Boot in sequence        →  shared-infra → payment → billing → your service
 8. Smoke test              →  hit a few endpoints to confirm wiring
 9. Run UJ tests            →  full integration suite
 ```
@@ -49,7 +49,7 @@ Both consumer requirements.txt files pin to `@v0.2.0`. Library is at `0.2.0` in 
 ## Step 2: Build payment service (no code changes for this release)
 
 ```bash
-cd payment/output
+cd <payment-service>
 docker compose build payment
 ```
 
@@ -64,7 +64,7 @@ echo $STRIPE_WEBHOOK_SECRET        # whsec_...
 ## Step 3: Build billing service
 
 ```bash
-cd billing/output
+cd <billing-service>
 docker compose build billing
 ```
 
@@ -76,16 +76,16 @@ This rebuild pulls `ab0t-quota @ git+...@v0.2.0` from the requirements.txt. The 
 
 Verify billing module imports cleanly:
 ```bash
-cd billing/output
+cd <billing-service>
 ./venv/bin/python -c "from app.modules.quota import quota_router; print('OK')"
 ```
 
 ---
 
-## Step 4: Build sandbox-platform
+## Step 4: Build your service
 
 ```bash
-cd resource/output/sandbox-platform
+cd <your-service>
 docker compose build sandbox
 ```
 
@@ -99,21 +99,33 @@ Rebuild pulls library + applies the Phase 1-4 migration changes already in place
 
 ## Step 5: Provision mesh credentials
 
-Sandbox needs to be registered as a mesh consumer of billing + payment. Run the existing setup script:
+Your service must be registered as a mesh consumer of billing + payment. This is
+self-serve — install the onboarding client and register:
 
 ```bash
-cd resource/output/sandbox-platform/setup
-./setup run 07     # register as billing + payment consumer
+curl -fsSL https://raw.githubusercontent.com/ab0t-com/clientsetup/main/install.sh | sh
+setup run 07     # register as billing + payment consumer
 ```
 
-You'll get back two values to put in sandbox's env:
+The installer verifies the published sha256 and is **idempotent — re-run the same
+command to update.** There is no separate update flag. Pin with `REF=vX.Y.Z`.
+
+Registration writes the credential to
+`~/.authmesh/<your-service>/billing-consumer.prod.json`. Export what this library
+reads, and set the org id printed by `run 07`:
 
 ```bash
-AB0T_MESH_API_KEY=ab0t_sk_live_<value>
-AB0T_CONSUMER_ORG_ID=<sandbox's UUID in the mesh>
+export AB0T_MESH_API_KEY="$(jq -r .api_key.key \
+  ~/.authmesh/<your-service>/billing-consumer.prod.json)"
+export AB0T_CONSUMER_ORG_ID=<your service's UUID in the mesh>
 ```
 
-Save them to `resource/output/sandbox-platform/.env`.
+> ⚠️ `clientsetup` prints this value as `BILLING_SERVICE_API_KEY`; this library
+> reads **`AB0T_MESH_API_KEY`**. Same value, different name — the export above is
+> the bridge.
+
+Load both from your secrets manager in production. **Never commit the key.**
+Reference: <https://github.com/ab0t-com/clientsetup>.
 
 The mesh API key needs the following billing scopes:
 - `BillingReader` — for `/billing/{org}/balance`, `/usage`, etc. (proxy reads)
@@ -208,7 +220,7 @@ credits manually.
 
 ### 6a. Stripe price IDs in quota-config.json
 
-Open `resource/output/sandbox-platform/quota-config.json`, find the `billing_integration` block:
+Open `<your-service>/quota-config.json`, find the `billing_integration` block:
 
 ```json
 {
@@ -256,11 +268,11 @@ verifies the signature.
 docker compose -f docker-compose.shared.yml up -d
 
 # 2. Payment service
-cd payment/output
+cd <payment-service>
 docker compose up -d payment
 
 # 3. Billing service
-cd billing/output
+cd <billing-service>
 docker compose up -d billing
 
 # Verify billing is healthy and the quota module loaded:
@@ -268,7 +280,7 @@ curl http://localhost:8002/health
 docker compose logs billing 2>&1 | grep quota_module_initialized
 
 # 4. Sandbox platform
-cd resource/output/sandbox-platform
+cd <your-service>
 docker compose up -d sandbox
 
 # Verify sandbox is healthy and the library wired up:
@@ -279,7 +291,7 @@ docker compose logs sandbox 2>&1 | grep "catalog published"
 
 Expected log lines on a clean sandbox boot:
 ```
-INFO ab0t_quota.setup: catalog published service=sandbox-platform tiers=4 resources=N bundles=4
+INFO ab0t_quota.setup: catalog published service=<your-service> tiers=4 resources=N bundles=4
 INFO ab0t_quota.setup: paid-tier proxy router mounted at prefix=/api
 INFO ab0t_quota.setup: quota setup complete: N resources, 4 tiers, 4 bundles, paid=True
 ```
@@ -295,12 +307,12 @@ curl http://localhost:8020/api/quotas/tiers
 
 # Catalog publish landed in billing
 curl -H "X-API-Key: $AB0T_MESH_API_KEY" \
-  "https://billing.service.ab0t.com/billing/$AB0T_CONSUMER_ORG_ID/tier/limits?service=sandbox-platform"
+  "https://billing.service.ab0t.com/billing/$AB0T_CONSUMER_ORG_ID/tier/limits?service=<your-service>"
 # Should return SANDBOX's actual limits (not library DEFAULT_TIERS)
 
 # Bridge endpoint (proves billing's per-service engine is wired)
 curl -X POST -H "X-API-Key: $AB0T_MESH_API_KEY" \
-  "https://billing.service.ab0t.com/billing/quota/sandbox-platform/test-org/check/sandbox.concurrent"
+  "https://billing.service.ab0t.com/billing/quota/<your-service>/test-org/check/<your-resource-key>"
 # Returns 404 with helpful message because no test-org has tier set yet — that's correct
 
 # Authenticated endpoint via sandbox proxy
@@ -313,14 +325,14 @@ curl -H "Authorization: Bearer $USER_JWT" \
 ## Step 9: UJ tests
 
 ```bash
-cd resource/output/sandbox-platform/scripts/curl_tests/user_journeys
+cd <your-service>/scripts/curl_tests/user_journeys
 bash UJ-050_*.sh    # checkout flow
 bash UJ-051_*.sh    # subscription
 bash UJ-052_*.sh    # tier upgrade
 bash UJ-053_*.sh    # invoice / payment methods
 
 # Billing-side UJ tests
-cd billing/output/scripts/curl_tests/user_journeys
+cd <billing-service>/scripts/curl_tests/user_journeys
 bash UJ-030_quota_tier_lifecycle.sh
 bash UJ-035_quota_override_lifecycle_with_tier_change.sh
 bash UJ-037_quota_payment_webhook_tier_sync.sh
@@ -333,7 +345,7 @@ file an issue with the failing UJ output.
 
 ## Production environment variables
 
-### sandbox-platform/.env (production)
+### <your-service>/.env (production)
 
 ```bash
 # Single mesh credential the library uses for all upstreams
@@ -418,7 +430,7 @@ for local dev. Production uses library defaults (mesh DNS).
 If sandbox fails after deploy:
 
 ```bash
-cd resource/output/sandbox-platform
+cd <your-service>
 
 # Revert to the last known-good library version
 sed -i 's/@v0.2.0/@v0.1.0/' requirements.txt
@@ -454,7 +466,7 @@ git tag pre-quota-migration-2026-04-25
 | billing quota module | `docker logs billing | grep quota_module_initialized` | `quota_module_initialized table=ab0t_quota_state` |
 | sandbox | `curl localhost:8020/api/health` | `{"status": "healthy"}` |
 | sandbox quota | `docker logs sandbox | grep "quota setup complete"` | `quota setup complete: N resources, 4 tiers, 4 bundles, paid=True` |
-| sandbox catalog publish | `docker logs sandbox | grep "catalog published"` | `catalog published service=sandbox-platform tiers=4 resources=N bundles=4` |
+| sandbox catalog publish | `docker logs sandbox | grep "catalog published"` | `catalog published service=<your-service> tiers=4 resources=N bundles=4` |
 | Redis | `redis-cli -h shared-redis ping` | `PONG` |
 | DynamoDB | `aws dynamodb describe-table --table-name ab0t_quota_state` | `TableStatus: ACTIVE` |
 
@@ -472,12 +484,12 @@ Lifespan startup raised an exception before the engine was published. Check sand
 
 ### Stripe webhook 400 "Missing Stripe-Signature"
 
-Webhook URL points at sandbox's old route or the request didn't come from Stripe. Verify the URL in Stripe dashboard matches `https://sandbox.your-domain/api/webhooks/stripe`.
+Webhook URL points at your service's old route or the request didn't come from Stripe. Verify the URL in Stripe dashboard matches `https://sandbox.your-domain/api/webhooks/stripe`.
 
 ### Frontend pricing page is empty
 
 `GET /api/payments/plans` returned `{"plans": []}`. Either:
-- Stripe products not synced into payment service's local cache (run `payment/output/scripts/sync_plans.sh`)
+- Stripe products not synced into payment service's local cache (run `<payment-service>/scripts/sync_plans.sh`)
 - `consumer_org_id` mismatch between sandbox's env and payment service's product owner
 
 ### Tier change doesn't take effect

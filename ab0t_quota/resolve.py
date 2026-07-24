@@ -174,6 +174,17 @@ def resolve_dependency(
         return Resolved(name, config_key, _validated(kwarg), Provenance.KWARG, "kwarg", secret)
 
     state, cfg_value = _walk(config, config_key)
+    # An empty STRING is 'unset', not 'declared as empty'. config.py resolves an
+    # unset `${QUOTA_VAR}` (no inline default) to "", and _env_lookup already
+    # treats "" as unset — without this the two halves of one resolver disagree,
+    # and `"redis_url": "${QUOTA_REDIS_URL}"` with the var unset flows an empty
+    # string into the redis constructor, surfacing as redis-py's `ValueError:
+    # Redis URL must specify one of the following schemes` instead of a typed
+    # error naming storage.redis_url.
+    # Strings ONLY — O3 (explicit empty collection is a declaration, e.g.
+    # `tiers: []` means zero tiers) is deliberately untouched.
+    if state == "declared" and isinstance(cfg_value, str) and cfg_value.strip() == "":
+        state, cfg_value = "null", None
     if state == "declared":
         return Resolved(name, config_key, _validated(cfg_value), Provenance.CONFIG,
                         f"config:{config_key}", secret)
@@ -394,10 +405,35 @@ def check_deprecated_generic_env(config: Optional[Mapping[str, Any]] = None) -> 
          "AB0T_AUTH_AUTH_URL" in os.environ, "AB0T_AUTH_AUTH_URL",
          "auth.url", "the auth service URL is no longer harvested"),
     )
+    # A password embedded in the DECLARED Redis URL (redis://:pw@host/4 — the
+    # conventional form) is a declaration of the password. Without this, a
+    # correctly-configured consumer who also happens to have a generic
+    # REDIS_PASSWORD in their environment gets an ERROR-level line saying "the
+    # Redis password is no longer harvested" — true, but irrelevant to them,
+    # because nothing is being lost. Sending someone to rename a variable that
+    # is not being used is the same misleading-diagnosis class this resolver
+    # exists to remove.
+    def _declared_url_carries_password() -> bool:
+        state, url = _walk(config, "storage.redis_url")
+        if state != "declared" or not isinstance(url, str) or not url.strip():
+            url = os.environ.get("QUOTA_REDIS_URL") or ""
+        if not url:
+            return False
+        try:
+            return urlsplit(url).password is not None
+        except Exception:
+            return False
+
     for present, name, repl_present, replacement, config_key, consequence in removed:
         if not present or repl_present:
             continue
         if config_key and _walk(config, config_key)[0] == "declared":
+            continue
+        if name == "REDIS_PASSWORD" and _declared_url_carries_password():
+            logger.debug(
+                "generic REDIS_PASSWORD is set but the declared Redis URL already "
+                "carries a password; nothing is harvested and nothing is lost. "
+                "Consider removing the unused variable. (D-10)")
             continue
         log = logger.warning if suppress else logger.error
         log("DEPRECATED generic %s is set in this environment but its namespaced "

@@ -389,7 +389,7 @@ shared/ab0t-quota/                                          ← THE consumer-sid
 └── docs/
     └── WEBHOOK_AND_CREDIT_GRANT_ARCHITECTURE.md            ← THIS DOC
 
-payment/output/                                             ← The payment-service
+<payment-service>/                                             ← The payment-service
 ├── app/
 │   ├── api/
 │   │   ├── routes/
@@ -415,7 +415,7 @@ payment/output/                                             ← The payment-serv
 │       :__   STRIPE_WEBHOOK_SECRET=whsec_Na...               ← Singular fallback; keep until §8 Step 8 of cutover
 └── docs/  (no canonical webhook doc here — this doc is the canonical reference)
 
-billing/output/                                             ← The billing-service
+<billing-service>/                                             ← The billing-service
 ├── app/
 │   ├── api/
 │   │   └── billing.py
@@ -429,7 +429,7 @@ billing/output/                                             ← The billing-serv
 │   └── CLICKHOUSE_CONTRACT.md                              ← Analytics-side schema doc
 └── ...
 
-resource/output/sandbox-platform/                           ← The CONSUMER service (one of N)
+<your-service>/                           ← The CONSUMER service (one of N)
 ├── app/
 │   ├── main.py                                             ← FastAPI app entry point
 │   ├── billing_helpers.py                                  ← post_launch_record, pre_launch_reserve
@@ -449,7 +449,7 @@ resource/output/sandbox-platform/                           ← The CONSUMER ser
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Service             │ Env var                                  │ Source of truth file                    │
 ├─────────────────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
-│ payment-service     │ STRIPE_API_VERSION                       │ payment/output/production/.env.production│
+│ payment-service     │ STRIPE_API_VERSION                       │ <payment-service>/.env.production│
 │                     │ STRIPE_SECRET_KEY                        │ "                                       │
 │                     │ STRIPE_PUBLISHABLE_KEY                   │ "                                       │
 │                     │ STRIPE_WEBHOOK_SECRET                    │ "  (single, legacy/fallback)            │
@@ -465,7 +465,7 @@ resource/output/sandbox-platform/                           ← The CONSUMER ser
 │                     │ AB0T_MESH_BILLING_URL                    │ "                                       │
 │                     │ AB0T_MESH_BILLING_API_KEY                │ "                                       │
 ├─────────────────────┼──────────────────────────────────────────┼─────────────────────────────────────────┤
-│ billing-service     │ (uses payment + auth keys via mesh API)  │ billing/output/.env*                    │
+│ billing-service     │ (uses payment + auth keys via mesh API)  │ <billing-service>/.env*                    │
 └─────────────────────┴──────────────────────────────────────────┴─────────────────────────────────────────┘
 ```
 
@@ -583,12 +583,12 @@ CHECKOUT#{session_id}/INTENT keys:
 - `shared/ab0t-quota/ab0t_quota/billing/router.py:662-921` — the webhook proxy handler
 - `shared/ab0t-quota/ab0t_quota/billing/clients.py:256-268` — `forward_webhook` (passthrough, NOT re-signing)
 - `shared/ab0t-quota/ab0t_quota/billing/subscription_credit.py` — dispatch helpers
-- `payment/output/app/api/webhooks.py:97-163` — multi-secret signature verification
-- `payment/output/app/api/webhooks.py:486-522` — legacy backup credit path
-- `payment/output/app/api/routes/checkout.py:308-516` — verify endpoint (`_verify_checkout_session_impl`)
-- `payment/output/app/config.py:34-59` — env declarations
-- `billing/output/app/services/usage_service.py:30-145` — usage record + balance debit logic
-- `billing/output/docs/CLICKHOUSE_CONTRACT.md` — analytics-side complement
+- the payment service's `app/api/webhooks.py:97-163` — multi-secret signature verification
+- the payment service's `app/api/webhooks.py:486-522` — legacy backup credit path
+- the payment service's `app/api/routes/checkout.py:308-516` — verify endpoint (`_verify_checkout_session_impl`)
+- the payment service's `app/config.py:34-59` — env declarations
+- the billing service's `app/services/usage_service.py:30-145` — usage record + balance debit logic
+- the billing service's `docs/CLICKHOUSE_CONTRACT.md` — analytics-side complement
 
 ### Audit history
 

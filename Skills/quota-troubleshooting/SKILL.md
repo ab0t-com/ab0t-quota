@@ -55,7 +55,7 @@ redis-cli GET quota:org-123:sandbox.concurrent:gauge
 # → "5"
 
 # Check actual sandboxes in DynamoDB
-# (run from sandbox-platform container)
+# (run from your service's container)
 python -c "
 import asyncio
 from app.database import SandboxDatabase

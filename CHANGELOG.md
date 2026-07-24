@@ -2,12 +2,55 @@
 
 ## [0.6.3] — DECLARED, NOT DISCOVERED
 
+### Getting started is now self-serve
+
+Registering for a mesh credential no longer requires contacting us. Signup is
+open, and the quickstart shows the whole path:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ab0t-com/clientsetup/main/install.sh | sh
+setup run 07
+```
+
+The installer is POSIX sh, HTTPS-only, verifies a published sha256, keeps the
+previous binary for one-step rollback, and is idempotent — **re-run the same
+command to update**. Pin a version with `REF=vX.Y.Z`, relocate with `PREFIX=`.
+
+**One thing to watch:** the onboarding client prints your credential as
+`BILLING_SERVICE_API_KEY`; this library reads `AB0T_MESH_API_KEY`. Same value,
+different name. `docs/quickstart.md` and `docs/deployment.md` both show the
+one-line export that bridges them — without it you get `QUOTA-CFG-007`.
+
+Onboarding reference: <https://github.com/ab0t-com/clientsetup>
+
+### Clearer configuration errors
+
+* **An empty configuration value is treated as unset, not as a declaration.**
+  If you write `"redis_url": "${QUOTA_REDIS_URL}"` and that variable is not set
+  in some environment, you now get `QUOTA-CFG-001` naming `storage.redis_url`
+  and the variable to set — instead of a low-level URL-parsing error from the
+  Redis client. Resolution still falls through to the namespaced environment
+  variable first. Applies to text values only; an explicitly empty list or
+  object remains a valid declaration.
+
+* **A password inside your Redis URL counts as declared.** `redis://:pw@host:6379/4`
+  is the conventional form, and using it no longer produces a startup error
+  telling you to rename a `REDIS_PASSWORD` variable the library is not reading.
+  The underlying protection is unchanged: if your URL carries no password and a
+  generic variable is set, you are still told.
+
+### Documentation
+
+Onboarding and deployment docs are now written for any service, using
+placeholders (`<your-service>`, `<billing-service>`) rather than one
+deployment's directory layout. Applies across `docs/` and the bundled Skills.
+
 ### THE CONFIG IS KING — end-customer messages are config-driven
 
 **Behaviour change, no action required** (ticket 20260722, D-CK-1…D-CK-5).
 
 * `messages.py` no longer carries **any** consumer's vocabulary. The two
-  lookup tables are DELETED: `ACTION_HINTS` (copy keyed on sandbox-platform's
+  lookup tables are DELETED: `ACTION_HINTS` (copy keyed on one deployment's
   resource keys) and `UPGRADE_TIER_MAP` (a fixed free → Starter → Pro →
   Enterprise ladder). A consumer whose plans are `free`/`pro` was previously
   told to *"upgrade to Starter"* — a plan that does not exist in their product
@@ -34,7 +77,7 @@
   vocabulary** with a populated, annotated `resources[]` section (every
   `counter_type` demonstrated once), plus `engine_mode`, `shadow_mode`, burst,
   thresholds and per-user sub-quotas shown doing real work. It previously
-  declared **zero resources** while its tier limits referenced `sandbox.*`
+  declared **zero resources** while its tier limits referenced resource keys
   keys it never defined — it only "worked" because the library had been taught
   that one consumer's vocabulary.
 * **Permanent control:** the key/const census now forbids any
@@ -48,7 +91,7 @@ D-1 originally set this release at `0.7.0` on this file's own stated policy
 MINOR"). The operator — who owns publishing and was given an explicit veto on
 that point — chose a patch bump, consistent with standing practice for this
 library. **The version number is therefore NOT a reliable signal of breakage
-for this release; the migration note is.** Recorded in DECISIONS.md D-1
+for this release; the migration note is.**
 (amended). Note that consumers install `git+…@main`, so no version number
 reaches them today either way — see the pinned-releases follow-up.
 **Read `docs/migrating-from-ambient-resolution.md`
