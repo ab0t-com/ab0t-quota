@@ -4,8 +4,10 @@
 title = "ab0t-quota gitleaks config"
 
 [extend]
-# Use the default gitleaks rules as a baseline
-# useDefault = true is implied
+# Use the default gitleaks rules (~170) as a baseline. This is NOT implied —
+# without it, only the custom rules below run and the built-in detectors for
+# ghp_/gho_ tokens, AWS keys, Stripe keys etc. are OFF.
+useDefault = true
 
 # Additional custom rules for this project
 [[rules]]
@@ -79,9 +81,10 @@ tags = ["webhook", "slack"]
 # Allowlist - paths and patterns that are safe to ignore
 [allowlist]
 description = "Global allowlist"
+# NOTE: tests/ is deliberately NOT blanket-exempted. A real credential in a test
+# file is still a leak; test-only synthetic values are allowlisted by regex below.
 paths = [
     '''\.gitleaks\.toml$''',
-    '''tests/.*\.py$''',
     '''.*\.egg-info/.*''',
     '''__pycache__/.*''',
     '''\.pytest_cache/.*''',
@@ -91,4 +94,28 @@ paths = [
     '''dist/.*''',
     '''build/.*''',
     '''quota-config\.example\.json$''',
+]
+# Content-level allowlist: known false positives from the generic rules, matched
+# on the secret text itself so they are exempt wherever they appear.
+regexes = [
+    # A docstring/prose line that names env-var identifiers, not a value.
+    '''AB0T_AUTH_WEBHOOK_SECRET, AB0T_MESH_API_KEY''',
+    # Synthetic credentials used only in tests (never real).
+    '''(URL_PW|KWARG_PW|realpw|SECRETPW|unused-generic|GENERIC_DECOY|DECOY_[A-Za-z_0-9]+|decoy-[a-z.]+)''',
+    # Obvious placeholder Slack webhook used in a dispatcher unit test.
+    '''hooks\.slack\.com/services/T123/B456/abc''',
+    # Prose naming env-var identifiers (not values).
+    '''`?AB0T_MESH_API_KEY`? env var''',
+]
+# Known false positives in HISTORY (commit 933ebb04, 2026-04-28), exempted by
+# exact fingerprint so any NEW occurrence in a new commit is NOT silenced:
+#   __main__.py:14  — docstring naming env-var identifiers
+#   CONTEXT.md:114  — a prod org UUID in prose (not a credential); that ticket is
+#                     now gitignored/untracked, but the blob persists in history.
+commits = [
+    "933ebb04845146bb9f14dc455c1cda6f15a97e7f",
+]
+# Stopwords keep the generic-* rules from firing on obvious non-secrets.
+stopwords = [
+    "example", "changeme", "placeholder", "your-", "redacted", "REDACTED",
 ]
