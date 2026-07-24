@@ -420,7 +420,11 @@ def check_deprecated_generic_env(config: Optional[Mapping[str, Any]] = None) -> 
         if not url:
             return False
         try:
-            return urlsplit(url).password is not None
+            # bool(), not `is not None`: urlsplit("redis://:@host").password is
+            # "" — an empty password is not a declared password. `is not None`
+            # would let `redis://:@host` suppress the D-10 error while carrying
+            # no credential.
+            return bool(urlsplit(url).password)
         except Exception:
             return False
 

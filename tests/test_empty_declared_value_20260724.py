@@ -140,3 +140,17 @@ def test_generic_redis_password_still_errors_when_url_has_none(monkeypatch, capl
 
     assert [r for r in caplog.records if r.levelno >= _logging.ERROR], \
         "D-10 must still fire when the URL carries no password"
+
+
+def test_empty_url_password_does_not_suppress_the_generic_error(monkeypatch, caplog):
+    """redis://:@host carries NO password — the empty-password form must not
+    suppress the D-10 error (fix (b) edge case: bool(), not `is not None`)."""
+    import logging as _logging
+    from ab0t_quota.resolve import check_deprecated_generic_env
+    monkeypatch.setenv("REDIS_PASSWORD", "generic")
+    monkeypatch.delenv("QUOTA_REDIS_PASSWORD", raising=False)
+    monkeypatch.delenv("QUOTA_REDIS_URL", raising=False)
+    with caplog.at_level(_logging.DEBUG):
+        check_deprecated_generic_env({"storage": {"redis_url": "redis://:@host:6379/4"}})
+    assert [r for r in caplog.records if r.levelno >= _logging.ERROR], \
+        "empty URL password must NOT suppress the generic-name error"
