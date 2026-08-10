@@ -768,3 +768,34 @@ class QuotaAlert(BaseModel):
     tier_id: str
     message: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class QuotaMetric(BaseModel):
+    """A structured, machine-consumable METRIC event — distinct from ``QuotaAlert``.
+
+    ``QuotaAlert`` is a human-facing notification: free-text ``message``, severity,
+    cooldown-gated so an on-call human isn't spammed. ``QuotaMetric`` is a numeric
+    observation meant for a metrics/alerting SINK (a Redis counter to scrape, a
+    statsd emit, a CloudWatch ``put_metric_data`` call) — every field is a number
+    or a low-cardinality label, never free text, so a consumer can chart or
+    threshold it without parsing a sentence. Unlike ``QuotaAlert``, a metric is
+    NOT rate-limited by a cooldown — a dashboard needs full-fidelity data to plot
+    drift over time, even while the paired human alert stays cooldown-gated.
+
+    Ticket 20260810_quota_drift_live_recurrence_permanent_fix (F9/P4.1): the
+    reconciler already logs ``gauge_drift_detected``/``gauge_drift_resolved``; this
+    is the emitted metric those log lines now ALSO carry, name-spaced
+    ``quota.drift_detected`` / ``quota.drift_resolved``.
+    """
+    name: str = Field(description="'quota.drift_detected' | 'quota.drift_resolved'")
+    org_id: str
+    resource_key: str
+    observed: float = Field(description="the provider/ledger's observed existence level")
+    ledger: float = Field(description="the activation ledger's Σ open total (may equal observed)")
+    counter_before: float = Field(description="the gauge value before this reconcile action")
+    counter_after: float = Field(description="the gauge value after this reconcile action")
+    delta: float = Field(description="abs(counter_after - counter_before); >0 for a detected "
+                                      "heal, 0.0 for a resolved (in-sync) event")
+    source: str = Field(default="", description="'activations' | 'provider' — which layer won; "
+                                                  "empty on a resolved event")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -157,6 +157,34 @@ By default the middleware **fails closed** — if Redis is unavailable, requests
 | **Rate** | Sliding window, auto-expires | Request throughput | API calls per hour |
 | **Accumulator** | Monotonic within period, resets on boundary | Spend tracking | Monthly compute cost (USD) |
 
+## Idempotency keys
+
+Every gauge `increment`/`decrement` call accepts an `idempotency_key`. Its ONE job is to make a
+retried call of the SAME lifecycle event a no-op, while a genuinely NEW event still applies. Get
+this wrong and you get exactly the bug class ticket `20260810_quota_drift_live_recurrence_permanent_fix`
+fixed: a gauge that silently drifts and never comes back down.
+
+**The rule: the key must carry a component that cannot repeat across two distinct activations of
+the same recyclable id.** A resource/container id alone is NOT enough — pools and warm-starts reuse
+ids, so `counter:lifecycle:end:{container_id}` computes the IDENTICAL key for two different
+activations. The second one is then silently treated as a duplicate of the first and dropped — the
+gauge sticks high (or, depending which side collides, a create is dropped and the gauge undercounts).
+
+Use ONE of:
+- **An activation/claim generation**, bumped on every reactivation, as a trailing segment:
+  `counter:lifecycle:end:{resource_id}:{claim_generation}` (the convention this library's own
+  consumers use — see `sandbox app/quota.py`).
+- **A fresh UUID per lifecycle event**, when no reliable generation counter is available (e.g. a
+  synthetic/out-of-band cleanup with no resource row in hand): `counter:lifecycle:end:{resource_id}:evt:{uuid4}`.
+  If the call can genuinely retry itself (not one-shot) and you need that retry to dedup, derive the
+  UUID deterministically from something stable across the retry (e.g. `uuid5(NAMESPACE_URL, f"{resource_id}:{started_at}")`)
+  instead of minting a fresh random one per call — a random id per call defeats dedup for a real retry.
+
+**Common mistake:** keying on the resource/container id alone, with no generation or UUID component.
+`ab0t_quota.counters.gauge.guard_idempotency_key` runs on every gauge mutation and WARNS (by
+default) when a key looks like this bare shape; set `AB0T_QUOTA_STRICT_IDEMPOTENCY_KEYS=1` to make
+it a hard refusal instead. The warning text names this section.
+
 ## Default tiers
 
 | Resource | Free | Starter | Pro | Enterprise |
@@ -232,6 +260,32 @@ engine.set_alert_manager(alert_mgr)
 ```
 
 Alerts fire at WARNING (80%), CRITICAL (95%), and EXCEEDED (100%) thresholds. Cooldown and severity escalation prevent alert spam.
+
+### Gauge-drift metrics + the sustained-drift alert
+
+The gauge reconciler's `DriftAlertManager` (`ab0t_quota.alerts`) does two things on
+every heal, distinct from the escalation alerts above:
+
+1. Emits a structured `QuotaMetric` (`name="quota.drift_detected"` /
+   `"quota.drift_resolved"`, with `org_id`, `resource_key`, `observed`, `ledger`,
+   `counter_before`, `counter_after`, `delta`) via every registered
+   `MetricDispatcher` — **never** cooldown-gated, unlike the paired human alert, so a
+   dashboard sees every observation. With no `metric_dispatchers=` supplied it
+   defaults to `[LogMetricDispatcher(), RedisCounterMetricDispatcher(redis)]` — a
+   consumer with no statsd/CloudWatch/Prometheus sink still gets a real, scrapeable
+   Redis counter (`quota:metrics:drift_detected:total`, `...:drift_resolved:total`,
+   `quota:metrics:drift:{org}:{resource_key}:sustained`) with zero extra config.
+   Every consumer that calls `setup_quota` also gets this surfaced over HTTP for
+   free, on the `drift_metrics` key of `/quota/capabilities` (totals + the list of
+   `(org, resource)` pairs currently sustaining).
+2. Tracks consecutive re-heals of the SAME `(org, resource)` with no intervening
+   resolve, and raises a **distinct CRITICAL alert** (`quota_drift_sustained`,
+   through the same dispatcher chain as `divergence_detected`) once
+   `alerts.drift_sustained_threshold` (config; default `3`) is crossed — the
+   signal that a gauge is *recurring* drift (e.g. an idempotency-key collision on a
+   reused resource id), not a one-off blip a single heal already handles quietly.
+   Wire `alerts.webhook_url` (or `alerts.drift_webhook_url`) to turn this into a
+   real page instead of a (loud, structured) log line.
 
 ## Configuration
 

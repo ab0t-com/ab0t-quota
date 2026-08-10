@@ -17,9 +17,13 @@ from .models.core import (
     TierConfig,
     TierLimits,
     QuotaOverride,
+    QuotaMetric,
 )
 from .providers import TierProvider, JWTTierProvider, AuthServiceTierProvider, StaticTierProvider
-from .alerts import AlertManager, AlertDispatcher, LogAlertDispatcher, WebhookAlertDispatcher
+from .alerts import (
+    AlertManager, AlertDispatcher, LogAlertDispatcher, WebhookAlertDispatcher,
+    MetricDispatcher, LogMetricDispatcher, RedisCounterMetricDispatcher,
+)
 from .config import load_config, load_tiers, load_resources, load_resource_bundles
 from .errors import QuotaConfigError
 from .messages import MessageBuilder, Templates
@@ -56,6 +60,7 @@ __all__ = [
     "TierConfig",
     "TierLimits",
     "QuotaOverride",
+    "QuotaMetric",
     # Providers
     "TierProvider",
     "JWTTierProvider",
@@ -67,6 +72,10 @@ __all__ = [
     "LogAlertDispatcher",
     "WebhookAlertDispatcher",
     "DriftAlertManager",
+    # Metrics (F9/P4.1)
+    "MetricDispatcher",
+    "LogMetricDispatcher",
+    "RedisCounterMetricDispatcher",
     # Reconciler (P4)
     "LibraryReconciler",
     "ReconcileConfig",

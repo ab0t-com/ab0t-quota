@@ -212,6 +212,9 @@ DYNAMIC_ALLOWLIST = {
         "${VAR} interpolation — namespaced to QUOTA_* by config.py's own rule",
     ("ddb_preflight.py", "PITR_CONFIRM_ENV"):
         "module constant AB0T_QUOTA_DDB_PITR_CONFIRMED",
+    ("gauge.py", "_STRICT_IDEMPOTENCY_ENV"):
+        "module constant AB0T_QUOTA_STRICT_IDEMPOTENCY_KEYS (ticket "
+        "20260810_quota_drift_live_recurrence_permanent_fix P1.5 contract guard)",
     ("redis_preflight.py", "DURABILITY_CONFIRM_ENV"):
         "module constant AB0T_QUOTA_REDIS_DURABILITY_CONFIRMED",
     ("redis_preflight.py", "SCRIPTING_CONFIRM_ENV"):

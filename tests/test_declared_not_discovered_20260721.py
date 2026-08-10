@@ -465,6 +465,14 @@ _LIBRARY_VOCABULARY: dict[str, set[str]] = {
     "billing/router.py": {"invoice"},
     "billing/config.py": {"resource"},
     "billing/lifecycle.py": {"resource"},
+    # F9/P4.1 (ticket 20260810_quota_drift_live_recurrence_permanent_fix):
+    # "quota.drift_detected" / "quota.drift_resolved" are the LIBRARY's own
+    # metric-EVENT names (QuotaMetric.name), namespaced under the library's
+    # OWN "quota" domain — never a consumer's resource key (a resource key is
+    # namespaced under the CONSUMER's service, e.g. "sandbox.concurrent").
+    # Same shape, opposite verdict, exactly the pairing this dict exists for
+    # (see the module docstring above, `resource.started`).
+    "alerts.py": {"quota"},
 }
 
 #: OPEN leaks of this exact class, recorded rather than hidden. The census is
@@ -621,7 +629,11 @@ def test_known_leaks_are_still_real_and_shrink_only():
 def test_library_vocabulary_exemptions_shrink_only():
     for rel in _LIBRARY_VOCABULARY:
         assert (LIB_DIR / rel).exists(), f"stale vocabulary exemption: {rel}"
-    assert sum(len(v) for v in _LIBRARY_VOCABULARY.values()) == 14, \
+    # 20260810 (F9/P4.1, ticket 20260810_quota_drift_live_recurrence_permanent_fix):
+    # 14 -> 15, +1 for "alerts.py": {"quota"} — the library's OWN metric-event
+    # namespace (QuotaMetric.name = "quota.drift_detected"/"quota.drift_resolved"),
+    # never a consumer's resource key. See the entry's own comment above.
+    assert sum(len(v) for v in _LIBRARY_VOCABULARY.values()) == 15, \
         "the per-file vocabulary allowlist changed size — justify it explicitly"
 
 

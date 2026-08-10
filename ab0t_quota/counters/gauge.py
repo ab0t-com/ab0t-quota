@@ -24,13 +24,123 @@ pre-dual is still recognised across the flip (the double-charge trap, K-3).
 
 from __future__ import annotations
 
+import logging
 import math
+import os
+import re
 from typing import Optional
 from .base import Counter, finite_magnitude, dual_lua
+
+logger = logging.getLogger(__name__)
 
 # Idempotency-key TTL (seconds). Unchanged from the pre-Lua implementation.
 # The migration flip gate must outwait this (keyspace spec §3.3).
 _IDEM_TTL = 86400
+
+# --- Idempotency-key contract guard (ticket 20260810, P1.1/P1.5) -----------
+#
+# THE BUG this defends against: a caller keys a gauge decrement/increment on
+# a bare RECYCLABLE resource/container id — e.g. `counter:lifecycle:end:{id}`
+# with no per-activation component. Warm-pool reuse means a SECOND, genuinely
+# DISTINCT lifecycle event (a different resource activation that happens to
+# reuse the same container id) computes the IDENTICAL key. The claim-then-
+# mutate Lua is *correctly* doing its job when it treats that as a retry of
+# the FIRST event and no-ops — the defect is the key, not the claim. Over
+# many reused ids this silently drops decrements and the gauge sticks high
+# forever (the live incident this ticket fixes: org cd790b95 "5/1" with zero
+# running sandboxes).
+#
+# The fix is a caller discipline: every idempotency key must carry a
+# component that CANNOT repeat across two distinct activations of the same
+# recyclable id — an activation/claim GENERATION bumped on every reactivation
+# (a trailing `:<int>`, the convention every current consumer already uses:
+# `counter:lifecycle:end:{resource_id}:{claim_generation}`), or a fresh UUID
+# per lifecycle event (a `:evt:<uuid4>` segment). This module cannot enforce
+# CORRECTNESS of that discipline (it has no idea whether a caller's generation
+# int is actually being bumped) — it can only catch the SHAPE of the mistake:
+# a key with no such component at all, which is exactly the collision-bug
+# shape. Defense-in-depth, not a proof.
+#
+# Default is WARN (many existing consumers must not break at import/runtime
+# because of a heuristic); set AB0T_QUOTA_STRICT_IDEMPOTENCY_KEYS=1 to make a
+# bad key a hard refusal instead. See ab0t-quota README.md "Idempotency keys"
+# for the contract + a worked example.
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_EVT_MARKER_RE = re.compile(r"(?:^|:)evt:")
+# A colon-delimited, purely-numeric segment ANYWHERE in the key — not just at
+# the end. engine.increment_for_bundle/decrement_for_bundle suffix every
+# consumer key with `:{resource_key}` before it reaches this counter
+# (engine.py ~1085/1093/1117: `f"{idempotency_key}:{rk}"`), so the generation
+# a caller embeds (e.g. `counter:lifecycle:end:{id}:{claim_generation}`)
+# lands in the MIDDLE of the final key, not its tail.
+_GENERATION_SEGMENT_RE = re.compile(r"(?:^|:)(?:gen:)?\d+(?::|$)")
+# An opaque HIGH-ENTROPY token: a run of >= 24 hex chars. This is what
+# `secrets.token_hex(16)` (32 hex) and a dash-less UUID (32 hex) produce —
+# and, critically, exactly the shape of the library's OWN release key,
+# `release:{activation_id}` where `activation_id = mint_activation_id()` =
+# `"act_" + secrets.token_hex(16)` (activations.py). Such a token is minted
+# FRESH per activation and never reused, so it is the strongest possible
+# unique component — yet the three patterns above (dashed-UUID / `:evt:` /
+# numeric-generation) all MISS it: it has no dashes, no `evt:`, and no purely
+# numeric segment. Without this pattern the guard raised on the library's own
+# `release:act_<hex>` key in strict mode (breaking `engine.release()` AFTER
+# the ledger row is marked RELEASED but BEFORE the gauge decrement → the exact
+# stuck-high drift this ticket exists to prevent) and warn-spammed on every
+# release in the default mode. 24 hex = 96 bits of entropy: far too long to be
+# a reused resource/pool id (e.g. `desktop-abc123` has only a 6-hex run), so
+# accepting it does not weaken detection of the genuine bare-recyclable-id bug.
+_OPAQUE_TOKEN_RE = re.compile(r"[0-9a-fA-F]{24,}")
+
+_STRICT_IDEMPOTENCY_ENV = "AB0T_QUOTA_STRICT_IDEMPOTENCY_KEYS"
+
+
+def idempotency_key_has_unique_component(key: str) -> bool:
+    """True when ``key`` carries something that cannot repeat across two
+    distinct activations of the same recyclable resource id: a UUID, an
+    explicit ``:evt:`` marker, a numeric generation, or an opaque high-entropy
+    token (a >= 24-hex run — a dash-less UUID or a ``secrets.token_hex`` id,
+    e.g. the library's own ``release:act_<hex>`` key). False means the key
+    looks like a bare recyclable id — the ticket-20260810 bug shape.
+    Exposed for the Go port's parity test + for consumers that want to
+    pre-validate a key before calling increment/decrement."""
+    if not key:
+        return True  # no idempotency requested at all is a separate, valid choice
+    return bool(
+        _UUID_RE.search(key) or _EVT_MARKER_RE.search(key)
+        or _GENERATION_SEGMENT_RE.search(key) or _OPAQUE_TOKEN_RE.search(key)
+    )
+
+
+class RecyclableIdempotencyKeyError(ValueError):
+    """Raised in strict mode when an idempotency key looks like a bare
+    recyclable resource/container id with no unique-per-event component."""
+
+
+def _strict_idempotency_enforcement() -> bool:
+    return os.getenv(_STRICT_IDEMPOTENCY_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def guard_idempotency_key(key: Optional[str]) -> None:
+    """Contract guard (P1.5): reject-or-warn an idempotency key shaped like a
+    bare recyclable id. Called on every gauge increment/decrement/*_user path
+    before the key ever reaches Lua."""
+    if not key or idempotency_key_has_unique_component(key):
+        return
+    msg = (
+        f"quota idempotency key {key!r} looks like a bare recyclable resource id "
+        "(no activation-generation/:evt:/uuid component) -- this is exactly the "
+        "shape that caused ticket 20260810's stuck-gauge collision: a reused "
+        "container/pool id makes a genuinely NEW lifecycle event compute the SAME "
+        "key as a past one, so it is silently treated as a duplicate and the "
+        "mutation is dropped. Key on a unique-per-lifecycle-event id instead: an "
+        "activation/claim generation bumped on every reactivation (trailing "
+        "':<int>'), or a fresh UUID per event (':evt:<uuid4>'). See ab0t-quota "
+        f"README.md 'Idempotency keys' for the contract + a worked example. (Set "
+        f"{_STRICT_IDEMPOTENCY_ENV}=1 to make this a hard error instead of a warning.)"
+    )
+    if _strict_idempotency_enforcement():
+        raise RecyclableIdempotencyKeyError(msg)
+    logger.warning("quota_idempotency_key_looks_recyclable %s", msg)
 
 # --- Atomic Lua scripts -----------------------------------------------------
 # Convention for every script:
@@ -205,6 +315,7 @@ class GaugeCounter(Counter):
         """Increment both the org-level gauge AND the user partition (atomic);
         bumps the CREATE generation (QI-05.1)."""
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
+        guard_idempotency_key(idempotency_key)  # P1.5 contract guard
         idem_key = f"{user_id}:{idempotency_key}" if idempotency_key else None
         has_idem = "1" if idem_key else "0"
         keys = [self._idem_key(idem_key), self._redis_key,
@@ -221,6 +332,7 @@ class GaugeCounter(Counter):
         """Decrement org gauge AND user partition, flooring both at zero —
         atomic (QI-02); claim scoped by the CREATE generation (QI-05.1)."""
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
+        guard_idempotency_key(idempotency_key)  # P1.5 contract guard
         idem_key = f"{user_id}:{idempotency_key}" if idempotency_key else None
         has_idem = "1" if idem_key else "0"
         keys = [self._idem_gen_key(idem_key), self._redis_key,
@@ -255,6 +367,7 @@ class GaugeCounter(Counter):
         """Atomic check-and-spend at the org level (QI-03). Returns
         (new_or_current_value, admitted)."""
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
+        guard_idempotency_key(idempotency_key)  # P1.5 contract guard
         has_idem = "1" if idempotency_key else "0"
         keys = [self._idem_key(idempotency_key), self._redis_key]
         keys += self._keys2(("idem_key", idempotency_key), ("gauge_key",))
@@ -273,6 +386,7 @@ class GaugeCounter(Counter):
         """Atomic check-and-spend at BOTH the org and per-user level (QI-03),
         bumping the CREATE generation. Returns (user_value, admitted)."""
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
+        guard_idempotency_key(idempotency_key)  # P1.5 contract guard
         idem_key = f"{user_id}:{idempotency_key}" if idempotency_key else None
         has_idem = "1" if idem_key else "0"
         keys = [self._idem_key(idem_key), self._redis_key,
@@ -297,6 +411,7 @@ class GaugeCounter(Counter):
 
     async def increment(self, delta: float, idempotency_key: Optional[str] = None) -> float:
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
+        guard_idempotency_key(idempotency_key)  # P1.5 contract guard
         has_idem = "1" if idempotency_key else "0"
         keys = [self._idem_key(idempotency_key), self._redis_key]
         keys += self._keys2(("idem_key", idempotency_key), ("gauge_key",))
@@ -308,6 +423,7 @@ class GaugeCounter(Counter):
 
     async def decrement(self, delta: float, idempotency_key: Optional[str] = None) -> float:
         delta = finite_magnitude(delta)  # W-T3/ET-03: validate BEFORE Lua
+        guard_idempotency_key(idempotency_key)  # P1.5 contract guard
         has_idem = "1" if idempotency_key else "0"
         keys = [self._idem_key(idempotency_key), self._redis_key]
         keys += self._keys2(("idem_key", idempotency_key), ("gauge_key",))

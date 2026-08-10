@@ -14,9 +14,10 @@ from typing import Optional
 
 from redis.asyncio import Redis
 
-from .models.core import QuotaAlert, AlertSeverity
+from .models.core import QuotaAlert, AlertSeverity, QuotaMetric
 
 logger = logging.getLogger("ab0t_quota.alerts")
+metrics_logger = logging.getLogger("ab0t_quota.metrics")
 
 # Default: 1 alert per resource per org per hour
 DEFAULT_COOLDOWN_SECONDS = 3600
@@ -96,6 +97,145 @@ class WebhookAlertDispatcher(AlertDispatcher):
                     logger.error("webhook_alert_failed url=%s status=%d", self._url, resp.status_code)
         except Exception as e:
             logger.error("webhook_alert_error url=%s error=%s", self._url, str(e))
+
+
+# ---------------------------------------------------------------------------
+# Metric dispatchers (F9/P4.1, ticket 20260810_quota_drift_live_recurrence_permanent_fix)
+# ---------------------------------------------------------------------------
+#
+# WHY THESE EXIST, SEPARATE FROM AlertDispatcher: an alert is cooldown-gated
+# (never spam a human) and free-text. A metric is the opposite — never
+# cooldown-gated (a dashboard needs every observation to chart drift over
+# time) and strictly numeric/low-cardinality, so a downstream sink can
+# threshold or graph it. Reusing AlertDispatcher for both would force one of
+# the two contracts to lose (either the human gets spammed, or the metric
+# gets holes). This module previously logged `gauge_drift_detected` /
+# `gauge_drift_resolved` ONLY as part of a QuotaAlert's message string — a
+# human can read that, but nothing can chart it. A MetricDispatcher fixes
+# that without touching the alert path at all.
+
+class MetricDispatcher(ABC):
+    """Base class for metric emission — a numeric SINK, distinct from
+    AlertDispatcher's human-facing notification. Multiple dispatchers may be
+    registered (e.g. a scrapeable Redis counter AND a structured log line)."""
+
+    @abstractmethod
+    async def emit(self, metric: QuotaMetric) -> None:
+        """Record one metric observation. Implementation decides the sink."""
+
+
+class LogMetricDispatcher(MetricDispatcher):
+    """Emit metrics as a structured, grep/scrape-able log line (default,
+    always active). Distinct logger + line SHAPE (`name=... key=value`) from
+    QuotaAlert's message-based line, so a log-based metrics pipeline (Datadog
+    log-metrics, CloudWatch Logs Insights, a `journalctl | grep` cron, or a
+    Prometheus log exporter) can parse it without string-matching a sentence
+    meant for a human."""
+
+    async def emit(self, metric: QuotaMetric) -> None:
+        metrics_logger.info(
+            "quota_metric name=%s org_id=%s resource_key=%s observed=%s ledger=%s "
+            "counter_before=%s counter_after=%s delta=%s source=%s",
+            metric.name, metric.org_id, metric.resource_key, metric.observed,
+            metric.ledger, metric.counter_before, metric.counter_after,
+            metric.delta, metric.source,
+        )
+
+
+class RedisCounterMetricDispatcher(MetricDispatcher):
+    """The "if there is no metrics sink" fallback (F9/P4.1). Every consumer
+    already has the engine's Redis — this needs no new infrastructure, no
+    statsd agent, no CloudWatch IAM grant. It increments plain counters an
+    operator (or a future statsd/CloudWatch bridge) can read directly with
+    GET — a `docker exec ... redis-cli GET quota:metrics:drift_detected:total`
+    already works.
+
+    Keys (all under ``key_prefix``, default ``"quota:metrics"``):
+      * ``{prefix}:drift_detected:total``               — INCR, all-time count.
+      * ``{prefix}:drift_detected:{org}:{resource_key}`` — INCR, per (org, resource).
+      * ``{prefix}:drift_resolved:total``                — INCR, all-time count.
+      * ``{prefix}:drift:{org}:{resource_key}:sustained`` — consecutive detects
+        with no intervening resolve for this (org, resource); reset to 0 on a
+        resolve. Mirrors ``DriftAlertManager``'s own sustained-pass tracker —
+        this copy is the one an external scraper reads without importing the
+        library.
+
+    A dispatcher failure (a flaky Redis op) is caught and logged, never
+    raised — recording a metric must never break the reconcile pass."""
+
+    def __init__(self, redis: Redis, key_prefix: str = "quota:metrics"):
+        self._redis = redis
+        self._prefix = key_prefix
+
+    def _sustained_key(self, org_id: str, resource_key: str) -> str:
+        return f"{self._prefix}:drift:{org_id}:{resource_key}:sustained"
+
+    async def emit(self, metric: QuotaMetric) -> None:
+        try:
+            if metric.name == "quota.drift_detected":
+                await self._redis.incr(f"{self._prefix}:drift_detected:total")
+                await self._redis.incr(
+                    f"{self._prefix}:drift_detected:{metric.org_id}:{metric.resource_key}")
+                await self._redis.incr(self._sustained_key(metric.org_id, metric.resource_key))
+            elif metric.name == "quota.drift_resolved":
+                await self._redis.incr(f"{self._prefix}:drift_resolved:total")
+                await self._redis.delete(self._sustained_key(metric.org_id, metric.resource_key))
+        except Exception as e:
+            logger.error("redis_counter_metric_dispatch_error metric=%s org=%s resource=%s "
+                         "error=%s", metric.name, metric.org_id, metric.resource_key, e)
+
+
+async def drift_metrics_snapshot(
+    redis: Redis, *, metrics_prefix: str = "quota:metrics",
+    sustained_threshold: int = 3, max_scan: int = 500,
+) -> dict:
+    """Read ``RedisCounterMetricDispatcher``'s scrapeable counters (F9/P4.1,
+    ticket 20260810_quota_drift_live_recurrence_permanent_fix).
+
+    This is the "expose a counter the platform can scrape" fallback: a
+    consumer wires it into whatever HTTP surface they already have (setup.py
+    mounts it on the library's own ``/quota/capabilities`` for every consumer
+    automatically). Two cheap O(1) totals, plus a BOUNDED scan (never more
+    than ``max_scan`` keys — a drift storm must not turn a status probe into
+    its own incident, same ethos as the reconciler's own per-pass budget) for
+    which (org, resource) pairs are CURRENTLY sustaining drift at or above
+    ``sustained_threshold`` consecutive re-heals — i.e. exactly the set the
+    ``quota_drift_sustained`` alert has fired (or will fire) for.
+    """
+    async def _get_int(key: str) -> int:
+        v = await redis.get(key)
+        return int(v) if v else 0
+
+    snap: dict = {
+        "drift_detected_total": await _get_int(f"{metrics_prefix}:drift_detected:total"),
+        "drift_resolved_total": await _get_int(f"{metrics_prefix}:drift_resolved:total"),
+        "sustained_threshold": sustained_threshold,
+        "currently_sustaining": [],
+        "scan_truncated": False,
+    }
+    scanned = 0
+    suffix = ":sustained"
+    key_root = f"{metrics_prefix}:drift:"
+    try:
+        async for key in redis.scan_iter(match=f"{key_root}*{suffix}", count=100):
+            scanned += 1
+            if scanned > max_scan:
+                snap["scan_truncated"] = True
+                break
+            raw = await redis.get(key)
+            count = int(raw) if raw else 0
+            if count < sustained_threshold:
+                continue
+            k = key.decode() if isinstance(key, bytes) else str(key)
+            body = k[len(key_root):-len(suffix)]  # "{org_id}:{resource_key}"
+            org_id, _, resource_key = body.rpartition(":")
+            snap["currently_sustaining"].append({
+                "org_id": org_id, "resource_key": resource_key,
+                "consecutive_passes": count,
+            })
+    except Exception as e:
+        logger.error("drift_metrics_snapshot_scan_failed error=%s", e)
+    return snap
 
 
 class AlertManager:
@@ -183,11 +323,30 @@ class DriftAlertManager:
         dispatchers: Optional[list[AlertDispatcher]] = None,
         cooldown_seconds: int = 600,
         key_prefix: str = "quota:reconcile:drift",
+        metric_dispatchers: Optional[list[MetricDispatcher]] = None,
+        sustained_alert_threshold: int = 3,
     ):
         self._redis = redis
         self._dispatchers = dispatchers or [LogAlertDispatcher()]
         self._cooldown = cooldown_seconds
         self._prefix = key_prefix
+        # F9/P4.1: metric_dispatchers defaults to a log line + a Redis counter —
+        # both need zero extra config/infrastructure, so "no metrics sink wired"
+        # never means "no observability" (the P4.1 fallback promise).
+        self._metric_dispatchers = (
+            list(metric_dispatchers) if metric_dispatchers is not None
+            else [LogMetricDispatcher(), RedisCounterMetricDispatcher(redis)]
+        )
+        # Sustained-drift threshold: consecutive reconcile passes that had to
+        # re-heal the SAME (org, resource) with no intervening resolve. A
+        # single heal is expected (a crash, a slow provider); the SAME gauge
+        # needing a heal N passes running is the signature of a RECURRING bug
+        # (e.g. the F1 idempotency-key collision) — that is the case a metric
+        # alone does not surface unless something is watching it, so the
+        # library also raises a dedicated CRITICAL alert once the threshold
+        # is crossed (proves the wiring end-to-end even with zero external
+        # metrics infrastructure).
+        self._sustained_threshold = sustained_alert_threshold
 
     def _active_key(self, org_id: str, resource_key: str) -> str:
         return f"{self._prefix}:{org_id}:{resource_key}:active"
@@ -205,6 +364,69 @@ class DriftAlertManager:
             except Exception as e:  # a broken dispatcher must never break reconcile
                 logger.error("drift_alert_dispatch_error dispatcher=%s error=%s",
                              type(dispatcher).__name__, str(e))
+
+    async def _emit_metric(self, metric: QuotaMetric) -> None:
+        """Fan the metric out to every configured MetricDispatcher. NEVER
+        rate-limited (unlike ``_dispatch``'s alerts) — a metrics sink needs
+        every observation, and a broken dispatcher must never break reconcile."""
+        for dispatcher in self._metric_dispatchers:
+            try:
+                await dispatcher.emit(metric)
+            except Exception as e:
+                logger.error("drift_metric_dispatch_error dispatcher=%s error=%s",
+                             type(dispatcher).__name__, str(e))
+
+    def _sustained_key(self, org_id: str, resource_key: str) -> str:
+        return f"{self._prefix}:{org_id}:{resource_key}:sustained_passes"
+
+    def _sustained_cd_key(self, org_id: str, resource_key: str) -> str:
+        return f"{self._prefix}:{org_id}:{resource_key}:sustained_cd"
+
+    async def _track_sustained(self, org_id: str, resource_key: str) -> int:
+        """INCR the consecutive-detect counter for (org, resource); returns the
+        new count. TTL'd generously so an abandoned org's counter doesn't
+        live forever."""
+        key = self._sustained_key(org_id, resource_key)
+        count = await self._redis.incr(key)
+        await self._redis.expire(key, max(self._cooldown * 8, 3600))
+        return int(count)
+
+    async def _clear_sustained(self, org_id: str, resource_key: str) -> None:
+        await self._redis.delete(self._sustained_key(org_id, resource_key))
+
+    async def _maybe_sustained_alert(
+        self, org_id: str, resource_key: str, *, count: int,
+        observed: float, ledger: float, tier_id: str = "",
+    ) -> bool:
+        """Once ``count`` (consecutive re-heals with no intervening resolve)
+        reaches the threshold, raise a distinct CRITICAL alert — a sustained
+        drift is a RECURRING bug (this bug class's 4th sighting was exactly
+        this: a reconciler that heals but keeps re-drifting), not a one-off
+        blip a single heal already handles quietly. Rate-limited by its own
+        cooldown key (separate from the plain detect cooldown) so it re-fires
+        periodically while the condition persists, not once and never again."""
+        if count < self._sustained_threshold:
+            return False
+        cd = self._sustained_cd_key(org_id, resource_key)
+        if not await self._redis.set(cd, "1", ex=self._cooldown, nx=True):
+            return False  # rate-limited: already fired inside the cooldown
+        await self._dispatch(QuotaAlert(
+            org_id=org_id, resource_key=resource_key,
+            severity=AlertSeverity.CRITICAL,
+            current=observed, limit=ledger,
+            utilization=(observed / ledger) if ledger else 0.0,
+            tier_id=tier_id,
+            message=(
+                f"quota_drift_sustained org={org_id} resource={resource_key} "
+                f"consecutive_passes={count} observed={observed} ledger={ledger} — "
+                f"this gauge has drifted and been re-healed {count} consecutive "
+                f"reconcile passes with no intervening resolve. This reads as a "
+                f"RECURRING bug (e.g. an idempotency-key collision on a reused "
+                f"resource id), not a one-off blip — investigate the WRITE path, "
+                f"not just the counter."
+            ),
+        ))
+        return True
 
     # ---- D-75: infrastructure invariants (the guards' own boundary: TIME) ----------
     # Every guard we own (D-32 durability, D-71 topology, D-72 eviction, D-73 scripting,
@@ -264,7 +486,26 @@ class DriftAlertManager:
     ) -> bool:
         """Reconciler force-set the counter (a real drift). Rate-limited by the
         detect cooldown; sets the persistent ``active`` marker so a later
-        ``drift_resolved`` can pair with it. Returns True if dispatched."""
+        ``drift_resolved`` can pair with it. Returns True if the (cooldown-gated)
+        human ALERT was dispatched.
+
+        F9/P4.1 (ticket 20260810): ALSO emits a structured ``quota.drift_detected``
+        METRIC on EVERY call — never cooldown-gated, unlike the alert below, since
+        a metrics sink needs full-fidelity data to chart drift over time — and
+        tracks consecutive sustained passes, raising a distinct CRITICAL alert
+        once ``sustained_alert_threshold`` is crossed (the signal that this is a
+        RECURRING bug, not a one-off blip)."""
+        delta = abs(after - before)
+        await self._emit_metric(QuotaMetric(
+            name="quota.drift_detected", org_id=org_id, resource_key=resource_key,
+            observed=observed, ledger=ledger, counter_before=before,
+            counter_after=after, delta=delta, source=source,
+        ))
+        sustained = await self._track_sustained(org_id, resource_key)
+        await self._maybe_sustained_alert(
+            org_id, resource_key, count=sustained, observed=observed,
+            ledger=ledger, tier_id=tier_id)
+
         # Persist the active marker (long-lived; cleared only by a resolve) so a
         # heal can always find it. Its TTL is generous — a drift that never heals
         # should stay "active".
@@ -290,13 +531,27 @@ class DriftAlertManager:
         """The (org, resource) value now matches its authoritative level. Fires
         ONLY if a drift was previously active, then clears the markers. NOT
         suppressed by the detect cooldown — a resolve must never be swallowed by
-        a prior admit. Returns True if dispatched."""
+        a prior admit. Returns True if dispatched.
+
+        F9/P4.1 (ticket 20260810): the consecutive-sustained-passes counter is
+        always cleared here (the streak breaks the moment we're back in sync),
+        and a ``quota.drift_resolved`` METRIC (delta=0.0) is emitted paired 1:1
+        with the human ``gauge_drift_resolved`` alert — same trigger condition
+        (an active drift existed), so a metrics sink and an on-call human always
+        see the SAME "all clear" transitions, never a metric-only or alert-only one."""
         active_key = self._active_key(org_id, resource_key)
         was_active = await self._redis.get(active_key)
+        await self._clear_sustained(org_id, resource_key)
         if not was_active:
             return False
         await self._redis.delete(active_key)
         await self._redis.delete(self._detect_cd_key(org_id, resource_key))
+        await self._redis.delete(self._sustained_cd_key(org_id, resource_key))
+        await self._emit_metric(QuotaMetric(
+            name="quota.drift_resolved", org_id=org_id, resource_key=resource_key,
+            observed=value, ledger=value, counter_before=value, counter_after=value,
+            delta=0.0, source="",
+        ))
         await self._dispatch(QuotaAlert(
             org_id=org_id, resource_key=resource_key,
             severity=AlertSeverity.WARNING,

@@ -764,7 +764,7 @@ def setup_quota(
 
         # D-40 — give the snapshot a CONSUMER. Emitting it is the easy half.
         try:
-            _register_capability_routes(_app)
+            _register_capability_routes(_app, redis=redis, config=config)
         except Exception as e:
             logger.warning("capabilities routes not registered: %s", e)
 
@@ -1188,7 +1188,18 @@ def _build_drift_alert_manager(redis, config):
     QB-01's signature) reaches a human instead of a log-only default.
 
     Config: `alerts.drift_webhook_url` (falls back to `alerts.webhook_url`),
-    `alerts.drift_cooldown_seconds` (falls back to `alerts.cooldown_seconds`)."""
+    `alerts.drift_cooldown_seconds` (falls back to `alerts.cooldown_seconds`).
+
+    F9/P4.1 (ticket 20260810_quota_drift_live_recurrence_permanent_fix):
+    `alerts.drift_sustained_threshold` (consecutive re-heals before the
+    sustained-drift CRITICAL alert fires; default 3). Metric dispatchers are
+    NOT built here — `DriftAlertManager`'s own default (a structured log line
+    + a scrapeable Redis counter, both zero-config) already satisfies "a
+    consumer with no metrics sink still gets observability"; a consumer that
+    wants a real statsd/CloudWatch/webhook metrics sink passes its own
+    `metric_dispatchers=[...]` when constructing `DriftAlertManager` directly
+    (bypassing `setup_quota`'s config-only wiring), same seam as any other
+    custom dispatcher."""
     from .alerts import DriftAlertManager, LogAlertDispatcher
     alerts_cfg = config.get("alerts", {}) or {}
     dispatchers = [LogAlertDispatcher()]
@@ -1204,6 +1215,7 @@ def _build_drift_alert_manager(redis, config):
         dispatchers=dispatchers,
         cooldown_seconds=int(alerts_cfg.get("drift_cooldown_seconds",
                                             alerts_cfg.get("cooldown_seconds", 600))),
+        sustained_alert_threshold=int(alerts_cfg.get("drift_sustained_threshold", 3)),
     )
 
 
@@ -1532,20 +1544,39 @@ def quota_health(app) -> dict:
     return {"status": "degraded" if degraded else "ok", "degraded": degraded}
 
 
-def _register_capability_routes(app) -> None:
+def _register_capability_routes(app, *, redis=None, config=None) -> None:
     """D-40 — mount `/quota/capabilities` (full snapshot) and `/quota/health`
     (money-aware, 503 when degraded). Namespaced so the library never squats on a
-    consumer's own `/health`."""
+    consumer's own `/health`.
+
+    F9/P4.1 (ticket 20260810_quota_drift_live_recurrence_permanent_fix):
+    `/quota/capabilities` also carries a live `drift_metrics` block — the
+    "expose a counter the platform can scrape" fallback for a consumer with
+    no external metrics sink (statsd/CloudWatch/Prometheus). Every consumer
+    that calls `setup_quota` already gets this endpoint for free; no extra
+    consumer-side wiring is required. `redis`/`config` are optional so an
+    existing caller (or a test) that doesn't pass them keeps working — the
+    drift_metrics block is simply omitted."""
     try:
         from fastapi.responses import JSONResponse
     except Exception:  # pragma: no cover - FastAPI always present in practice
         return
+
+    alerts_cfg = (config or {}).get("alerts", {}) or {}
+    sustained_threshold = int(alerts_cfg.get("drift_sustained_threshold", 3))
 
     async def _capabilities():
         snap = dict(getattr(app.state, "quota_capabilities", {}) or {})
         # D-50: surface live loop liveness alongside the startup snapshot, so a
         # worker that died AFTER boot is visible to a human, not just in the logs.
         snap["loops"] = quota_loop_liveness(app)
+        if redis is not None:
+            try:
+                from .alerts import drift_metrics_snapshot
+                snap["drift_metrics"] = await drift_metrics_snapshot(
+                    redis, sustained_threshold=sustained_threshold)
+            except Exception as e:
+                logger.error("drift_metrics snapshot failed: %s", e)
         return snap
 
     async def _health():
