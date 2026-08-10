@@ -6,10 +6,12 @@ check, increment, decrement, get_usage.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from redis.asyncio import Redis
 
@@ -145,10 +147,44 @@ class QuotaEngine:
         activation_store=None,
         activations_enabled: Optional[bool] = None,
         keyspace=None,
+        observed_usage_provider: Optional[Callable[[str], Any]] = None,
+        accumulator_usage_provider: Optional[Callable[[str], Any]] = None,
+        drift_alerts=None,
+        truth_provider_timeout_seconds: float = 10.0,
+        read_repair_throttle_seconds: Optional[float] = None,
     ):
         self._redis = redis
         self._tier_provider = tier_provider
         self._registry = registry
+        # --- Typed truth-source seams (ticket 20260810, robust self-correcting
+        # quota; DESIGN_robust_quota.md) ------------------------------------------
+        # The fast Redis counter is NEVER the authority — it is a cache of a
+        # type-specific DERIVED truth. Two user-safety rules (recount-before-deny,
+        # read-repair) recompute that truth from the resource's TYPE source before
+        # ever harming a user. The engine dispatches on `counter_type`:
+        #   * GAUGE       -> observed_usage_provider(org_id) -> {rk: {"total", "per_user"}}
+        #                    (a LIVE count of what actually exists; the same seam the
+        #                    reconciler uses — authoritative for EXISTENCE, D-33).
+        #   * ACCUMULATOR -> accumulator_usage_provider(org_id) -> {rk: period_total}
+        #                    (re-SUM of the durable event ledger for the CURRENT period;
+        #                    NOT a live count — a meter's past is real and lives in the
+        #                    ledger, DESIGN §2 Type B).
+        #   * RATE        -> no truth source: the TTL'd window counter IS truth (self-
+        #                    healing on window roll), so it is never recounted.
+        # Both providers are OPTIONAL. Their ABSENCE is the zero-config default: the
+        # engine behaves exactly as before (no recount, no read-repair) — so wiring a
+        # provider is purely additive and can never change a consumer that has none.
+        self._observed_usage_provider = observed_usage_provider
+        self._accumulator_usage_provider = accumulator_usage_provider
+        self._drift_alerts = drift_alerts
+        self._truth_provider_timeout_seconds = truth_provider_timeout_seconds
+        if read_repair_throttle_seconds is None:
+            try:
+                read_repair_throttle_seconds = float(
+                    os.getenv("AB0T_QUOTA_READ_REPAIR_THROTTLE_SECONDS", "60") or 60)
+            except ValueError:
+                read_repair_throttle_seconds = 60.0
+        self._read_repair_throttle_seconds = read_repair_throttle_seconds
         # K-1 (keyspace spec §3.2): the declared keyspace state — service scope,
         # version, dual flag. None = v1 single-shape, today's behaviour.
         from .keyspace import Keyspace
@@ -359,6 +395,17 @@ class QuotaEngine:
                     result.user_id = request.user_id
                     result.user_current = user_current
                     result.user_limit = effective_per_user
+
+        # P1 — RECOUNT-BEFORE-DENY (ticket 20260810, the highest-impact rule).
+        # Never block a user on a stale cached number. When the cache would DENY,
+        # recompute the true usage from the resource's TYPE source of truth and only
+        # deny if the truth is really at/over limit; otherwise repair the cache and
+        # ALLOW. Fail-OPEN on a truth-source error (P1.2/D-31): allow + alert, never
+        # block. RATE and consumers with no truth source configured are unaffected.
+        if result.decision == QuotaDecision.DENY:
+            result = await self._recount_before_deny(
+                request, resource_def, result, counter, tier, tier_limits,
+                effective_limit, has_override, effective_per_user)
 
         # Fire alert on warning/critical/exceeded
         if self._alert_manager and result.severity in (
@@ -846,6 +893,17 @@ class QuotaEngine:
 
         admitted, reason = await self._atomic_bundle_spend(specs, user_id, idempotency_key)
 
+        # P1 — RECOUNT-BEFORE-DENY on the atomic gauge path (ticket 20260810). A
+        # denial here rests on the CACHED gauge; before returning it, verify against
+        # the live provider. If the cache was stale-high (drift), repair the gauges to
+        # the observed truth and RETRY the spend once. Fail-OPEN on a truth-source
+        # error (D-31): retry with limits dropped so a provider outage never blocks a
+        # user. Only active when an observed_usage_provider is wired (else unchanged).
+        if (not admitted and enforce and not self._enforcement.shadow_mode
+                and self._observed_usage_provider is not None and specs):
+            admitted, reason = await self._acquire_recount_before_deny(
+                org_id, specs, user_id, idempotency_key, denied_reason=reason)
+
         # Shadow mode — a would-be DENY becomes an ALLOW: spent + logged, not blocked
         # (D-15, mirror check()/Go engine.go:164). The first (limited) spend claimed
         # NOTHING on denial (the Lua sets the idem key only after every check passes),
@@ -1139,6 +1197,11 @@ class QuotaEngine:
 
     async def get_usage(self, org_id: str, **provider_kwargs) -> QuotaUsageResponse:
         """Get full usage report for an org across all registered resources."""
+        # P2.2 — READ-REPAIR (ticket 20260810). A plain usage read opportunistically
+        # recomputes from truth and repairs a drifted cache, so the number a user sees
+        # is honest AND self-healing. Throttled per-org and best-effort — it never
+        # breaks the read, and is a no-op for a consumer with no truth source wired.
+        await self._maybe_read_repair(org_id)
         tier_id = await self._tier_provider.get_tier(org_id, **provider_kwargs)
         tier = self._tiers.get(tier_id) or self._lowest_tier()
 
@@ -1182,12 +1245,420 @@ class QuotaEngine:
         )
 
     # ------------------------------------------------------------------
+    # Typed truth-sources: recount-before-deny, read-repair, reconcile_org
+    # (ticket 20260810 — DESIGN_robust_quota.md §0 the universal principle:
+    #  the fast counter is a cache of a type-specific derived truth; staleness
+    #  must never harm the user.)
+    # ------------------------------------------------------------------
+
+    _EPS = 1e-9
+
+    async def _call_truth_provider(self, provider, org_id: str) -> dict:
+        """Invoke a (sync or async) truth provider, bounded by
+        ``truth_provider_timeout_seconds`` for async (D-52: a hung provider must
+        not stall the caller). Raises on failure — the caller decides fail-open."""
+        result = provider(org_id)
+        if inspect.isawaitable(result):
+            t = self._truth_provider_timeout_seconds
+            if t and t > 0:
+                result = await asyncio.wait_for(result, t)
+            else:
+                result = await result
+        return result or {}
+
+    def _drift_alert_manager(self):
+        """The drift metric/alert channel. If the consumer wired one it is reused;
+        otherwise a log-only ``DriftAlertManager`` is lazily built from the engine's
+        Redis (so ``quota.drift_detected`` still fires with zero extra config)."""
+        if self._drift_alerts is None:
+            from .alerts import DriftAlertManager
+            self._drift_alerts = DriftAlertManager(redis=self._redis)
+        return self._drift_alerts
+
+    @staticmethod
+    def _extract_truth_from_obs(obs: Optional[dict], resource_def) -> Optional[tuple[float, dict]]:
+        """Pull ``(total, per_user)`` for a resource from a provider result dict, or
+        None if the key is ABSENT (absence != zero, D-51 — a missing key is 'no
+        observation', never an affirmative zero that could wipe the counter)."""
+        rk = resource_def.resource_key
+        if obs is None or rk not in obs:
+            return None
+        entry = obs.get(rk)
+        if resource_def.counter_type == CounterType.GAUGE:
+            entry = entry or {}
+            total = float(entry.get("total", 0.0))
+            per_user = {str(u): float(v) for u, v in (entry.get("per_user") or {}).items()}
+            return total, per_user
+        # ACCUMULATOR: accept {rk: number} or {rk: {"total": number}}.
+        if isinstance(entry, dict):
+            return float(entry.get("total", 0.0)), {}
+        return float(entry), {}
+
+    def _truth_provider_for(self, resource_def):
+        """The truth provider for a resource's TYPE, or None. GAUGE→live provider,
+        ACCUMULATOR→ledger provider, RATE→None (the window counter is truth)."""
+        ct = resource_def.counter_type
+        if ct == CounterType.GAUGE:
+            return self._observed_usage_provider
+        if ct == CounterType.ACCUMULATOR:
+            return self._accumulator_usage_provider
+        return None
+
+    async def _recompute_true_usage(self, org_id: str, resource_def) -> Optional[tuple[float, dict]]:
+        """Recompute a single resource's TRUE usage from its type source of truth.
+        Returns ``(total, per_user)``; None when no source is configured OR the
+        provider returned no observation for this key. Raises on a provider error
+        (the caller fails open)."""
+        provider = self._truth_provider_for(resource_def)
+        if provider is None:
+            return None
+        obs = await self._call_truth_provider(provider, org_id)
+        return self._extract_truth_from_obs(obs, resource_def)
+
+    async def _repair_counter_to_truth(
+        self, org_id: str, resource_def, counter, true_total: float, true_per_user: dict,
+    ) -> float:
+        """Force-set the cached counter to the type's truth. GAUGE also syncs its
+        per-user partitions to the observed set and CLEARS stale ones (QI-06 — a
+        repair that fixes half the state guarantees org/user divergence). Returns the
+        previous org value."""
+        before = await counter.get()
+        await counter.reset(true_total)
+        if (resource_def.counter_type == CounterType.GAUGE
+                and hasattr(counter, "reset_user") and hasattr(counter, "_user_key")):
+            prefix = counter._user_key("")
+            existing: set[str] = set()
+            try:
+                async for k in self._redis.scan_iter(match=f"{prefix}*", count=100):
+                    existing.add(k.decode() if isinstance(k, bytes) else str(k))
+            except Exception:
+                pass
+            for uid, uval in (true_per_user or {}).items():
+                await counter.reset_user(uid, float(uval))
+                existing.discard(prefix + str(uid))
+            for stale in existing:
+                try:
+                    raw = await self._redis.get(stale)
+                    if raw and float(raw) != 0.0:
+                        await self._redis.delete(stale)
+                except Exception:
+                    pass
+        return before
+
+    async def _recount_before_deny(
+        self, request: QuotaCheckRequest, resource_def, denied_result: QuotaResult,
+        counter, tier: TierConfig, tier_limits: TierLimits, effective_limit,
+        has_override: bool, effective_per_user,
+    ) -> QuotaResult:
+        """P1 — the recount-before-deny mechanism. Given a would-be DENY, recompute
+        the true usage from the resource's TYPE truth source; repair a stale cache and
+        re-decide. Fail-OPEN on a truth-source error (never block a user on an
+        unverifiable cache). Returns the (possibly flipped) result."""
+        ct = resource_def.counter_type
+        if ct == CounterType.RATE:
+            return denied_result  # the TTL'd window counter is already truth
+        provider = self._truth_provider_for(resource_def)
+        if provider is None:
+            return denied_result  # no truth source wired — keep the cache-based deny
+        org_id, rk = request.org_id, request.resource_key
+        try:
+            truth = await self._recompute_true_usage(org_id, resource_def)
+        except Exception as e:
+            # P1.2 — the truth source is unreachable. The correct fail direction is
+            # TYPE-AWARE (not uniform), because the two counter types drift in OPPOSITE
+            # directions:
+            #
+            #   * GAUGE — the cache drifts HIGH from lost decrements (the cd790b95 "5/0"
+            #     class), so a stale cache must NEVER block a user. Fail-OPEN: allow +
+            #     alert. Any over-admission is bounded and healed by the reconciler.
+            #
+            #   * ACCUMULATOR — the cache IS the durable ledger-backed running total: a
+            #     meter/cost counter is monotonic within its period and has NO
+            #     lost-decrement drift, so "cache says over limit" means the customer
+            #     genuinely accrued that spend. Failing OPEN here would let spend blow
+            #     past the cap during a ledger-source outage (overspend / revenue risk).
+            #     So do NOT fail-open: KEEP the cache-based deny (fail-to-last-known for
+            #     money — the cache is the best available estimate). A genuinely-wrong
+            #     meter cache is corrected by reconcile_org / read-repair, NEVER by
+            #     fail-open. Still alert (distinct reason) so the outage is visible.
+            try:
+                await self._drift_alert_manager().provider_unreachable(org_id, error=str(e))
+            except Exception:
+                pass
+            if ct == CounterType.ACCUMULATOR:
+                logger.error(
+                    "recount_source_unavailable_kept_deny org=%s resource=%s error=%s — "
+                    "KEEPING the deny (money-safety, fail-to-last-known): an accumulator "
+                    "cache is the durable ledger sum with no lost-decrement drift, so "
+                    "allowing on a source outage risks overspend past the cap.",
+                    org_id, rk, e,
+                )
+                return denied_result.model_copy(update={
+                    "reason": "recount_source_unavailable_kept_deny",
+                })
+            logger.error(
+                "recount_before_deny_truth_unreachable org=%s resource=%s error=%s — "
+                "ALLOWING (fail-open on drift, D-31); a gauge's stale cache must never "
+                "block a user, and an IO error is not evidence of real usage.",
+                org_id, rk, e,
+            )
+            return denied_result.model_copy(update={
+                "decision": QuotaDecision.ALLOW,
+                "severity": AlertSeverity.INFO,
+                "reason": "recount_fail_open",
+                "message": MessageBuilder.allow(
+                    resource_def, denied_result.current, effective_limit,
+                    denied_result.current + request.increment),
+            })
+        if truth is None:
+            # Provider reachable but gave NO observation for this key (absence !=
+            # zero, D-51). We cannot prove headroom; keep the deny.
+            return denied_result
+        true_total, true_per_user = truth
+        cached = await counter.get()
+        drifted = abs(true_total - cached) > self._EPS
+        if drifted:
+            await self._repair_counter_to_truth(
+                org_id, resource_def, counter, true_total, true_per_user)
+            try:
+                await self._drift_alert_manager().drift_detected(
+                    org_id, rk, observed=true_total, ledger=cached,
+                    before=cached, after=true_total,
+                    source="provider" if ct == CounterType.GAUGE else "ledger",
+                    resource_type=ct.value, tier_id=tier.tier_id)
+            except Exception:
+                pass
+        # Re-decide the admission with the TRUE numbers.
+        repaired = self._evaluate(
+            resource_key=rk, current=true_total, requested=request.increment,
+            limit=effective_limit, tier=tier, tier_limits=tier_limits,
+            has_override=has_override, resource_def=resource_def, counter=counter)
+        # Re-apply the per-user gauge sub-check with the TRUE per-user level.
+        if (repaired.allowed and request.user_id and effective_per_user is not None
+                and ct == CounterType.GAUGE):
+            user_current = float((true_per_user or {}).get(request.user_id, 0.0))
+            if user_current + request.increment > effective_per_user:
+                return denied_result.model_copy(update={
+                    "current": true_total,
+                    "user_current": user_current,
+                    "user_limit": effective_per_user,
+                    "denied_level": "user",
+                    "reason": "recount_user_over_limit",
+                })
+            repaired.user_id = request.user_id
+            repaired.user_current = user_current
+            repaired.user_limit = effective_per_user
+        if repaired.allowed and drifted:
+            repaired.reason = "recount_repaired_allow"
+        elif repaired.denied:
+            repaired.denied_level = "org"
+        return repaired
+
+    async def _acquire_recount_before_deny(
+        self, org_id: str, specs: list[dict], user_id: Optional[str],
+        idem: Optional[str], *, denied_reason: str,
+    ) -> tuple[bool, str]:
+        """P1 for acquire()'s atomic gauge spend. Verify a denial against the live
+        provider; repair any drifted gauge and RETRY the spend once. Fail-OPEN on a
+        truth-source error: retry with limits dropped (never block on an unverifiable
+        cache). Returns ``(admitted, reason)``."""
+        try:
+            obs = await self._call_truth_provider(self._observed_usage_provider, org_id)
+        except Exception as e:
+            logger.error(
+                "acquire_recount_truth_unreachable org=%s error=%s — retrying with "
+                "limits dropped (fail-open on drift, D-31); a stale cache must never "
+                "block a user.", org_id, e,
+            )
+            try:
+                await self._drift_alert_manager().provider_unreachable(org_id, error=str(e))
+            except Exception:
+                pass
+            dropped = [{**s, "org_limit": None, "user_limit": None} for s in specs]
+            return await self._atomic_bundle_spend(dropped, user_id, idem)
+        repaired_any = False
+        for s in specs:
+            rk = s["resource_key"]
+            counter = s["gauge"]
+            rd = self._registry.get(rk)
+            if rd is None:
+                continue
+            truth = self._extract_truth_from_obs(obs, rd)
+            if truth is None:
+                continue  # absence != zero — can't verify this gauge; leave it
+            true_total, per_user = truth
+            cached = await counter.get()
+            if abs(true_total - cached) > self._EPS:
+                await self._repair_counter_to_truth(org_id, rd, counter, true_total, per_user)
+                repaired_any = True
+                try:
+                    await self._drift_alert_manager().drift_detected(
+                        org_id, rk, observed=true_total, ledger=cached,
+                        before=cached, after=true_total, source="provider",
+                        resource_type="gauge")
+                except Exception:
+                    pass
+        if not repaired_any:
+            return False, denied_reason  # the cache matched reality — a real deny
+        return await self._atomic_bundle_spend(specs, user_id, idem)
+
+    async def reconcile_org(
+        self, org_id: str, resource_key: Optional[str] = None,
+    ) -> dict:
+        """P2 — recompute each resource from its TYPE source of truth and force-set
+        the cached counter to it. Powers a user-facing 'Recalculate usage' button:
+        idempotent, safe to call anytime, and it ONLY ever sets the counter to the
+        derived truth (never an arbitrary value).
+
+          * GAUGE       -> observed_usage_provider (live existence count)
+          * ACCUMULATOR -> accumulator_usage_provider (re-sum of the durable period ledger)
+          * RATE        -> skipped (the TTL'd window counter is self-healing truth)
+
+        Emits ``quota.drift_detected`` on every repair and ``quota.drift_resolved``
+        when already in sync. Returns a structured before->after per resource::
+
+            {"org_id": ..., "resources": {resource_key: {
+                "counter_type": "gauge"|"accumulator"|"rate",
+                "before": float|None, "after": float|None,
+                "changed": bool, "source": "provider"|"ledger"|None,
+                "status": "repaired"|"in_sync"|"skipped_rate"|"no_truth_source"
+                          |"no_observation"|"truth_unavailable"}}}
+        """
+        if resource_key is not None:
+            resource_defs = [self._registry.require(resource_key)]
+        else:
+            resource_defs = list(self._registry.all())
+
+        # Fetch each provider AT MOST ONCE per pass (a provider returns the whole
+        # org in one call), then dispatch per resource from the cached result.
+        need_gauge = (self._observed_usage_provider is not None
+                      and any(rd.counter_type == CounterType.GAUGE for rd in resource_defs))
+        need_acc = (self._accumulator_usage_provider is not None
+                    and any(rd.counter_type == CounterType.ACCUMULATOR for rd in resource_defs))
+        gauge_obs = acc_obs = None
+        gauge_err = acc_err = None
+        if need_gauge:
+            try:
+                gauge_obs = await self._call_truth_provider(self._observed_usage_provider, org_id)
+            except Exception as e:
+                gauge_err = e
+                logger.error("reconcile_org_gauge_provider_unreachable org=%s error=%s", org_id, e)
+                try:
+                    await self._drift_alert_manager().provider_unreachable(org_id, error=str(e))
+                except Exception:
+                    pass
+        if need_acc:
+            try:
+                acc_obs = await self._call_truth_provider(self._accumulator_usage_provider, org_id)
+            except Exception as e:
+                acc_err = e
+                logger.error("reconcile_org_acc_provider_unreachable org=%s error=%s", org_id, e)
+                try:
+                    await self._drift_alert_manager().provider_unreachable(org_id, error=str(e))
+                except Exception:
+                    pass
+
+        out: dict = {"org_id": org_id, "resources": {}}
+        for rd in resource_defs:
+            rk = rd.resource_key
+            ct = rd.counter_type
+            entry = {"counter_type": ct.value, "before": None, "after": None,
+                     "changed": False, "source": None, "status": None}
+            if ct == CounterType.RATE:
+                entry["status"] = "skipped_rate"
+                out["resources"][rk] = entry
+                continue
+            provider = self._truth_provider_for(rd)
+            if provider is None:
+                entry["status"] = "no_truth_source"
+                out["resources"][rk] = entry
+                continue
+            counter = create_counter(self._redis, org_id, rd, keyspace=self._keyspace)
+            before = await counter.get()
+            entry["before"] = before
+            obs = gauge_obs if ct == CounterType.GAUGE else acc_obs
+            err = gauge_err if ct == CounterType.GAUGE else acc_err
+            if err is not None:
+                entry["after"] = before
+                entry["status"] = "truth_unavailable"
+                out["resources"][rk] = entry
+                continue
+            truth = self._extract_truth_from_obs(obs, rd)
+            if truth is None:
+                entry["after"] = before
+                entry["status"] = "no_observation"
+                out["resources"][rk] = entry
+                continue
+            true_total, true_per_user = truth
+            source = "provider" if ct == CounterType.GAUGE else "ledger"
+            entry["source"] = source
+            entry["after"] = true_total
+            if abs(true_total - before) > self._EPS:
+                await self._repair_counter_to_truth(org_id, rd, counter, true_total, true_per_user)
+                entry["changed"] = True
+                entry["status"] = "repaired"
+                try:
+                    await self._drift_alert_manager().drift_detected(
+                        org_id, rk, observed=true_total, ledger=before,
+                        before=before, after=true_total, source=source,
+                        resource_type=ct.value)
+                except Exception:
+                    pass
+            else:
+                entry["status"] = "in_sync"
+                try:
+                    await self._drift_alert_manager().drift_resolved(org_id, rk, value=true_total)
+                except Exception:
+                    pass
+            out["resources"][rk] = entry
+        return out
+
+    async def _maybe_read_repair(self, org_id: str) -> None:
+        """P2.2 — throttled, best-effort read-repair on the usage getter. A plain
+        read opportunistically recomputes from truth and repairs the cache. No-op
+        when no truth source is wired; throttled per-org so a hot dashboard cannot
+        hammer the provider; never raises (a repair failure must not break a read)."""
+        if (self._observed_usage_provider is None
+                and self._accumulator_usage_provider is None):
+            return
+        throttle = self._read_repair_throttle_seconds
+        if throttle and throttle > 0:
+            try:
+                key = self._keyspace.readrepair_key(org_id)
+                ok = await self._redis.set(key, "1", ex=int(throttle), nx=True)
+                if not ok:
+                    return  # another read repaired inside the throttle window
+            except Exception:
+                pass
+        try:
+            await self.reconcile_org(org_id)
+        except Exception as e:
+            logger.warning("read_repair_failed org=%s error=%s — read continues", org_id, e)
+
+    # ------------------------------------------------------------------
     # Tier cache management
     # ------------------------------------------------------------------
 
     def set_alert_manager(self, alert_manager: AlertManager) -> None:
         """Attach an alert manager for WARNING/CRITICAL notifications."""
         self._alert_manager = alert_manager
+
+    def set_drift_alerts(self, drift_alerts) -> None:
+        """Attach the DriftAlertManager used for ``quota.drift_detected`` metrics +
+        drift alerts emitted by recount-before-deny / reconcile_org / read-repair.
+        setup_quota shares the SAME manager the reconciler uses so the engine's
+        repairs reach the configured sinks (webhook + scrapeable Redis counters),
+        not only the lazily-built log-only default (ticket 20260810, Phase 3)."""
+        self._drift_alerts = drift_alerts
+
+    def set_truth_providers(
+        self, *, observed_usage_provider=None, accumulator_usage_provider=None,
+    ) -> None:
+        """Attach/replace the typed truth-source seams after construction (used by
+        setup_quota once the consumer callbacks are resolved). None leaves the
+        existing provider unchanged is NOT assumed — pass explicitly."""
+        self._observed_usage_provider = observed_usage_provider
+        self._accumulator_usage_provider = accumulator_usage_provider
 
     async def invalidate_tier_cache(self, org_id: str) -> None:
         """Clear cached tier for an org. Call from payment webhooks after tier change."""

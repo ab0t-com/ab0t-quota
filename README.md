@@ -185,6 +185,103 @@ Use ONE of:
 default) when a key looks like this bare shape; set `AB0T_QUOTA_STRICT_IDEMPOTENCY_KEYS=1` to make
 it a hard refusal instead. The warning text names this section.
 
+## Keeping usage correct (self-healing counters)
+
+The Redis counter is a **cache**, never the authority. Each resource declares a
+`counter_type`, and the engine knows that type's **source of truth** and reconciles the
+cache against it. Wiring the truth source is **purely additive** — wire neither provider
+and the engine behaves exactly as it always has.
+
+| Counter type | Source of truth | Provider you wire |
+|---|---|---|
+| **Gauge** (concurrency / live level) | a **live count** of what actually exists right now (your product rows / the cloud) | `observed_usage_provider` |
+| **Accumulator** (metered spend this period) | a **re-sum of your durable event ledger** for the current period (the past is real — a stopped sandbox still owes this month's cost) | `accumulator_usage_provider` |
+| **Rate** (windowed throughput) | the TTL'd window counter **is** the truth (self-heals on window roll) | none |
+
+### Wire the truth sources
+
+```python
+setup_quota(
+    app,
+    config_path="quota-config.json",
+    # GAUGE truth: a LIVE existence count of the consumer's product rows.
+    #   fn(org_id) -> {resource_key: {"total": float, "per_user": {user_id: float}}}
+    observed_usage_provider=count_live_resources,
+    # ACCUMULATOR truth: RE-SUM the durable event ledger for the CURRENT period.
+    #   fn(org_id) -> {resource_key: period_total}   (or {resource_key: {"total": ...}})
+    accumulator_usage_provider=sum_period_ledger,
+)
+```
+
+Both callbacks may be sync or async, are bounded by `truth_provider_timeout_seconds`
+(default 10s), and return **only the keys they can observe** — a missing key means "no
+observation", never an affirmative zero (absence never wipes a counter).
+
+### Recount-before-deny
+
+Before the engine denies on the cached number, it recomputes true usage from the
+resource's type source, repairs a stale cache, and only denies if the truth is really at
+the limit. A gauge stuck high from a lost `-1` can never wrongly block a user.
+
+On a **truth-source outage** the fail direction is **type-aware**, because the two types
+drift in opposite directions:
+
+- **Gauge → fail OPEN** — a stale gauge must never block. A gauge only drifts *high*
+  (lost decrements), so the engine allows + alerts (`reason=recount_fail_open`); any
+  over-admission is bounded and healed by the reconciler.
+- **Accumulator → keep the deny** (fail-to-last-known, `reason=recount_source_unavailable_kept_deny`).
+  A ledger-backed meter is monotonic within its period with no lost-decrement drift, so
+  "cache says over limit" is real spend — allowing it would let spend blow past the cap.
+  A genuinely-wrong meter cache is corrected by `reconcile_org` / read-repair, never by fail-open.
+- **Rate → unchanged** (the window is already truth).
+
+### `reconcile_org` — the "Recalculate usage" button
+
+`reconcile_org(org_id, resource_key=None)` recomputes **every** resource (or one) from
+its type truth, repairs the counter, and returns a structured before→after. It is
+**idempotent and safe to call anytime** — it only ever sets a counter to derived truth.
+This is what backs a user-facing **"Recalculate usage"** button — the consumer exposes it
+behind an endpoint of its own (e.g. `POST /api/quotas/recalculate`).
+
+```python
+report = await quota.reconcile_org(org_id)   # `quota` = the QuotaContext from setup_quota
+# {
+#   "org_id": "org_123",
+#   "resources": {
+#     "sandbox.concurrent":    {"counter_type": "gauge",       "before": 5, "after": 0,
+#                               "changed": True,  "source": "provider", "status": "repaired"},
+#     "sandbox.monthly_cost":  {"counter_type": "accumulator", "before": 42.0, "after": 42.0,
+#                               "changed": False, "source": "ledger",   "status": "in_sync"},
+#     "api.requests_per_hour": {"counter_type": "rate", "status": "skipped_rate"},
+#   }
+# }
+```
+
+Per-resource `status`: `repaired` | `in_sync` | `skipped_rate` | `no_truth_source` |
+`no_observation` | `truth_unavailable`.
+
+### Read-repair
+
+`get_usage(org_id)` (the QuotaContext `usage()` / your billing page) opportunistically
+recomputes from truth and repairs a drifted cache before returning, so the number a user
+sees is honest and self-healing. It is throttled per-org
+(`AB0T_QUOTA_READ_REPAIR_THROTTLE_SECONDS`, default 60s) and best-effort — a repair
+failure never breaks the read.
+
+### Detection
+
+Every recount-repair and every `reconcile_org` repair emits
+`quota.drift_detected{org, resource, type, delta}` (scrapeable Redis counters + optional
+webhook), so drift is visible even as it self-heals.
+
+### Troubleshooting: "usage looks wrong"
+
+The number self-heals on the next read or denial. To force it immediately, call
+`reconcile_org(org_id)` (or click the **Recalculate usage** button). **Never hand-edit the
+Redis counter** — a manual `SET` is a new lie the next reconcile overwrites, and it
+bypasses the drift metric. The counter is a cache of a derived truth; fix the truth (or
+reconcile), not the cache.
+
 ## Default tiers
 
 | Resource | Free | Starter | Pro | Enterprise |

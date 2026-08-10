@@ -790,6 +790,12 @@ class QuotaMetric(BaseModel):
     name: str = Field(description="'quota.drift_detected' | 'quota.drift_resolved'")
     org_id: str
     resource_key: str
+    # Ticket 20260810 (Phase 3): the resource's COUNTER TYPE — the `type` label in
+    # the drift metric contract `quota.drift_detected{org,resource,type,delta}`. So a
+    # dashboard can split gauge drift (the '5/0' class) from accumulator drift
+    # (metered under/over-count) without joining back to config. "" = unspecified
+    # (a legacy caller that doesn't pass it — e.g. the gauge-only periodic reconciler).
+    resource_type: str = Field(default="", description="'gauge' | 'accumulator' | ''")
     observed: float = Field(description="the provider/ledger's observed existence level")
     ledger: float = Field(description="the activation ledger's Σ open total (may equal observed)")
     counter_before: float = Field(description="the gauge value before this reconcile action")

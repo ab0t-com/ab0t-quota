@@ -335,6 +335,20 @@ class BridgeContext:
     async def usage(self, org_id: str):
         return await self._client.usage(org_id)
 
+    async def reconcile_org(self, org_id: str, resource_key: Optional[str] = None) -> dict:
+        # Ticket 20260810 (P2.1): reconcile_org recomputes counters from their type's
+        # truth source. In bridge mode the counters live server-side (billing owns the
+        # Redis + the reconciler), so the recalculate operation belongs to the server;
+        # there is no public mesh endpoint for it yet. Fail LOUD-but-safe: report that
+        # the operation is server-side rather than silently claiming a repair happened.
+        # TODO(public-mesh-ga): add POST /billing/quota/{service}/{org}/reconcile and
+        # call it here so bridge mode is a full drop-in for the recalculate button.
+        logger.warning(
+            "bridge reconcile_org is server-side in bridge mode — the billing service "
+            "owns the counters + reconciler; no client-side recompute is performed.")
+        return {"org_id": org_id, "resources": {},
+                "status": "server_side_in_bridge_mode"}
+
     async def feature(self, org_id: str, feature_name: str) -> bool:
         # Bridge mode doesn't have a feature endpoint yet — derive from usage.
         u = await self._client.usage(org_id)

@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.6.5] — Recount-before-deny, read-repair, and one-call recalculate
+
+### Your quota can no longer show — or enforce — a wrong number
+
+The fast counter is now treated as a cache of a per-type derived truth, and the
+library repairs it before it can ever harm a user:
+
+- **Recount-before-deny.** When the cached counter would deny a request, the
+  engine first recomputes the true usage from the resource's *type* source of
+  truth — a **gauge** from your live-count callback (`observed_usage_provider`),
+  a **meter/accumulator** by re-summing your durable period ledger
+  (`accumulator_usage_provider`) — and only denies if the truth is really at the
+  limit. A stale-high gauge (the "shows 5 with 0 running" class) now self-heals
+  and allows.
+- **Type-aware fail direction on a truth-source outage** (money-safety). A
+  **gauge** fails *open* (a stale gauge must never block a user; over-admission
+  is bounded and healed). A **meter** does *not* — it keeps the last-known
+  ledger-backed decision, so a ledger-source outage can never let spend blow past
+  the cap. Both still alert.
+- **`reconcile_org(org_id, resource_key=None)`** — recompute every resource from
+  its type truth, repair the counter, and get a structured before→after back.
+  Idempotent and safe to call anytime; it powers a user-facing "Recalculate
+  usage" button.
+- **Read-repair.** A usage read opportunistically recomputes and repairs a
+  drifted counter (throttled, best-effort).
+- **Detection.** `quota.drift_detected` now carries a `type` label and fires on
+  recount-repair and `reconcile_org`, not only the periodic reconciler.
+
+Non-breaking and purely additive: wire `observed_usage_provider` /
+`accumulator_usage_provider` (both optional) into `setup_quota` to opt in; a
+service that wires neither behaves exactly as before.
+
 ## [0.6.4] — Drift observability + idempotency-key contract guard
 
 ### Your quota gauges now report when they drift

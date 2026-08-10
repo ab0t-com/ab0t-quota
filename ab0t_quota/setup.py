@@ -177,6 +177,14 @@ class QuotaContext:
     async def usage(self, org_id: str):
         return await self._engine.get_usage(org_id)
 
+    async def reconcile_org(self, org_id: str, resource_key: Optional[str] = None) -> dict:
+        """P2 (ticket 20260810) — recompute each resource from its TYPE truth source
+        and repair the cached counter to it. Powers a user-facing 'Recalculate usage'
+        button: idempotent, safe anytime, and it only ever sets a counter to derived
+        truth. Returns a structured before->after per resource. See
+        ``QuotaEngine.reconcile_org``."""
+        return await self._engine.reconcile_org(org_id, resource_key)
+
     async def feature(self, org_id: str, feature_name: str) -> bool:
         return await self._engine.check_feature(org_id, feature_name)
 
@@ -207,6 +215,15 @@ def setup_quota(
     # Σ open activations (a handle-using client self-heals with no code). Sync or
     # async. Consumer-owned: their DB, their consuming-state semantics.
     observed_usage_provider: Optional[Callable[[str], Any]] = None,
+    # Ticket 20260810 — the ACCUMULATOR (meter) truth seam, the type-B twin of
+    # observed_usage_provider. OPTIONAL callback
+    #   fn(org_id) -> {resource_key: period_total}   (or {resource_key: {"total": ...}})
+    # that RE-SUMS the consumer's DURABLE event ledger for the CURRENT period (NOT a
+    # live count — a meter's past is real, DESIGN_robust_quota.md §2 Type B). Wired
+    # into the engine so recount-before-deny / reconcile_org / read-repair can verify
+    # an accumulator denial against the ledger, not the cached running total. Absence
+    # = accumulators are not recounted (unchanged behaviour).
+    accumulator_usage_provider: Optional[Callable[[str], Any]] = None,
     # D-37 — the activation store the engine (acquire/release) and the reconciler
     # share. DEFAULT is a durable, SHARED RedisActivationStore (self-provisioned
     # from the same Redis as the counter). In-memory is per-process and unsafe
@@ -390,6 +407,13 @@ def setup_quota(
         enforcement=load_enforcement(config),
         activation_store=resolved_activation_store,
         keyspace=keyspace,  # K-9: counters/reconciler/recent-guard inherit it
+        # Ticket 20260810: the typed truth-source seams. The engine dispatches
+        # recount-before-deny / read-repair / reconcile_org on counter_type —
+        # GAUGE→observed_usage_provider, ACCUMULATOR→accumulator_usage_provider.
+        # Absent = zero-config default (no recount/read-repair), so this is purely
+        # additive for a consumer that wires neither.
+        observed_usage_provider=observed_usage_provider,
+        accumulator_usage_provider=accumulator_usage_provider,
     )
 
     # Alert manager: log dispatcher always; webhook if configured
@@ -631,6 +655,14 @@ def setup_quota(
         # with NO activation row → un-settleable usage) is QB-01's signature and
         # must reach a HUMAN, not terminate in a log-only default dispatcher.
         drift_alerts = _build_drift_alert_manager(redis, config)
+        # Ticket 20260810 (Phase 3): the ENGINE's recount-before-deny / reconcile_org
+        # / read-repair emit quota.drift_detected through the SAME configured manager
+        # the reconciler uses (webhook + scrapeable Redis counters), not a lazily-built
+        # log-only default. Shared here once it exists.
+        try:
+            engine.set_drift_alerts(drift_alerts)
+        except Exception as e:  # never fatal — the engine falls back to log-only
+            logger.warning("failed to share drift alert manager with engine: %s", e)
 
         # D-75 — the guards' own caveat: every infrastructure check we own (D-32, D-71,
         # D-72, D-73, D-76) verified the world ONCE, at boot, and then trusted it forever.

@@ -440,6 +440,54 @@ When `widget.monthly_cost` hits the tier cap, the next
 
 ---
 
+## Keeping usage correct — wire a truth source
+
+The Redis counter is a **cache**, not the authority. Wire your product's truth source and
+the engine keeps the cache honest: it recomputes true usage before ever denying a user,
+self-heals on reads, and gives you a one-call **"Recalculate usage"** button. Wiring is
+**purely additive** — skip it and behaviour is exactly as before.
+
+Which provider you wire depends on the resource's `counter_type`:
+
+- **Gauge** (concurrency / live level) → `observed_usage_provider` — a **live count** of
+  what actually exists now.
+  `fn(org_id) -> {resource_key: {"total": float, "per_user": {user_id: float}}}`
+- **Accumulator** (metered spend) → `accumulator_usage_provider` — a **re-sum of your
+  durable event ledger** for the current period (the past is real).
+  `fn(org_id) -> {resource_key: period_total}`
+- **Rate** → nothing; the TTL'd window is already truth.
+
+```python
+setup_quota(
+    app,
+    config_path="quota-config.json",
+    observed_usage_provider=count_live_widgets,      # GAUGE truth (live existence)
+    accumulator_usage_provider=sum_period_ledger,    # ACCUMULATOR truth (ledger re-sum)
+)
+```
+
+What you get:
+
+- **Recount-before-deny** — a would-be denial is re-checked against truth first, so a
+  gauge stuck high from a lost decrement never wrongly blocks a user. On a truth-source
+  outage the fail direction is **type-aware**: a gauge fails **open** (a stale gauge must
+  never block); an accumulator **keeps the deny** (a ledger-backed meter must never let
+  spend blow past the cap).
+- **Read-repair** — `quota.usage(org_id)` repairs a drifted cache before returning
+  (throttled, best-effort).
+- **Recalculate button** — `await quota.reconcile_org(org_id)` recomputes every resource
+  from its truth, repairs the counter, and returns a structured before→after. Idempotent
+  and safe anytime. Wire it behind an endpoint like `POST /api/quotas/recalculate`.
+
+**If a number ever looks wrong:** call `quota.reconcile_org(org_id)` (or click Recalculate).
+**Never hand-edit the Redis counter** — the next reconcile overwrites it and it skips the
+drift metric. Every repair emits `quota.drift_detected{org, resource, type, delta}`.
+
+See the [README "Keeping usage correct" section](../README.md#keeping-usage-correct-self-healing-counters)
+for the full contract and the `status` values `reconcile_org` returns.
+
+---
+
 ## Configuration env vars
 
 The full set you need:

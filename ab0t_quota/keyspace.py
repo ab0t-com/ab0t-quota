@@ -116,6 +116,14 @@ class Keyspace:
             return f"quota:reconcile:recent:{org}"
         return f"{self._org_prefix(org, v)}:reconcile:recent"
 
+    def readrepair_key(self, org, version=None):
+        """Read-repair throttle latch (ticket 20260810). An org-scoped SET-NX-EX
+        marker so a hot usage read repairs at most once per throttle window. Built
+        here (the ONE key-shape home, K-6) rather than as a loose f-string. Not a
+        counter — it never needs snapshot/parse — so it is deliberately unversioned
+        (org-scoped, like the tier cache), same ethos as recent_key's v1 form."""
+        return f"quota:reconcile:readrepair:{org}"
+
     # ------------------------------------------------------------- dual side
 
     @property

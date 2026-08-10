@@ -134,10 +134,10 @@ class LogMetricDispatcher(MetricDispatcher):
 
     async def emit(self, metric: QuotaMetric) -> None:
         metrics_logger.info(
-            "quota_metric name=%s org_id=%s resource_key=%s observed=%s ledger=%s "
+            "quota_metric name=%s org_id=%s resource_key=%s type=%s observed=%s ledger=%s "
             "counter_before=%s counter_after=%s delta=%s source=%s",
-            metric.name, metric.org_id, metric.resource_key, metric.observed,
-            metric.ledger, metric.counter_before, metric.counter_after,
+            metric.name, metric.org_id, metric.resource_key, metric.resource_type,
+            metric.observed, metric.ledger, metric.counter_before, metric.counter_after,
             metric.delta, metric.source,
         )
 
@@ -482,7 +482,7 @@ class DriftAlertManager:
     async def drift_detected(
         self, org_id: str, resource_key: str, *,
         observed: float, ledger: float, before: float, after: float,
-        source: str, tier_id: str = "",
+        source: str, tier_id: str = "", resource_type: str = "",
     ) -> bool:
         """Reconciler force-set the counter (a real drift). Rate-limited by the
         detect cooldown; sets the persistent ``active`` marker so a later
@@ -498,6 +498,7 @@ class DriftAlertManager:
         delta = abs(after - before)
         await self._emit_metric(QuotaMetric(
             name="quota.drift_detected", org_id=org_id, resource_key=resource_key,
+            resource_type=resource_type,
             observed=observed, ledger=ledger, counter_before=before,
             counter_after=after, delta=delta, source=source,
         ))
@@ -527,6 +528,7 @@ class DriftAlertManager:
 
     async def drift_resolved(
         self, org_id: str, resource_key: str, *, value: float, tier_id: str = "",
+        resource_type: str = "",
     ) -> bool:
         """The (org, resource) value now matches its authoritative level. Fires
         ONLY if a drift was previously active, then clears the markers. NOT
@@ -549,6 +551,7 @@ class DriftAlertManager:
         await self._redis.delete(self._sustained_cd_key(org_id, resource_key))
         await self._emit_metric(QuotaMetric(
             name="quota.drift_resolved", org_id=org_id, resource_key=resource_key,
+            resource_type=resource_type,
             observed=value, ledger=value, counter_before=value, counter_after=value,
             delta=0.0, source="",
         ))
