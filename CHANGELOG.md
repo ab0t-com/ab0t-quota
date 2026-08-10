@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.4] — Drift observability + idempotency-key contract guard
+
+### Your quota gauges now report when they drift
+
+The reconciler emits a `quota.drift_detected` metric every time it corrects a
+gauge back to live truth, plus a sustained-drift alert — so a slow counter leak
+shows up on a dashboard instead of as a surprised customer.
+
+### A guard rail on idempotency keys
+
+The counter API now warns when a decrement idempotency key looks like a
+recyclable resource id — the shape that could cause a missed decrement to be
+silently dropped. It stays a warning by default; set
+`AB0T_QUOTA_STRICT_IDEMPOTENCY_KEYS=1` to make it a hard error. Keys built from a
+unique per-lifecycle-event id are unaffected.
+
+Non-breaking: no config or call-site change is required to upgrade from 0.6.x.
+
 ## [0.6.3] — DECLARED, NOT DISCOVERED
 
 ### Getting started is now self-serve
