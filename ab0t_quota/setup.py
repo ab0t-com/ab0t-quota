@@ -86,6 +86,7 @@ from .providers import (
     AuthServiceTierProvider,
     JWTTierProvider,
     StaticTierProvider,
+    TierFetchError,
     TierProvider,
 )
 from .registry import ResourceRegistry
@@ -1185,6 +1186,13 @@ def _build_tier_provider(config: dict, redis: Redis) -> TierProvider:
         )
 
         async def fetch_tier(org_id: str) -> str:
+            # DSD-01/02 (ticket 20260810_tier_failclosed_lastknowngood): NEVER
+            # invent a tier on failure. A swallowed billing blip that returns
+            # `free` is indistinguishable from a real free assignment and,
+            # once cached, enforces a paying PRO org at FREE for the whole TTL
+            # window. Raise TierFetchError instead — AuthServiceTierProvider
+            # then serves the last-known-good tier (never a downgrade). Only a
+            # real 200 with a tier_id advances the cached/last-known-good tier.
             import httpx
             try:
                 async with httpx.AsyncClient(timeout=5) as client:
@@ -1192,17 +1200,25 @@ def _build_tier_provider(config: dict, redis: Redis) -> TierProvider:
                         f"{billing_url}/billing/{org_id}/tier",
                         headers={"X-API-Key": mesh_key},
                     )
-                    if resp.status_code == 200:
-                        return resp.json().get("tier_id", "free")
             except Exception as e:
                 logger.warning("mesh tier fetch failed org=%s error=%s", org_id, e)
-            return tier_cfg.get("default_tier", "free")
+                raise TierFetchError(f"mesh tier fetch failed org={org_id}: {e}") from e
+            if resp.status_code == 200:
+                tier_id = resp.json().get("tier_id")
+                if tier_id:
+                    return tier_id
+                logger.warning("mesh tier fetch org=%s returned 200 without tier_id", org_id)
+                raise TierFetchError(f"mesh tier fetch org={org_id}: 200 without tier_id")
+            logger.warning("mesh tier fetch org=%s status=%d", org_id, resp.status_code)
+            raise TierFetchError(f"mesh tier fetch org={org_id}: HTTP {resp.status_code}")
 
+        lkg_ttl_cfg = tier_cfg.get("lkg_ttl_seconds")
         return AuthServiceTierProvider(
             fetch_fn=fetch_tier,
             redis=redis,
             cache_ttl=int(tier_cfg.get("cache_ttl_seconds", 60)),
             default_tier=tier_cfg.get("default_tier", "free"),
+            lkg_ttl=int(lkg_ttl_cfg) if lkg_ttl_cfg is not None else None,
         )
 
     if provider_type == "jwt":

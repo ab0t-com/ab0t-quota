@@ -19,7 +19,7 @@ from .models.core import (
     QuotaOverride,
     QuotaMetric,
 )
-from .providers import TierProvider, JWTTierProvider, AuthServiceTierProvider, StaticTierProvider
+from .providers import TierProvider, JWTTierProvider, AuthServiceTierProvider, StaticTierProvider, TierFetchError
 from .alerts import (
     AlertManager, AlertDispatcher, LogAlertDispatcher, WebhookAlertDispatcher,
     MetricDispatcher, LogMetricDispatcher, RedisCounterMetricDispatcher,
@@ -39,7 +39,7 @@ from .activations import (
 from .reconcile import LibraryReconciler, ReconcileConfig
 from .alerts import DriftAlertManager
 
-__version__ = "0.6.5"
+__version__ = "0.6.6"
 
 __all__ = [
     # Engine & middleware
@@ -66,6 +66,7 @@ __all__ = [
     "JWTTierProvider",
     "AuthServiceTierProvider",
     "StaticTierProvider",
+    "TierFetchError",
     # Alerts
     "AlertManager",
     "AlertDispatcher",

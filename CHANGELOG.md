@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.6.6] — Tier resolution never downgrades a paying org on a billing hiccup
+
+### A transient billing failure can no longer silently drop you to "free"
+
+The tier provider used to swallow any billing fetch error and return — **and cache** —
+the default (`free`) tier, so a paying org could be enforced as free for the whole
+cache window on any billing blip. Now:
+
+- On a billing fetch failure the provider serves the **last-known-good** tier (the last
+  value a successful fetch returned), never a cached fallback. Only an explicit,
+  successful downgrade moves a paid org off its tier.
+- A genuinely-unknown org (never successfully fetched) still defaults to `free` — correct
+  for a new org — and that default is **not** written to the cache.
+- New optional `lkg_ttl` on `AuthServiceTierProvider`; last-known-good defaults to
+  never-expire for the strongest never-downgrade guarantee.
+
+Also adds `docs/COUNTER_TYPES.md` — the canonical reference for the `counter_type` setting
+(gauge / accumulator / rate: what each means, its source of truth, and how to choose).
+
+Non-breaking + additive: no config or call-site change is required to upgrade from 0.6.x.
+
 ## [0.6.5] — Recount-before-deny, read-repair, and one-call recalculate
 
 ### Your quota can no longer show — or enforce — a wrong number
