@@ -108,6 +108,13 @@ class AuthServiceTierProvider(TierProvider):
     #: many fast-cache expiries and is available to serve during an outage.
     _LKG_PREFIX = "quota:tier:lkg:"
 
+    #: RC4 (ticket 20260810 detection): consecutive per-org fetch failures at
+    #: which the warning ESCALATES to an ERROR-level "sustained" signal — LKG
+    #: serving keeps customers safe but must never make a long billing outage
+    #: SILENT (a customer found the last one; a dashboard must find the next).
+    #: Class attribute so tests (and unusual deployments) can tune it.
+    SUSTAINED_FAILURE_THRESHOLD = 5
+
     def __init__(
         self,
         fetch_fn: Callable[[str], Awaitable[str]],
@@ -125,10 +132,36 @@ class AuthServiceTierProvider(TierProvider):
         # successful fetch that overwrites it). Operators may bound staleness
         # with an explicit TTL via config `tier_provider.lkg_ttl_seconds`.
         self._lkg_ttl = lkg_ttl
+        # RC4 — consecutive fetch-failure streaks per org (in-process, reset on
+        # any success). DETECTION-ONLY: never changes what is served.
+        self._failure_streaks: dict = {}
 
     @staticmethod
     def _decode(value) -> str:
         return value.decode() if isinstance(value, (bytes, bytearray)) else value
+
+    def consecutive_failures(self, org_id: str) -> int:
+        """RC4 observability accessor: current consecutive fetch-failure streak
+        for an org (0 after any success)."""
+        return self._failure_streaks.get(org_id, 0)
+
+    def _note_fetch_failure(self, org_id: str, error) -> int:
+        """RC4: bump the org's consecutive-failure streak and escalate to an
+        ERROR-level `tier_lookup_failing_sustained` line at the threshold (and
+        every threshold multiple, so a long outage keeps re-signalling without
+        per-request spam)."""
+        streak = self._failure_streaks.get(org_id, 0) + 1
+        self._failure_streaks[org_id] = streak
+        threshold = max(2, int(self.SUSTAINED_FAILURE_THRESHOLD))
+        if streak >= threshold and streak % threshold == 0:
+            logger.error(
+                "tier_lookup_failing_sustained org=%s consecutive_failures=%d "
+                "error=%s — billing tier lookups have failed repeatedly; "
+                "last-known-good is holding entitlements but the source outage "
+                "needs attention (RC4 detection)",
+                org_id, streak, error,
+            )
+        return streak
 
     async def get_tier(self, org_id: str, **kwargs) -> str:
         cache_key = f"{self._CACHE_PREFIX}{org_id}"
@@ -142,6 +175,7 @@ class AuthServiceTierProvider(TierProvider):
         try:
             tier = await self._fetch_fn(org_id)
         except Exception as e:
+            self._note_fetch_failure(org_id, e)
             # Transient failure. Do NOT cache a fallback and do NOT overwrite
             # the good cached/last-known-good tier (DSD-01/02).
             lkg = await self._read_last_known_good(lkg_key)
@@ -164,6 +198,7 @@ class AuthServiceTierProvider(TierProvider):
 
         # Success — this is the ONLY path that writes the cache and advances
         # the last-known-good record (an explicit downgrade lands here too).
+        self._failure_streaks.pop(org_id, None)  # RC4: streak broken by success
         if self._redis:
             await self._redis.set(cache_key, tier, ex=self._cache_ttl)
             await self._write_last_known_good(lkg_key, tier)

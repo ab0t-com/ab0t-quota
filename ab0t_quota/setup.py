@@ -52,6 +52,7 @@ release. Today, only the local mode is wired.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -600,9 +601,11 @@ def setup_quota(
                 required_gsis=("gsi1", "gsi2"))  # query_by_user / query_by_status (ENV-16)
 
         # Start heartbeat monitor if paid-tier wired one up
+        # (asyncio is a module-level import now — a function-local `import
+        # asyncio` here would shadow it for the WHOLE lifespan body and break
+        # the earlier RC3 create_task with UnboundLocalError.)
         heartbeat_task = None
         if paid_state and paid_state.get("heartbeat_monitor"):
-            import asyncio
             heartbeat_task = asyncio.create_task(
                 paid_state["heartbeat_monitor"].start(),
                 name="ab0t_quota_heartbeat",
@@ -743,12 +746,33 @@ def setup_quota(
 
         # Auto-publish tier catalog to billing so cross-service admin views
         # (`/billing/{org}/tier/limits`) reflect the consumer's actual limits
-        # instead of library defaults. Best-effort.
+        # instead of library defaults.
+        #
+        # RC3 (ticket 20260810_billing_resilience_and_erroneous_tier_downgrade
+        # TICKET.md P4; verify_fabel_5_report_20260812 H7): the publish used to
+        # be best-effort-ONCE — a billing outage during startup left billing
+        # with NO tier definitions (`tier/limits` → limits:[]) invisibly until
+        # a customer was wrong. Now: a failed publish schedules a background
+        # RETRY-UNTIL-ACKED loop with capped backoff. Durability rationale: the
+        # catalog is DERIVED state (a pure function of this consumer's config),
+        # so process-lifetime retry + republish-on-every-startup IS the durable
+        # contract — there is no event to lose, only a PUT to eventually land.
+        # The capability snapshot reports the state so an unpublished catalog
+        # is a visible degradation, never a silence.
+        catalog_retry_task = None
         service_name = _resolve_service_name(config, registry)
         if service_name and enable_paid and not offline:
-            await _publish_tier_catalog(
+            _published = await _publish_tier_catalog(
                 service_name, tiers, registry=registry, bundles=bundles,
             )
+            caps["tier_catalog"] = "published" if _published else "retrying(startup publish failed)"
+            if not _published:
+                catalog_retry_task = asyncio.create_task(
+                    _retry_publish_tier_catalog_until_acked(
+                        service_name, tiers, registry=registry, bundles=bundles,
+                        caps=caps,
+                    )
+                )
 
         # Fire on_ready callback so the consumer's wiring code can stash a
         # reference to the engine (useful when their helper functions don't
@@ -851,6 +875,17 @@ def setup_quota(
                 heartbeat_task.cancel()
                 try:
                     await heartbeat_task
+                except Exception:
+                    pass
+            if catalog_retry_task is not None:
+                catalog_retry_task.cancel()
+                try:
+                    await catalog_retry_task
+                except asyncio.CancelledError:
+                    # CancelledError is a BaseException on 3.8+ — a bare
+                    # `except Exception` would let it escape the lifespan
+                    # teardown and fail the app shutdown.
+                    pass
                 except Exception:
                     pass
             if store is not None:
@@ -1153,6 +1188,61 @@ async def _publish_tier_catalog(
         logger.warning("catalog publish error service=%s error=%s",
                        service_name, e)
         return False
+
+
+# RC3 — retry backoff schedule for the catalog publish (seconds). Capped and
+# gentle: billing outages are exactly when we must not hammer billing. Module
+# constants so tests can shrink them.
+CATALOG_RETRY_BACKOFF_SECONDS = (30, 60, 120, 300)
+CATALOG_RETRY_MAX_INTERVAL_SECONDS = 300
+
+
+async def _retry_publish_tier_catalog_until_acked(
+    service_name: str, tiers, *, registry=None, bundles=None, caps: Optional[dict] = None,
+) -> None:
+    """RC3 — background retry-until-acked for the tier-catalog publish.
+
+    Runs after a FAILED startup publish. Retries with capped backoff until
+    billing acks (2xx) or the app shuts down (task cancelled by the composed
+    lifespan). Every attempt is the same idempotent PUT of config-derived
+    state, so redelivery is harmless; a restart re-enters via the normal
+    startup publish. Updates the capabilities snapshot dict in place so
+    "catalog unpublished" is always a visible degradation.
+    """
+    attempt = 0
+    while True:
+        idx = min(attempt, len(CATALOG_RETRY_BACKOFF_SECONDS) - 1)
+        delay = min(CATALOG_RETRY_BACKOFF_SECONDS[idx], CATALOG_RETRY_MAX_INTERVAL_SECONDS)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        attempt += 1
+        try:
+            ok = await _publish_tier_catalog(
+                service_name, tiers, registry=registry, bundles=bundles,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # _publish_tier_catalog shouldn't raise, but stay alive
+            logger.warning("catalog publish retry error service=%s attempt=%d error=%s",
+                           service_name, attempt, e)
+            ok = False
+        if ok:
+            if caps is not None:
+                caps["tier_catalog"] = f"published(after {attempt} retries)"
+            logger.info("catalog publish RECOVERED service=%s after %d retries",
+                        service_name, attempt)
+            return
+        if caps is not None:
+            caps["tier_catalog"] = f"retrying(attempt {attempt})"
+        logger.warning(
+            "catalog still unpublished service=%s attempt=%d next_retry_s=%d — "
+            "billing has no tier definitions for this service until this lands",
+            service_name, attempt,
+            min(CATALOG_RETRY_BACKOFF_SECONDS[min(attempt, len(CATALOG_RETRY_BACKOFF_SECONDS) - 1)],
+                CATALOG_RETRY_MAX_INTERVAL_SECONDS),
+        )
 
 
 def _resolve_service_name(config: dict, registry: ResourceRegistry) -> Optional[str]:

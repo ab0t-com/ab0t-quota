@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.6.7] — Sustained tier-failure detection (RC4) + durable catalog publish (RC3)
+
+Non-breaking, additive; parity target for `ab0t-quota-go` v0.1.9.
+
+- **RC4 — sustained tier-lookup-failure detection.** The tier provider tracks a
+  per-org consecutive fetch-failure streak and escalates to an ERROR-level
+  `tier_lookup_failing_sustained` signal at a threshold (default 5, tunable via
+  `SUSTAINED_FAILURE_THRESHOLD`), plus a `consecutive_failures(org_id)` accessor; a
+  success resets the streak. **Detection-only — serving is unchanged** (last-known-good
+  still applies), so a dark billing dependency pages instead of silently degrading.
+- **RC3 — durable tier-catalog publish.** A failed catalog publish now schedules a
+  background retry-until-acked loop with capped backoff and republishes on every
+  startup, instead of best-effort-once. The catalog is derived state (a pure function
+  of this consumer's config), so process-lifetime retry + republish-on-startup is the
+  durable contract; the capability snapshot reports catalog state.
+
 ## [0.6.6] — Tier resolution never downgrades a paying org on a billing hiccup
 
 ### A transient billing failure can no longer silently drop you to "free"
